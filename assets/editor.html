@@ -1,0 +1,2397 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Relatum</title>
+  <!-- 背景配置需要等 /api/load 返回；先用上次确认过的深浅语义给浏览器首帧定底色，
+       避免深色画布在等待数据与图片时闪出白屏。真实配置加载后仍由 editor.js 校准。 -->
+  <script>
+    (function () {
+      try {
+        var tone = localStorage.getItem('canvas:backgroundTone') === 'dark' ? 'dark' : 'light';
+        document.documentElement.dataset.editorBackgroundTone = tone;
+        if (localStorage.getItem('canvas:darkSemanticUiOptimization') !== '0') {
+          document.documentElement.classList.add('dark-semantic-ui');
+        }
+      } catch (e) {
+        document.documentElement.dataset.editorBackgroundTone = 'light';
+      }
+    })();
+  </script>
+  <style>
+    html { background: #fbfbfa; }
+    html[data-editor-background-tone="dark"] { background: #101214; }
+  </style>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="editor-onboarding.css">
+  <!-- MathJax 3 — 本地化（X 轮）
+       脚本由 canvas.js 在初始画布绘制完成后、浏览器空闲时加载。
+       配置成不自动 typeset 整页——由 canvas.js 按节点显式调 typesetPromise，
+       这样顶栏文件名、保存状态等字串里如果偶然有 $ 不会被误伤。
+       本地 vendor 路径下完全离线工作；不需要联网。 -->
+  <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: [['$', '$'], ['\\(', '\\)']],
+        displayMath: [['$$', '$$'], ['\\[', '\\]']],
+        processEscapes: true,
+        // 公式工作流②：AMS 编号——equation / align 等环境自动编号，\label / \ref / \eqref 生效；
+        // 裸 $$…$$ 仍不编号（向后兼容旧画布）。每个节点排版前 canvas.js 会 texReset()，编号按节点各自从 (1) 起。
+        tags: 'ams'
+      },
+      startup: { typeset: false }
+    };
+  </script>
+</head>
+<body class="editor-page">
+  <!-- 首屏前同步设定模式 / 子模式，避免新建画布先闪一下完整顶栏再收起（editor.js 后续会再校准一次） -->
+  <script>
+    (function () {
+      try {
+        var p = new URLSearchParams(location.search);
+        var fresh = p.get('fresh') === '1';
+        var embed = p.get('embed') === '1';
+        if (embed) document.body.classList.add('embed');
+        var initialTone = document.documentElement.dataset.editorBackgroundTone === 'dark' ? 'dark' : 'light';
+        document.body.dataset.backgroundTone = initialTone;
+        var returnTheme = localStorage.getItem('canvas:startTheme') === 'dark' ? 'dark' : 'light';
+        document.body.dataset.returnTheme = returnTheme;
+        var mode = localStorage.getItem('canvas:mode') || 'normal';
+        if (mode === 'pro' || mode === 'edit') mode = 'normal';
+        if (['normal', 'mindmap', 'decor'].indexOf(mode) < 0) mode = 'normal';
+        var subKeys = {
+          normal: 'canvas:normalSubmode',
+          mindmap: 'canvas:mindmapSubmode',
+          decor: 'canvas:decorSubmode'
+        };
+        var submodes = {};
+        ['normal', 'mindmap', 'decor'].forEach(function (name) {
+          var defaultValue = name === 'decor' ? 'full' : 'clean';
+          var value = localStorage.getItem(subKeys[name]) || defaultValue;
+          submodes[name] = (value === 'clean' || value === 'full') ? value : defaultValue;
+        });
+        if (fresh) { mode = 'normal'; submodes.normal = 'clean'; }
+        // 内嵌浮窗藏了顶栏=没法切模式，锁定「普通」模式，保证建节点/连线/改色字号都可用
+        if (embed) { mode = 'normal'; submodes.normal = 'full'; }
+        document.body.dataset.mode = mode;
+        document.body.dataset.modeSubmode = submodes[mode];
+        document.body.dataset.normalSubmode = submodes.normal;
+        var language = localStorage.getItem('canvas:toolbarLanguage') === 'en' ? 'en' : 'zh-CN';
+        document.documentElement.dataset.uiLanguage = language;
+        document.documentElement.lang = language;
+        document.body.dataset.uiLanguage = language;
+        if (localStorage.getItem('canvas:showNodeChecklists') === '1') {
+          document.body.classList.add('show-node-checklists');
+        }
+        if (localStorage.getItem('canvas:showMindmapFolds') === '1') {
+          document.body.classList.add('show-mindmap-folds');
+        }
+        if (localStorage.getItem('canvas:darkSemanticUiOptimization') !== '0') {
+          document.body.classList.add('dark-semantic-ui');
+        }
+        // 顶栏先藏起来（首屏前就打标记），等内容全部就位后由 editor.js 移除此类、让顶栏从顶部滑入，
+        // 借此遮住标题/状态加载过程中的任何中间态闪烁
+        document.body.classList.add('topbar-pending', 'background-initializing');
+      } catch (e) {}
+    })();
+  </script>
+  <div class="editor-opening-cover" data-role="editor-opening-cover" aria-hidden="true"></div>
+  <div class="editor-immersive-background" data-role="editor-immersive-background" aria-hidden="true"></div>
+  <aside class="task-export-notice" data-role="task-export-notice"
+         role="status" aria-live="polite" aria-atomic="true" hidden>
+    <span class="task-export-notice-icon" aria-hidden="true">
+      <svg viewBox="0 0 20 20" fill="none" stroke="currentColor"
+           stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M6.2 3.7H4.8a1.1 1.1 0 0 0-1.1 1.1v1.4M13.8 3.7h1.4a1.1 1.1 0 0 1 1.1 1.1v1.4M6.2 16.3H4.8a1.1 1.1 0 0 1-1.1-1.1v-1.4M13.8 16.3h1.4a1.1 1.1 0 0 0 1.1-1.1v-1.4"/>
+        <rect x="6.7" y="6.6" width="6.6" height="6.8" rx="1.5"/>
+        <path d="m8.4 10 1.15 1.15 2.2-2.35"/>
+      </svg>
+    </span>
+    <span class="task-export-notice-copy">
+      <strong data-role="task-export-notice-title">请选择卡片</strong>
+      <span data-role="task-export-notice-detail">选中要转换的卡片后再试。</span>
+    </span>
+    <button type="button" class="task-export-notice-close"
+            data-role="task-export-notice-close" aria-label="关闭提示">×</button>
+  </aside>
+  <header class="editor-top-bar">
+    <div class="editor-nav">
+      <button type="button" class="btn-text editor-back" data-action="back"
+              data-toolbar-i18n-title="backTitle" title="返回起步页">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor"
+             stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="m9.7 3.4-4.6 4.6 4.6 4.6"/>
+        </svg>
+        <span data-toolbar-i18n="back">起步页</span>
+      </button>
+
+      <div class="editor-mode-switch" data-role="mode-switch" role="group" aria-label="模式">
+        <span class="editor-mode-slider" data-role="mode-slider" aria-hidden="true"></span>
+        <span class="editor-mode-hover-line" data-role="mode-hover-line" aria-hidden="true"></span>
+        <button type="button" class="editor-mode-btn active" data-mode="normal"
+                data-toolbar-i18n="canvas">画布</button>
+        <button type="button" class="editor-mode-btn" data-mode="mindmap"
+                data-toolbar-i18n="mindmap">导图</button>
+        <button type="button" class="editor-mode-btn" data-mode="decor"
+                data-toolbar-i18n="patterns">图案</button>
+      </div>
+    </div>
+
+    <div class="editor-title">
+      <span class="editor-file-name" data-role="title"></span>
+      <span class="editor-save-state" data-role="save-state"></span>
+    </div>
+
+    <div class="editor-quick-actions" aria-label="画布操作">
+      <div class="editor-action-group editor-action-group-tools">
+        <button type="button" class="editor-export-btn editor-ai-btn" data-role="ai-toggle"
+                aria-expanded="false" aria-controls="ai-panel"
+                data-toolbar-i18n-title="aiTitle" title="AI 助手：对话生成 / 整理笔记">
+          <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"
+               stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M8 2.1 9.25 5.05 12.2 6.3 9.25 7.55 8 10.5 6.75 7.55 3.8 6.3 6.75 5.05Z"/>
+            <path d="M12.6 10.3 13.15 11.65 14.5 12.2 13.15 12.75 12.6 14.1 12.05 12.75 10.7 12.2 12.05 11.65Z"/>
+          </svg>
+          <span data-toolbar-i18n="ai">AI 助手</span>
+        </button>
+        <button type="button" class="editor-export-btn editor-graph-btn"
+                data-action="graph" aria-expanded="false" aria-controls="graph-overlay"
+                data-toolbar-i18n-title="graphTitle" title="查看当前画布的节点关系图谱" disabled>
+          <span data-toolbar-i18n="graph">图谱</span>
+        </button>
+        <button type="button" class="editor-export-btn" hidden
+                data-action="mindmap" aria-expanded="false" aria-controls="mindmap-menu"
+                title="把选中的节点按脑图布局自动排版">
+          脑图
+        </button>
+        <button type="button" class="editor-export-btn editor-background-btn"
+                data-action="background" aria-expanded="false" aria-controls="background-panel"
+                data-toolbar-i18n-title="backgroundTitle" title="设置所有画布共用的背景外观">
+          <span data-toolbar-i18n="background">背景</span>
+        </button>
+        <button type="button" class="editor-export-btn editor-template-btn"
+                data-action="templates" aria-expanded="false" aria-controls="template-menu"
+                data-toolbar-i18n-title="templatesTitle" title="我的模板：把常用的一组节点存成模板，拖进画布即可复用">
+          <span data-toolbar-i18n="templates">模板</span>
+        </button>
+      </div>
+      <span class="editor-action-separator" aria-hidden="true"></span>
+      <div class="editor-action-group editor-action-group-export">
+        <button type="button" class="editor-export-btn"
+                data-action="export-md" data-toolbar-i18n-title="exportMdTitle"
+                title="把当前画布导出为一组互相关联的 Markdown 文件">
+          <span data-toolbar-i18n="exportMd">导出 MD</span>
+        </button>
+        <button type="button" class="editor-export-btn"
+                data-action="export-png" data-toolbar-i18n-title="exportPngTitle"
+                title="把整张画布导出为一张高清 PNG 图片（不含 PDF 附件）">
+          <span data-toolbar-i18n="exportPng">导出 PNG</span>
+        </button>
+        <button type="button" class="editor-export-btn editor-task-export-btn"
+                data-action="export-tasks" data-toolbar-i18n-title="tasksTitle"
+                title="把选中的卡片节点转为学习页待办任务；成功后移除这些卡片">
+          <span class="task-export-default-label" data-toolbar-i18n="tasks">转为任务</span>
+          <span class="task-export-confirm-label" data-toolbar-i18n="tasksConfirm">确认转为任务</span>
+        </button>
+      </div>
+      <span class="editor-action-separator" aria-hidden="true"></span>
+      <button type="button" class="editor-export-btn editor-archive-btn"
+              data-action="archive" aria-label="归档划线节点"
+              data-toolbar-i18n-title="archiveTitle"
+              title="归档：收走已划删除线的正文节点，未划线节点保留在当前画布">
+        <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"
+             stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="2.3" y="2.9" width="11.4" height="3" rx="1"/>
+          <path d="M3.3 5.9v6.1a1 1 0 0 0 1 1h7.4a1 1 0 0 0 1-1V5.9"/>
+          <path d="M6.4 8.5h3.2"/>
+        </svg>
+        <span class="archive-confirm-label" data-toolbar-i18n="archiveConfirm">确认归档划线节点</span>
+      </button>
+    </div>
+
+    <!-- 脑图布局弹出菜单（顶栏“脑图”按钮触发；JS 定位到按钮下方）-->
+    <div class="mindmap-menu" id="mindmap-menu" data-role="mindmap-menu" role="menu" hidden>
+      <div class="mindmap-menu-hint">连续录入时优先整理当前分支；需要重排整片节点时再选下方布局。</div>
+      <button type="button" class="mindmap-menu-primary" data-mindmap="right" data-mindmap-scope="branch" role="menuitem">整理当前分支</button>
+      <div class="mindmap-menu-label">整片布局</div>
+      <button type="button" data-mindmap="right" role="menuitem">向右树形</button>
+      <button type="button" data-mindmap="left" role="menuitem">向左树形</button>
+      <button type="button" data-mindmap="down" role="menuitem">向下树形</button>
+      <button type="button" data-mindmap="radial" role="menuitem">放射星形</button>
+    </div>
+
+    <!-- 「模板」库下拉：顶栏「模板」按钮触发，向下展开；列出存好的模板，可拖进画布、可 × 删除 -->
+    <div class="template-menu" id="template-menu" data-role="template-menu" role="menu" hidden>
+      <div class="template-menu-head">我的模板</div>
+      <div class="template-menu-list" data-role="template-list" aria-label="模板列表"></div>
+      <div class="template-menu-empty" data-role="template-empty" hidden>
+        还没有模板。用左侧「套索」圈出一组节点，点「保存到模板」就能存到这里。
+      </div>
+      <div class="template-menu-hint">拖动模板卡片到画布即可放置；卡片右上角 <span aria-hidden="true">×</span> 删除模板。</div>
+    </div>
+  </header>
+
+  <!-- 解析阶段就把标题设成文件名（首屏前），避免先画"画布 加载中…"再被加载结果覆盖造成闪烁 -->
+  <script>
+    (function () {
+      try {
+        var f = new URLSearchParams(location.search).get('file');
+        if (f) {
+          var name = f.split(/[\\/]/).pop().replace(/\.canvas$/i, '');
+          var t = document.querySelector('[data-role="title"]');
+          if (t) t.textContent = name;
+        }
+      } catch (e) {}
+    })();
+  </script>
+
+  <main class="editor-main">
+    <div class="canvas-viewport" data-role="canvas-viewport">
+      <canvas class="canvas-edges-canvas" data-role="canvas-edges-canvas" aria-hidden="true"></canvas>
+      <div class="canvas-toolbox auto-hide" data-role="canvas-toolbox" aria-label="画布工具">
+        <button type="button" class="canvas-tool-btn active" data-canvas-tool="select" title="选择 / 移动">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M6 3 L15 10 L10.8 11.2 L13.1 16 L11.1 17 L8.8 12.2 L6 15 Z"/>
+          </svg>
+        </button>
+        <button type="button" class="canvas-tool-btn" data-canvas-tool="lasso" title="套索：圈出一组节点，存成模板">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <ellipse cx="10" cy="8.3" rx="6.2" ry="4.3" stroke-dasharray="2.6 2.1"/>
+            <path d="M6.7 12 C5.8 14.3 7 16 8.7 16.4"/>
+            <circle cx="9.4" cy="16.8" r="1"/>
+          </svg>
+        </button>
+        <button type="button" class="canvas-tool-btn" data-canvas-tool="pen" title="画笔 · 自由书写；再次点击设置，长按恢复默认">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M12.8 4 L16 7.2 L8.1 15.1 L4.4 15.6 L4.9 11.9 Z"/>
+            <path d="M11.1 5.7 L14.3 8.9"/>
+          </svg>
+        </button>
+        <button type="button" class="canvas-tool-btn" data-canvas-tool="eraser" title="橡皮擦除">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M4 12 L11.5 4.5 Q12.5 3.5 13.5 4.5 L16 7 Q17 8 16 9 L9.5 15.5 H5.5 Z"/>
+            <path d="M8.5 7.5 L13 12"/>
+            <path d="M3 16 H17"/>
+          </svg>
+        </button>
+        <button type="button" class="canvas-tool-btn" data-canvas-tool="text" title="添加文字">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M5 5 H15"/>
+            <path d="M10 5 V16"/>
+            <path d="M7 16 H13"/>
+          </svg>
+        </button>
+        <button type="button" class="canvas-tool-btn" data-canvas-tool="arrow" title="添加逆时针箭头；再次点击设置，长按恢复默认">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M4 6 C8 15 12 15 16 13"/>
+            <path d="M12.5 11.5 L16.3 12.9 L13.2 15.3"/>
+          </svg>
+        </button>
+        <button type="button" class="canvas-tool-btn" data-canvas-tool="arrow-cw" title="添加顺时针箭头；再次点击设置，长按恢复默认">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M4 14 C8 5 12 5 16 7"/>
+            <path d="M13.2 4.7 L16.3 7.1 L12.5 8.5"/>
+          </svg>
+        </button>
+        <button type="button" class="canvas-tool-btn" data-canvas-tool="arrow-line" title="直线箭头（选中后可加转折点）；再次点击设置，长按恢复默认">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M4 16 L15 5"/>
+            <path d="M10.5 4.8 L15.4 4.6 L15.2 9.5"/>
+          </svg>
+        </button>
+        <span class="canvas-tool-sep" aria-hidden="true"></span>
+        <button type="button" class="canvas-tool-btn" data-canvas-tool="sketch-rounded-rect" title="手绘圆角矩形">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M5.8 4.2 H14.2 Q16.2 4.2 16.1 6.2 V13.8 Q16.1 15.9 13.9 15.8 H5.8 Q3.9 15.8 3.9 13.7 V6.4 Q3.9 4.3 5.8 4.2 Z"/>
+            <path d="M5.6 4.9 C8.1 4.3 12 4.4 14.4 4.8"/>
+          </svg>
+        </button>
+        <button type="button" class="canvas-tool-btn" data-canvas-tool="sketch-diamond" title="手绘菱形">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M10 3.2 L16.5 10 L10 16.9 L3.5 10 Z"/>
+            <path d="M10.2 3.8 C12.5 6.1 14.7 8.1 16 10.2"/>
+          </svg>
+        </button>
+        <button type="button" class="canvas-tool-btn" data-canvas-tool="sketch-ellipse" title="手绘椭圆">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M3.5 10.2 C3.5 6.6 6.4 4.5 10.1 4.5 C13.8 4.5 16.5 6.5 16.5 10 C16.5 13.4 13.5 15.5 9.8 15.5 C6.1 15.5 3.5 13.5 3.5 10.2 Z"/>
+            <path d="M4.2 9.4 C5.1 5.7 8.2 4.2 11.8 4.9"/>
+          </svg>
+        </button>
+        <span class="canvas-tool-sep" aria-hidden="true"></span>
+        <button type="button" class="canvas-tool-btn canvas-history-btn" data-canvas-history="undo"
+                title="撤销（Ctrl+Z）" aria-label="撤销">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M7 6 L3.8 9.2 L7 12.4"/>
+            <path d="M4.2 9.2 H11.4 C14.4 9.2 16.2 10.8 16.2 13.5 C16.2 15.2 15.2 16.4 13.9 17"/>
+          </svg>
+        </button>
+        <button type="button" class="canvas-tool-btn canvas-history-btn" data-canvas-history="redo"
+                title="重做（Ctrl+Y）" aria-label="重做">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M13 6 L16.2 9.2 L13 12.4"/>
+            <path d="M15.8 9.2 H8.6 C5.6 9.2 3.8 10.8 3.8 13.5 C3.8 15.2 4.8 16.4 6.1 17"/>
+          </svg>
+        </button>
+      </div>
+      <div class="canvas-surface" data-role="canvas-surface">
+        <svg class="canvas-edges-layer" data-role="canvas-edges" width="4000" height="3000"></svg>
+        <svg class="canvas-ink-layer" data-role="canvas-ink" width="4000" height="3000"></svg>
+        <div class="canvas-empty-hint" data-role="empty-hint">
+          双击空白处，记下一个想法
+        </div>
+      </div>
+      <!-- 节点搜索栏（阶段 4：Ctrl+F 打开）-->
+      <div class="search-bar" data-role="search-bar" hidden>
+        <svg class="search-icon" viewBox="0 0 16 16" width="14" height="14" fill="none"
+             stroke="currentColor" stroke-width="1.5"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="7" cy="7" r="4.5"/>
+          <path d="M10.5 10.5L14 14"/>
+        </svg>
+        <input type="text" class="search-input" data-role="search-input"
+               placeholder="搜索节点…" spellcheck="false" autocomplete="off">
+        <span class="search-count" data-role="search-count"></span>
+        <button type="button" class="search-nav" data-role="search-prev"
+                title="上一个（Shift+Enter）" aria-label="上一个">↑</button>
+        <button type="button" class="search-nav" data-role="search-next"
+                title="下一个（Enter）" aria-label="下一个">↓</button>
+        <button type="button" class="search-nav search-close" data-role="search-close"
+                title="关闭（Esc）" aria-label="关闭搜索">×</button>
+      </div>
+
+      <!-- 左下角 HUD：缩放比例（上）+ 小地图（下，阶段 4）-->
+      <div class="viewport-hud-bl">
+        <button type="button" class="zoom-indicator" data-role="zoom-indicator"
+                title="点击重置 100%（Ctrl+0）">100%</button>
+        <div class="minimap" data-role="minimap" title="小地图：点击跳转 / 拖动取景框平移" hidden>
+          <div class="minimap-nodes" data-role="minimap-nodes"></div>
+          <div class="minimap-viewbox" data-role="minimap-viewbox"></div>
+        </div>
+      </div>
+      <div class="first-open-hint" data-role="first-open-hint">
+        双击空白处，写下第一个想法
+      </div>
+            <button type="button" class="assets-clean-btn" data-role="assets-clean-btn"
+              title="存在未使用的附件文件，点击打开文件夹自行清理" aria-label="清理附件" hidden>
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
+             stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14z"></path>
+        </svg>
+      </button>
+      <button type="button" class="help-fab" data-role="help-btn"
+              data-editor-i18n-title="helpTitle" data-editor-i18n-aria="helpAria"
+              title="快捷键速查（?）" aria-label="快捷键速查">?</button>
+      <button type="button" class="settings-fab" data-role="settings-btn"
+              data-editor-i18n-title="settingsTitle" data-editor-i18n-aria="settingsTitle"
+              title="设置" aria-label="设置" aria-expanded="false" aria-controls="settings-pop">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+      </button>
+      <div class="settings-pop" id="settings-pop" data-role="settings-pop" role="dialog"
+           data-editor-i18n-aria="canvasSettings" aria-label="画布设置" hidden>
+        <div class="settings-pop-title" data-editor-i18n="canvasSettings">画布设置</div>
+        <label class="settings-select toolbar-language-select">
+          <span data-role="toolbar-language-label">界面语言</span>
+          <select data-role="toolbar-language" aria-label="界面语言">
+            <option value="zh-CN">中文</option>
+            <option value="en">English</option>
+          </select>
+        </label>
+        <div class="editor-slider settings-slider" title="方向键平移速度">
+          <span class="editor-slider-label" data-editor-i18n="panSpeed">方向键平移速度</span>
+          <div class="settings-slider-track-wrap">
+            <input type="range" class="editor-slider-input"
+                   data-role="pan-speed" min="1" max="20" step="1" value="8">
+            <span class="settings-slider-tick" style="--default-pos:36.8421%" title="默认 8"></span>
+          </div>
+        </div>
+        <div class="editor-slider settings-slider" title="空格 + 左键拖动画布松手后的滑行动量（最左=关闭惯性）">
+          <span class="editor-slider-label"><span data-editor-i18n="panInertia">拖拽惯性</span>
+            <span class="editor-slider-val" data-role="pan-inertia-val">15%</span></span>
+          <div class="settings-slider-track-wrap">
+            <input type="range" class="editor-slider-input"
+                   data-role="pan-inertia" min="0" max="1" step="0.05" value="0.15">
+            <span class="settings-slider-tick" style="--default-pos:15%" title="默认 15%"></span>
+          </div>
+        </div>
+        <div class="editor-slider settings-slider" title="鼠标滚轮缩放速度">
+          <span class="editor-slider-label" data-editor-i18n="zoomSpeed">滚轮缩放速度</span>
+          <div class="settings-slider-track-wrap">
+            <input type="range" class="editor-slider-input"
+                   data-role="zoom-speed" min="0.5" max="3" step="0.1" value="1">
+            <span class="settings-slider-tick" style="--default-pos:20%" title="默认 1×"></span>
+          </div>
+        </div>
+        <div class="editor-slider settings-slider" title="悬停节点多久后浮出任务清单（最左=瞬发）">
+          <span class="editor-slider-label"><span data-editor-i18n="checklistDelay">任务清单出现延迟</span>
+            <span class="editor-slider-val" data-role="checklist-delay-val">0.8s</span></span>
+          <div class="settings-slider-track-wrap">
+            <input type="range" class="editor-slider-input"
+                   data-role="checklist-delay" min="0" max="2000" step="50" value="800">
+            <span class="settings-slider-tick" style="--default-pos:40%" title="默认 0.8s"></span>
+          </div>
+        </div>
+        <div class="editor-slider settings-slider" title="悬停已收起的脑图节点多久后临时展开分支（最左=瞬发）">
+          <span class="editor-slider-label"><span data-editor-i18n="branchDelay">分支预展开延迟</span>
+            <span class="editor-slider-val" data-role="mindmap-hover-delay-val">0.5s</span></span>
+          <div class="settings-slider-track-wrap">
+            <input type="range" class="editor-slider-input"
+                   data-role="mindmap-hover-delay" min="0" max="2000" step="50" value="500">
+            <span class="settings-slider-tick" style="--default-pos:25%" title="默认 0.5s"></span>
+          </div>
+        </div>
+        <div class="editor-slider settings-slider" title="鼠标悬停索引节点多久后，在其左侧弹出目录预览（最左=瞬发）">
+          <span class="editor-slider-label"><span data-editor-i18n="indexDelay">目录出现延迟</span>
+            <span class="editor-slider-val" data-role="index-hover-delay-val">0.4s</span></span>
+          <div class="settings-slider-track-wrap">
+            <input type="range" class="editor-slider-input"
+                   data-role="index-hover-delay" min="0" max="2000" step="50" value="400">
+            <span class="settings-slider-tick" style="--default-pos:20%" title="默认 0.4s"></span>
+          </div>
+        </div>
+        <div class="editor-slider settings-slider" title="鼠标悬停按钮或控件多久后弹出提示文字说明（最左=瞬发）">
+          <span class="editor-slider-label"><span data-editor-i18n="tooltipHoverDelay">提示框出现延迟</span>
+            <span class="editor-slider-val" data-role="tooltip-hover-delay-val">3.5s</span></span>
+          <div class="settings-slider-track-wrap">
+            <input type="range" class="editor-slider-input"
+                   data-role="tooltip-hover-delay" min="0" max="5000" step="50" value="3500">
+            <span class="settings-slider-tick" style="--default-pos:70%" title="默认 3.5s"></span>
+          </div>
+        </div>
+        <div class="editor-slider settings-slider" title="鼠标离开按钮或控件后多久收起提示文字说明（最左=瞬收）">
+          <span class="editor-slider-label"><span data-editor-i18n="tooltipHideDelay">提示框消失延迟</span>
+            <span class="editor-slider-val" data-role="tooltip-hide-delay-val">70ms</span></span>
+          <div class="settings-slider-track-wrap">
+            <input type="range" class="editor-slider-input"
+                   data-role="tooltip-hide-delay" min="0" max="500" step="10" value="70">
+            <span class="settings-slider-tick" style="--default-pos:14%" title="默认 70ms"></span>
+          </div>
+        </div>
+        <div class="settings-pop-divider" aria-hidden="true"></div>
+        <label class="settings-select">
+          <span data-editor-i18n="codeLanguage">新建代码节点语言</span>
+          <select data-role="code-default-language" aria-label="新建代码节点默认语言">
+            <option value="c">C</option>
+            <option value="python">Python</option>
+            <option value="matlab">MATLAB</option>
+          </select>
+        </label>
+        <div class="settings-checks-grid">
+        <label class="settings-check" title="总开关：同时控制左侧画布手写笔，以及 PDF / Markdown / 正文阅读批注里的压感钢笔；关掉则全部不随力度变粗细。左侧画布笔还需在左侧「画笔」配置里单独勾选「压感」才生效。">
+          <input type="checkbox" data-role="pen-pressure" checked>
+          <span data-editor-i18n="penPressure">手写笔压感总开关（含批注钢笔）</span>
+        </label>
+        <label class="settings-check" title="拖动单个文本框靠近内容节点时显示绿色对齐线并自动吸附；默认关闭。">
+          <input type="checkbox" data-role="enable-text-snap">
+          <span data-editor-i18n="textSnap">文本框拖动自动对齐</span>
+        </label>
+        <label class="settings-check" title="在节点左侧显示悬停任务清单入口">
+          <input type="checkbox" data-role="show-node-checklists">
+          <span data-editor-i18n="nodeChecklists">显示节点任务清单</span>
+        </label>
+        <label class="settings-check" title="在有子节点的节点右侧显示收起 / 展开按钮">
+          <input type="checkbox" data-role="show-mindmap-folds">
+          <span data-editor-i18n="foldControls">显示收起子节点按钮</span>
+        </label>
+        <label class="settings-check" title="控制「画布」完整状态下选中节点或连线时是否打开属性检查器；简洁状态始终禁用">
+          <input type="checkbox" data-role="enable-inspector" checked>
+          <span data-editor-i18n="canvasInspector">启动《画布》的属性检查器</span>
+        </label>
+        <label class="settings-check" title="控制思维导图模式完整状态下选中对象时是否打开属性检查器；导图排版预设面板仍会保留">
+          <input type="checkbox" data-role="enable-mindmap-inspector">
+          <span data-editor-i18n="mindmapInspector">启动思维导图模式的属性检查器</span>
+        </label>
+        <label class="settings-check" title="控制图案模式完整状态下选中装饰对象时是否打开属性检查器；图案新建预设面板仍会保留">
+          <input type="checkbox" data-role="enable-decor-inspector" checked>
+          <span data-editor-i18n="decorInspector">启动图案模式的属性检查器</span>
+        </label>
+        <label class="settings-check" title="鼠标悬停索引节点时，在其左侧弹出只读目录预览（默认开启；出现快慢见上方「目录出现延迟」）">
+          <input type="checkbox" data-role="enable-index-hover" checked>
+          <span data-editor-i18n="indexHover">悬停弹出目录</span>
+        </label>
+        <label class="settings-check" title="框选多个节点后浮出「生成索引」小按钮，一键收成目录卡（默认关闭）">
+          <input type="checkbox" data-role="enable-gen-index">
+          <span data-editor-i18n="selectionIndex">框选生成索引目录</span>
+        </label>
+        <label class="settings-check" title="左键框选空白区域后浮出「+ 盒子」按钮；框选节点后浮出「+ 分组」按钮（默认开启）">
+          <input type="checkbox" data-role="enable-box-create" checked>
+          <span data-editor-i18n="boxCreate">框选创建盒子/分组</span>
+        </label>
+        <label class="settings-check" title="背景语义为深色时，把画布连线临时按荧光样式显示；只改变视觉，不修改线条原始样式或 .canvas 数据。">
+          <input type="checkbox" data-role="enable-dark-edge-optimization" checked>
+          <span data-editor-i18n="darkLines">深色模式线条优化</span>
+        </label>
+        <label class="settings-check" title="改动后自动保存到 .canvas 文件（默认开启）；关掉则回到手动 Ctrl+S">
+          <input type="checkbox" data-role="enable-dark-semantic-ui" checked>
+          <span data-editor-i18n="darkUi">深色语义 UI 优化</span>
+        </label>
+        <label class="settings-check" title="改动后自动保存到 .canvas 文件（默认开启）；关掉则回到手动 Ctrl+S">
+          <input type="checkbox" data-role="enable-autosave" checked>
+          <span data-editor-i18n="autosave">自动保存</span>
+        </label>
+        </div>
+
+        <div class="settings-pop-divider" aria-hidden="true"></div>
+        <div class="settings-pop-title" data-editor-i18n="view">视图</div>
+        <button type="button" class="settings-action-btn"
+                data-role="locate-recent" title="定位最近新增的节点（空格）">
+          <svg viewBox="0 0 16 16" width="15" height="15" fill="none"
+               stroke="currentColor" stroke-width="1.5"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3 6V3h3M13 6V3h-3M3 10v3h3M13 10v3h-3"/>
+            <circle cx="8" cy="8" r="1.5" fill="currentColor" stroke="none"/>
+          </svg>
+          <span data-editor-i18n="locateLatest">定位最近节点</span>
+          <kbd data-editor-i18n="space">空格</kbd>
+        </button>
+        <label class="settings-check" title="关闭后，空格仍可按住拖动画布，但松开空格不再自动定位最近节点">
+          <input type="checkbox" data-role="enable-space-locate">
+          <span data-editor-i18n="spaceLocate">空格键定位最近节点</span>
+        </label>
+        <button type="button" class="settings-action-btn"
+                data-role="zoom-preset" title="按偏好缩放并居中">
+          <svg viewBox="0 0 16 16" width="15" height="15" fill="none"
+               stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+            <circle cx="8" cy="8" r="5"/>
+            <circle cx="8" cy="8" r="1.5" fill="currentColor" stroke="none"/>
+          </svg>
+          <span data-editor-i18n="centerZoom">偏好缩放并居中</span>
+        </button>
+        <div class="settings-zoom-row">
+          <span class="editor-slider-label" data-editor-i18n="zoomLevel">缩放比例</span>
+          <input type="text" class="editor-zoom-pref"
+                 data-role="zoom-pref" value="100%" maxlength="5" inputmode="numeric"
+                 title="偏好缩放比例（25-400%；点击修改，Enter 保存）">
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- 正常画布模式面板：用于配置之后新建的节点与连线。 -->
+  <aside class="side-panel" data-role="pro-panel" role="group" aria-label="新建默认样式">
+    <div class="side-panel-head">
+      <span class="side-panel-head-title" data-editor-i18n="canvasNewStyles">画布 · 新建样式</span>
+      <button type="button" class="panel-dim-btn" data-role="panel-dim-toggle" aria-pressed="false" aria-label="熄灭面板">
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <g class="pd-beam">
+            <line x1="12" y1="2" x2="12" y2="0.8"/>
+            <line x1="8.2" y1="2.4" x2="7.2" y2="1.1"/>
+            <line x1="15.8" y1="2.4" x2="16.8" y2="1.1"/>
+          </g>
+          <path d="M18 6c0 2-2 2-2 4v10a2 2 0 0 1-2 2h-4a2 2 0 0 1-2-2V10c0-2-2-2-2-4V2h14v4Z"/>
+          <line x1="6" y1="6" x2="18" y2="6"/>
+        </svg>
+      </button>
+    </div>
+    <div class="side-panel-body">
+      <div class="sp-subhead" data-editor-i18n="nodes">节点</div>
+      <div class="sp-field">
+        <label>类型</label>
+        <div class="sp-shape-switch sp-multi" data-role="pro-kind">
+          <button type="button" data-kind="index">索引</button>
+          <button type="button" data-kind="preview">预览</button>
+          <button type="button" data-kind="card" class="active">卡片</button>
+          <button type="button" data-kind="sticky">便签</button>
+          <button type="button" data-kind="code">代码</button>
+        </div>
+      </div>
+      <div class="sp-field">
+        <label>形状</label>
+        <div class="sp-shape-switch" data-role="pro-shape">
+          <button type="button" data-shape="rect" class="active">矩形</button>
+          <button type="button" data-shape="square">正方</button>
+          <button type="button" data-shape="circle">圆形</button>
+        </div>
+      </div>
+      <div class="sp-field">
+        <label>边框颜色</label>
+        <input type="color" data-role="pro-border" value="#000000">
+      </div>
+      <div class="sp-field">
+        <label>背景颜色</label>
+        <input type="color" data-role="pro-bg" value="#ffffff">
+      </div>
+      <div class="sp-field canvas-color-field">
+        <label data-editor-i18n="quickColors">快速配色</label>
+        <div class="canvas-color-presets" data-role="pro-node-color-presets" aria-label="节点配色预设" data-editor-i18n-aria="nodeColorPresets"></div>
+        <button type="button" class="sp-reset sp-reset-compact canvas-section-reset" data-role="pro-reset-colors" data-editor-i18n="resetColors">恢复配色</button>
+      </div>
+      <div class="sp-field">
+        <label>背景透明度 <span data-role="pro-opacity-val">100%</span></label>
+        <div class="settings-slider-track-wrap">
+          <input type="range" data-role="pro-opacity" min="0" max="100" step="5" value="100">
+          <span class="settings-slider-tick" style="--default-pos:100%" title="默认 100%"></span>
+        </div>
+      </div>
+      <label class="sp-check">
+        <input type="checkbox" data-role="pro-hide-chrome">
+        <span>隐藏节点背景</span>
+      </label>
+      <button type="button" class="sp-reset sp-reset-compact canvas-section-reset" data-role="pro-reset-geometry" data-editor-i18n="resetGeometry">恢复形状与缩放</button>
+
+      <div class="sp-subhead" data-editor-i18n="typeAndOutline">文字与轮廓</div>
+      <div class="sp-field">
+        <label>整体缩放 <span data-role="pro-scale-val">100%</span></label>
+        <div class="settings-slider-track-wrap">
+          <input type="range" data-role="pro-scale" min="50" max="200" step="1" value="100">
+          <span class="settings-slider-tick" style="--default-pos:33.3333%" title="默认 100%"></span>
+        </div>
+      </div>
+      <div class="sp-field">
+        <label>圆角 <span data-role="pro-radius-val">10px</span></label>
+        <div class="settings-slider-track-wrap">
+          <input type="range" data-role="pro-radius" min="0" max="40" step="1" value="10">
+          <span class="settings-slider-tick" style="--default-pos:25%" title="默认 10px"></span>
+        </div>
+      </div>
+      <div class="sp-field">
+        <label>字重 <span data-role="pro-font-weight-val">默认</span></label>
+        <input type="range" data-role="pro-font-weight" min="100" max="900" step="10" value="400">
+      </div>
+      <div class="sp-field">
+        <label>文字比例 <span data-role="pro-font-scale-val">100%</span></label>
+        <div class="settings-slider-track-wrap">
+          <input type="range" data-role="pro-font-scale" min="75" max="160" step="1" value="100">
+          <span class="settings-slider-tick" style="--default-pos:29.4118%" title="默认 100%"></span>
+        </div>
+      </div>
+      <div class="sp-field">
+        <label>文字对齐</label>
+        <div class="sp-shape-switch" data-role="pro-text-align">
+          <button type="button" data-text-align="left" class="active">左</button>
+          <button type="button" data-text-align="center">中</button>
+          <button type="button" data-text-align="right">右</button>
+        </div>
+      </div>
+      <button type="button" class="sp-reset sp-reset-compact canvas-section-reset" data-role="pro-reset-typography" data-editor-i18n="resetTypography">恢复文字与轮廓</button>
+
+      <div class="sp-subhead" data-editor-i18n="lines">线条</div>
+      <div class="sp-field">
+        <label>线型</label>
+        <div class="sp-shape-switch sp-multi" data-role="pro-curve">
+          <button type="button" data-curve="bezier" class="active">曲线</button>
+          <button type="button" data-curve="straight">直线</button>
+          <button type="button" data-curve="elbow">折线</button>
+          <button type="button" data-curve="rounded-elbow">圆角折线</button>
+          <button type="button" data-curve="s-curve">S 曲线</button>
+          <button type="button" data-curve="smooth">平滑曲线</button>
+          <button type="button" data-curve="branch">枝桠曲线</button>
+          <button type="button" data-curve="arc">弧线</button>
+          <button type="button" data-curve="organic">自然曲线</button>
+        </div>
+      </div>
+      <div class="sp-field">
+        <label>线条样式</label>
+        <div class="sp-shape-switch sp-multi" data-role="pro-line-style">
+          <button type="button" data-line-style="solid" class="active">实线</button>
+          <button type="button" data-line-style="dashed">虚线</button>
+          <button type="button" data-line-style="dotted">点线</button>
+          <button type="button" data-line-style="soft">柔线</button>
+          <button type="button" data-line-style="glow">荧光</button>
+        </div>
+      </div>
+      <div class="sp-field">
+        <label>线条颜色</label>
+        <input type="color" data-role="pro-color" value="#000000">
+        <div class="canvas-edge-color-presets" data-role="pro-edge-color-presets" aria-label="连线颜色预设" data-editor-i18n-aria="lineColorPresets"></div>
+      </div>
+      <div class="sp-field">
+        <label>箭头</label>
+        <div class="sp-shape-switch" data-role="pro-arrow">
+          <button type="button" data-arrow="none" class="active">无</button>
+          <button type="button" data-arrow="one">单向</button>
+          <button type="button" data-arrow="both">双向</button>
+        </div>
+      </div>
+      <div class="sp-field">
+        <label>线条粗细 <span data-role="pro-width-val">1.5</span></label>
+        <div class="settings-slider-track-wrap">
+          <input type="range" data-role="pro-width" min="1" max="6" step="0.5" value="1.5">
+          <span class="settings-slider-tick" style="--default-pos:10%" title="默认 1.5"></span>
+        </div>
+      </div>
+      <div class="sp-field">
+        <label>箭头大小 <span data-role="pro-arrowsize-val">12</span></label>
+        <div class="settings-slider-track-wrap">
+          <input type="range" data-role="pro-arrowsize" min="8" max="24" step="1" value="12">
+          <span class="settings-slider-tick" style="--default-pos:25%" title="默认 12"></span>
+        </div>
+      </div>
+
+      <div class="canvas-style-main-actions">
+        <button type="button" class="sp-reset" data-role="pro-apply-defaults" data-editor-i18n="applyCurrentNewStyle" hidden>应用当前新建样式</button>
+        <button type="button" class="sp-reset edit-reset-appearance" data-role="pro-reset" data-editor-i18n="resetNewStyleDefaults">全部新建样式恢复朴素默认</button>
+      </div>
+
+      <!-- 节点内容区：箭头独立记忆展开状态；单选节点时可用，无选择时保持高度并变灰 -->
+      <div class="sp-subhead pro-content-head" data-role="pro-content-head" aria-expanded="false">
+        <button type="button" class="sp-section-toggle" data-role="pro-content-toggle" data-editor-i18n-aria="nodeContent">
+          <span data-editor-i18n="nodeContent">节点内容</span>
+          <svg class="sp-toggle-arrow" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <span class="sp-section-hint" data-role="pro-content-hint" data-editor-i18n="contentHint">选中一个节点后可编辑正文</span>
+      </div>
+      <div class="sp-content-body" data-role="pro-content-body">
+        <div class="sp-field">
+          <label><span data-editor-i18n="bodyLabel">正文</span> <span class="sp-field-note" data-role="pro-body-note" data-editor-i18n="bodyNoteDefault">只在阅读窗口显示</span></label>
+          <textarea class="sp-text-body" data-role="pro-body"
+                    placeholder="把长文本粘贴到这里。支持 Markdown、数学公式与选区标注。"
+                    spellcheck="false"></textarea>
+          <div class="sp-text-body sp-rich-body" data-role="pro-body-rich" contenteditable="true"
+               aria-label="正文富文本编辑器" data-editor-i18n-aria="richBodyEditor" spellcheck="false" hidden></div>
+          <div class="sp-hint" data-role="pro-body-hint" data-editor-i18n="bodyHintCard">卡片正文常驻显示；预览悬停展开；便签正文即主体；代码整块着色。</div>
+        </div>
+        <div class="sp-field" data-role="pro-code-lang-wrap" hidden>
+          <label data-editor-i18n="codeLangLabel">代码语言</label>
+          <select class="sp-select" data-role="pro-code-language" aria-label="代码节点语言">
+            <option value="c">C</option>
+            <option value="python">Python</option>
+            <option value="matlab">MATLAB</option>
+          </select>
+          <div class="sp-hint" data-editor-i18n="codeLangHint">只影响当前代码节点的着色；代码不会执行。</div>
+        </div>
+        <label class="sp-check">
+          <input type="checkbox" data-role="pro-review-enabled">
+          <span data-editor-i18n="reviewEnabled">加入复习卡片</span>
+        </label>
+        <textarea class="sp-text-body sp-review-questions" data-role="pro-review-questions"
+                  placeholder="每行一个自定义问题；留空时使用系统预设问题。"
+                  spellcheck="false"></textarea>
+        <div class="sp-hint">复习页会优先抽这些问题，再混合系统预设问题。</div>
+        <textarea class="sp-text-body sp-review-answer" data-role="pro-review-answer"
+                  placeholder="参考答案（可留空）：复习时点「查看答案」才显示。"
+                  spellcheck="false"></textarea>
+      </div>
+    </div>
+    <div class="side-panel-note" data-role="pro-note" data-editor-i18n="proNoteDefaults">只影响之后新建的节点与连线；选中单个节点时可直接编辑其属性。</div>
+  </aside>
+
+  <!-- 当前所选：任意内容对象被选中时自动出现，不再是独立模式。 -->
+  <aside class="side-panel" data-role="edit-panel" role="group" aria-label="编辑选中对象">
+    <div class="side-panel-head">
+      <span class="side-panel-head-title" data-editor-i18n="inspectorPanel">属性检查器</span>
+      <button type="button" class="panel-dim-btn" data-role="panel-dim-toggle" aria-pressed="false" aria-label="熄灭面板">
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <g class="pd-beam">
+            <line x1="12" y1="2" x2="12" y2="0.8"/>
+            <line x1="8.2" y1="2.4" x2="7.2" y2="1.1"/>
+            <line x1="15.8" y1="2.4" x2="16.8" y2="1.1"/>
+          </g>
+          <path d="M18 6c0 2-2 2-2 4v10a2 2 0 0 1-2 2h-4a2 2 0 0 1-2-2V10c0-2-2-2-2-4V2h14v4Z"/>
+          <line x1="6" y1="6" x2="18" y2="6"/>
+        </svg>
+      </button>
+    </div>
+    <div class="side-panel-body">
+      <div class="sp-empty" data-role="edit-empty" data-editor-i18n="epEmpty">
+        选中一个或多个节点 / 连线来精修样式；多选会批量应用。\n仍可双击新建、粘贴、复制或 Alt 拖出连线；在线身上拖动可加拐点。
+      </div>
+
+      <div data-role="edit-node" hidden>
+        <div class="edit-selection-summary">
+          <div>
+            <div class="sp-subhead" data-editor-i18n="epNodes">节点</div>
+            <div class="edit-selection-title" data-role="en-selection-title">当前节点</div>
+          </div>
+          <span class="edit-selection-badge" data-role="en-selection-badge">单选</span>
+        </div>
+        <div class="sp-hint" data-role="en-batch-note" hidden></div>
+        <button type="button" class="sp-reset edit-create-group" data-role="en-create-group" hidden>建立分组</button>
+        <div class="edit-mindmap-context" data-role="en-mindmap-context" hidden>
+          <div class="edit-context-head">
+            <span data-editor-i18n="epMindmapStyle">思维导图样式</span>
+            <span class="edit-context-state" data-role="en-mindmap-state">跟随预设</span>
+          </div>
+          <div class="edit-context-actions">
+            <button type="button" class="sp-reset" data-role="en-mindmap-reset-color" data-editor-i18n="epResetPresetColor">恢复预设配色</button>
+            <button type="button" class="sp-reset" data-role="en-mindmap-reset-size" data-editor-i18n="epResetAutoSize">恢复自动尺寸</button>
+          </div>
+          <div class="sp-hint" data-editor-i18n="epMindmapHint">编辑颜色或尺寸会转为手工值；恢复后会继续跟随脑图分支和层级。</div>
+        </div>
+        <div class="sp-text-node-banner" data-role="en-text-banner" hidden>
+          <span data-role="en-kind-label">索引节点</span>
+          <button type="button" class="sp-inline-action" data-role="en-open-reader">阅读（F）</button>
+        </div>
+        <div class="sp-field" data-role="en-switch-kind-wrap" hidden>
+          <button type="button" class="sp-reset" data-role="en-switch-text" hidden>转换为索引节点</button>
+          <button type="button" class="sp-reset" data-role="en-switch-preview" hidden>转换为预览节点</button>
+          <button type="button" class="sp-reset" data-role="en-switch-card" hidden>转换为卡片节点</button>
+          <button type="button" class="sp-reset" data-role="en-switch-code" hidden>转换为代码节点</button>
+          <div class="sp-hint" data-editor-i18n="epConvertHint">转换会保留标题；索引按连接关系自动生成目录，卡片正文常驻显示，预览悬停展开，代码只做语法着色。</div>
+        </div>
+        <div class="sp-field" data-role="en-convert-normal-wrap" hidden>
+          <button type="button" class="sp-reset sp-reset-danger" data-role="en-convert-normal" data-editor-i18n="epConvertNormal">
+            转换为普通节点
+          </button>
+          <div class="sp-hint" data-editor-i18n="epConvertNormalHint">仅保留标题，正文会在确认后清除。</div>
+        </div>
+        <div class="sp-field" data-role="en-convert-wrap">
+          <button type="button" class="sp-reset" data-role="en-convert-text">转换为索引节点</button>
+          <button type="button" class="sp-reset" data-role="en-convert-preview">转换为预览节点</button>
+          <button type="button" class="sp-reset" data-role="en-convert-card">转换为卡片节点</button>
+          <button type="button" class="sp-reset" data-role="en-convert-code">转换为代码节点</button>
+          <div class="sp-hint" data-editor-i18n="epConvertContentHint">当前内容会完整保存为正文，首行成为可见标题，可撤销。</div>
+        </div>
+        <div class="sp-field" data-role="en-code-language-wrap" hidden>
+          <label>代码语言</label>
+          <select class="sp-select" data-role="en-code-language" aria-label="代码节点语言">
+            <option value="c">C</option>
+            <option value="python">Python</option>
+            <option value="matlab">MATLAB</option>
+          </select>
+          <div class="sp-hint">只影响当前代码节点的着色；代码不会执行，也不会解析 Markdown 或数学公式。</div>
+        </div>
+        <div class="sp-field" data-role="decor-width-wrap">
+          <label>形状 <span class="sp-field-note" data-role="en-shape-state"></span></label>
+          <div class="sp-shape-switch" data-role="en-shape">
+            <button type="button" data-shape="rect">矩形</button>
+            <button type="button" data-shape="square">正方</button>
+            <button type="button" data-shape="circle">圆形</button>
+          </div>
+        </div>
+        <div class="sp-field" data-role="decor-height-wrap">
+          <label>边框颜色 <span class="sp-field-note" data-role="en-border-state"></span></label>
+          <input type="color" data-role="en-border" value="#000000">
+        </div>
+        <div class="sp-field" data-role="decor-rotation-wrap">
+          <label>背景颜色 <span class="sp-field-note" data-role="en-bg-state"></span></label>
+          <input type="color" data-role="en-bg" value="#ffffff">
+        </div>
+        <div class="sp-field canvas-color-field">
+          <label data-editor-i18n="quickColors">快速配色</label>
+          <div class="canvas-color-presets" data-role="en-node-color-presets" aria-label="节点配色预设" data-editor-i18n-aria="nodeColorPresets"></div>
+          <button type="button" class="sp-reset sp-reset-compact canvas-section-reset" data-role="en-reset-colors" data-editor-i18n="resetColors">恢复配色</button>
+        </div>
+        <div class="sp-field" data-role="decor-opacity-wrap">
+          <label>背景透明度 <span data-role="en-opacity-val">100%</span></label>
+          <input type="range" data-role="en-opacity" min="0" max="100" step="1" value="100">
+        </div>
+        <label class="sp-check">
+          <input type="checkbox" data-role="en-hide-chrome">
+          <span>隐藏节点背景</span>
+        </label>
+        <div class="sp-field" data-role="decor-layer-wrap">
+          <label>整体缩放 <span data-role="en-scale-val">100%</span></label>
+          <input type="range" data-role="en-scale" min="50" max="200" step="1" value="100">
+        </div>
+        <button type="button" class="sp-reset sp-reset-compact canvas-section-reset" data-role="en-reset-geometry" data-editor-i18n="resetGeometry">恢复形状与缩放</button>
+        <div class="sp-subhead edit-inspector-section">文字与轮廓</div>
+        <div class="sp-field">
+          <label>圆角 <span data-role="en-radius-val">默认</span></label>
+          <input type="range" data-role="en-radius" min="0" max="32" step="1" value="8">
+        </div>
+        <div class="sp-field">
+          <label>字重 <span data-role="en-font-weight-val">默认</span></label>
+          <input type="range" data-role="en-font-weight" min="100" max="900" step="10" value="400">
+        </div>
+        <div class="sp-field">
+          <label>文字比例 <span data-role="en-font-scale-val">100%</span></label>
+          <input type="range" data-role="en-font-scale" min="75" max="160" step="1" value="100">
+        </div>
+        <div class="sp-field">
+          <label>文字对齐 <span class="sp-field-note" data-role="en-text-align-state"></span></label>
+          <div class="sp-shape-switch" data-role="en-text-align">
+            <button type="button" data-text-align="left">左</button>
+            <button type="button" data-text-align="center">中</button>
+            <button type="button" data-text-align="right">右</button>
+          </div>
+        </div>
+        <button type="button" class="sp-reset sp-reset-compact canvas-section-reset" data-role="en-reset-typography" data-editor-i18n="resetTypography">恢复文字与轮廓</button>
+        <div class="sp-field" data-role="en-body-wrap" hidden>
+          <label>正文 <span class="sp-field-note" data-role="en-body-note">只在阅读窗口显示</span></label>
+          <textarea class="sp-text-body" data-role="en-body"
+                    placeholder="把长文本粘贴到这里。支持 Markdown、数学公式与选区标注。"
+                    spellcheck="false"></textarea>
+          <div class="sp-text-body sp-rich-body" data-role="en-body-rich" contenteditable="true"
+               aria-label="正文富文本编辑器" data-editor-i18n-aria="richBodyEditor" spellcheck="false" hidden></div>
+          <div class="sp-hint" data-role="en-body-hint">选中文字可添加高光、字色或字号；回到画布后按 F 阅读。</div>
+        </div>
+        <div class="sp-field" data-role="en-review-wrap" hidden>
+          <label class="sp-check sp-check-inline">
+            <input type="checkbox" data-role="en-review-enabled">
+            <span>加入复习卡片</span>
+          </label>
+          <textarea class="sp-text-body sp-review-questions" data-role="en-review-questions"
+                    placeholder="每行一个自定义问题；留空时使用系统预设问题。"
+                    spellcheck="false"></textarea>
+          <div class="sp-hint" data-role="pro-review-hint" data-editor-i18n="reviewHint">复习页会优先抽这些问题，再混合系统预设问题。</div>
+          <textarea class="sp-text-body sp-review-answer" data-role="en-review-answer"
+                    placeholder="参考答案（可留空）：复习时点「查看答案」才显示。"
+                    spellcheck="false"></textarea>
+          <div class="sp-hint">写给未来的自己对照用；复习卡片右上角「查看答案」会显示它。</div>
+        </div>
+        <div class="sp-field" data-role="en-review-batch-wrap" hidden>
+          <label class="sp-check sp-check-inline">
+            <input type="checkbox" data-role="en-review-batch">
+            <span data-editor-i18n="reviewEnabled">加入复习卡片</span>
+          </label>
+          <div class="sp-hint" data-editor-i18n="epReviewBatchHint">横线表示仅部分节点已加入；点击会统一加入，再次取消则全部移出。</div>
+        </div>
+        <div class="canvas-style-main-actions">
+          <button type="button" class="sp-reset" data-role="en-apply-defaults" data-editor-i18n="applyCurrentNewStyle">应用当前新建样式</button>
+          <button type="button" class="sp-reset edit-reset-appearance" data-role="en-reset-appearance" data-editor-i18n="resetBuiltInAppearance">恢复内置朴素外观</button>
+        </div>
+      </div>
+
+      <div data-role="edit-edge" hidden>
+        <div class="edit-selection-summary">
+          <div>
+            <div class="sp-subhead">连线</div>
+            <div class="edit-selection-title" data-role="ee-selection-title">当前连线</div>
+          </div>
+          <span class="edit-selection-badge" data-role="ee-selection-badge">单选</span>
+        </div>
+        <div class="sp-hint" data-role="ee-batch-note" hidden></div>
+        <div class="sp-field">
+          <label>线型 <span class="sp-field-note" data-role="ee-curve-state"></span></label>
+          <div class="sp-shape-switch sp-multi" data-role="ee-curve">
+            <button type="button" data-curve="bezier">曲线</button>
+            <button type="button" data-curve="straight">直线</button>
+            <button type="button" data-curve="elbow">折线</button>
+            <button type="button" data-curve="rounded-elbow">圆角折线</button>
+            <button type="button" data-curve="s-curve">S 曲线</button>
+            <button type="button" data-curve="smooth">平滑曲线</button>
+            <button type="button" data-curve="branch">枝桠曲线</button>
+            <button type="button" data-curve="arc">弧线</button>
+            <button type="button" data-curve="organic">自然曲线</button>
+          </div>
+        </div>
+        <div class="sp-field">
+          <label>线条样式 <span class="sp-field-note" data-role="ee-line-style-state"></span></label>
+          <div class="sp-shape-switch sp-multi" data-role="ee-line-style">
+            <button type="button" data-line-style="solid">实线</button>
+            <button type="button" data-line-style="dashed">虚线</button>
+            <button type="button" data-line-style="dotted">点线</button>
+            <button type="button" data-line-style="soft">柔线</button>
+            <button type="button" data-line-style="glow">荧光</button>
+          </div>
+        </div>
+        <div class="sp-field">
+          <label>线条颜色 <span class="sp-field-note" data-role="ee-color-state"></span></label>
+          <input type="color" data-role="ee-color" value="#000000">
+          <div class="canvas-edge-color-presets" data-role="ee-color-presets" aria-label="连线颜色预设" data-editor-i18n-aria="lineColorPresets"></div>
+          <button type="button" class="sp-reset sp-reset-compact canvas-section-reset" data-role="ee-color-reset" data-editor-i18n="resetLineColor">恢复连线颜色</button>
+        </div>
+        <div class="sp-field">
+          <label>箭头 <span class="sp-field-note" data-role="ee-arrow-state"></span></label>
+          <div class="sp-shape-switch" data-role="ee-arrow">
+            <button type="button" data-arrow="none">无</button>
+            <button type="button" data-arrow="one">单向</button>
+            <button type="button" data-arrow="both">双向</button>
+          </div>
+        </div>
+        <div class="sp-field">
+          <label>线条粗细 <span data-role="ee-width-val">1.5</span></label>
+          <input type="range" data-role="ee-width" min="1" max="6" step="0.5" value="1.5">
+        </div>
+        <div class="sp-field">
+          <label>箭头大小 <span data-role="ee-arrowsize-val">12</span></label>
+          <input type="range" data-role="ee-arrowsize" min="8" max="24" step="1" value="12">
+        </div>
+        <button type="button" class="sp-reset" data-role="ee-clear-waypoints" data-editor-i18n="epClearWaypoints">清除所有拐点</button>
+        <div class="canvas-style-main-actions">
+          <button type="button" class="sp-reset" data-role="ee-apply-defaults" data-editor-i18n="applyCurrentNewLineStyle">应用当前新建连线样式</button>
+          <button type="button" class="sp-reset edit-reset-appearance" data-role="ee-reset-appearance" data-editor-i18n="resetBuiltInLineStyle">恢复内置朴素连线</button>
+        </div>
+      </div>
+    </div>
+    <div class="side-panel-note">改动作用于当前选中的内容节点或连线；多选会批量应用，创建操作仍可正常使用。</div>
+  </aside>
+
+  <!-- 新版 EXE 第 7 项：图案模式 · 装饰图案与图片 -->
+  <aside class="side-panel decor-panel" data-role="decor-panel" role="group" aria-label="图案与图片">
+    <div class="side-panel-head">
+      <span class="side-panel-head-title" data-editor-i18n="patternsMode">图案模式</span>
+      <button type="button" class="panel-dim-btn" data-role="panel-dim-toggle" aria-pressed="false" aria-label="熄灭面板">
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <g class="pd-beam">
+            <line x1="12" y1="2" x2="12" y2="0.8"/>
+            <line x1="8.2" y1="2.4" x2="7.2" y2="1.1"/>
+            <line x1="15.8" y1="2.4" x2="16.8" y2="1.1"/>
+          </g>
+          <path d="M18 6c0 2-2 2-2 4v10a2 2 0 0 1-2 2h-4a2 2 0 0 1-2-2V10c0-2-2-2-2-4V2h14v4Z"/>
+          <line x1="6" y1="6" x2="18" y2="6"/>
+        </svg>
+      </button>
+    </div>
+    <div class="side-panel-body">
+      <div class="sp-subhead" data-editor-i18n="insertShapes">插入图案</div>
+      <div class="decor-palette" data-role="decor-palette">
+        <button type="button" data-shape-type="dashed-box" data-editor-i18n="dashedBox">虚线框</button>
+        <button type="button" data-shape-type="color-block" data-editor-i18n="colorBlock">纯色色块</button>
+        <button type="button" data-text-preset="emphasis-card" data-editor-i18n="emphasisNote">重点便签</button>
+        <button type="button" data-text-preset="note-bubble" data-editor-i18n="noteBubble">旁注框</button>
+        <button type="button" data-shape-type="bracket" data-editor-i18n="bracket">括号标记</button>
+        <button type="button" data-shape-type="divider" data-editor-i18n="divider">分隔线</button>
+        <button type="button" data-shape-type="corner-frame" data-editor-i18n="cornerFrame">角标框</button>
+        <button type="button" data-shape-type="question" data-editor-i18n="question">问号</button>
+        <button type="button" data-shape-type="sketch-rounded-rect" data-editor-i18n="sketchRect">手绘圆角矩形</button>
+        <button type="button" data-shape-type="sketch-diamond" data-editor-i18n="sketchDiamond">手绘菱形</button>
+        <button type="button" data-shape-type="sketch-ellipse" data-editor-i18n="sketchEllipse">手绘椭圆</button>
+      </div>
+      <button type="button" class="sp-reset decor-image-add" data-role="decor-add-image">
+        <span data-editor-i18n="insertImage">插入本地图片</span>
+      </button>
+      <button type="button" class="sp-reset decor-image-add" data-role="decor-add-attachment">
+        <span data-editor-i18n="insertAttachment">插入 PDF / Markdown 附件</span>
+      </button>
+      <div class="sp-hint">也可以直接把本地图片 / PDF / Markdown 文件拖进画布；图片存到 &lt;画布名&gt;.assets/images/，附件存到 .assets/attachments/（同一文档按内容去重只存一份）。附件可任意模式拖动（拖标题栏）、正文区滚动，图案模式可调大小。</div>
+
+      <div class="sp-subhead decor-group-preset-head">
+        <span data-editor-i18n="groupPresets">盒子 / 分组预设</span>
+        <span class="decor-global-badge" data-role="decor-group-preset-mode">新建预设</span>
+      </div>
+      <div class="decor-group-presets" data-role="decor-group-presets" aria-label="盒子与分组预设"></div>
+      <div class="sp-hint" data-role="decor-group-preset-hint">没有选中盒子或分组时，点击只修改之后新建的默认样式。</div>
+
+      <div class="decor-selection-empty" data-role="decor-selection-empty">
+        选中一个图案或图片后，可调整外观、尺寸与图层。
+      </div>
+      <div class="decor-selection" data-role="decor-selection" hidden>
+        <div class="sp-subhead" data-role="decor-kind-label" data-i18n-managed="canvas">图案</div>
+        <div class="sp-field">
+          <label>宽度 <span data-role="decor-width-val">240px</span></label>
+          <input type="range" data-role="decor-width" min="20" max="2000" step="5" value="240">
+        </div>
+        <div class="sp-field">
+          <label>高度 <span data-role="decor-height-val">140px</span></label>
+          <input type="range" data-role="decor-height" min="8" max="2000" step="5" value="140">
+        </div>
+        <div class="sp-field" data-role="decor-font-size-wrap" hidden>
+          <label>字号 <span data-role="decor-font-size-val">22px</span></label>
+          <input type="range" data-role="decor-font-size" min="10" max="96" step="1" value="22">
+        </div>
+        <div class="sp-field">
+          <label>旋转角度 <span data-role="decor-rotation-val">0°</span></label>
+          <input type="range" data-role="decor-rotation" min="-180" max="180" step="1" value="0">
+        </div>
+        <div class="sp-field" data-role="decor-shape-colors">
+          <div data-role="decor-border-style-wrap" hidden>
+            <label>线条样式 <span data-role="decor-border-style-state"></span></label>
+            <div class="sp-shape-switch sp-multi" data-role="decor-border-style">
+              <button type="button" data-border-style="solid">实线</button>
+              <button type="button" data-border-style="dashed">虚线</button>
+              <button type="button" data-border-style="dotted">点线</button>
+              <button type="button" data-border-style="double">双线</button>
+            </div>
+          </div>
+          <div class="sp-field decor-border-width-field" data-role="decor-border-width-wrap" hidden>
+            <label>边框粗细 <span data-role="decor-border-width-val">1px</span></label>
+            <input type="range" data-role="decor-border-width" min="1" max="6" step="0.5" value="1">
+          </div>
+          <div data-role="decor-border-wrap">
+            <label>边框颜色 <span data-role="decor-border-state"></span></label>
+            <input type="color" data-role="decor-border" value="#b8b3aa">
+          </div>
+          <div data-role="decor-fill-wrap">
+            <label><span data-role="decor-fill-label">填充颜色</span><span data-role="decor-fill-state"></span></label>
+            <input type="color" data-role="decor-fill" value="#ffffff">
+          </div>
+          <div data-role="decor-text-color-wrap" hidden>
+            <label>文字颜色 <span data-role="decor-text-color-state"></span></label>
+            <input type="color" data-role="decor-text-color" value="#1a1a1a">
+          </div>
+          <div data-role="decor-color-presets-wrap" hidden>
+            <label data-role="decor-color-presets-label">预设颜色</label>
+            <div data-role="decor-color-presets" class="decor-color-presets"></div>
+          </div>
+          <div data-role="decor-fill-mode-wrap">
+            <label>填充 <span data-role="decor-fill-mode-state"></span></label>
+            <div class="sp-shape-switch sp-multi" data-role="decor-fill-mode">
+              <button type="button" data-fill-mode="none">无</button>
+              <button type="button" data-fill-mode="tint">淡</button>
+              <button type="button" data-fill-mode="solid">实</button>
+            </div>
+          </div>
+          <button type="button" class="sp-reset sp-reset-compact" data-role="decor-reset-fill">
+            重置默认颜色
+          </button>
+        </div>
+        <div class="sp-field" data-role="decor-title-tone-wrap" hidden>
+          <label>标题文字语义 <span data-role="decor-title-tone-state"></span></label>
+          <div class="sp-shape-switch" data-role="decor-title-tone">
+            <button type="button" data-title-tone="light">浅色</button>
+            <button type="button" data-title-tone="dark">深色</button>
+          </div>
+          <div class="sp-hint">浅色字适合较深的标题底色；深色字适合柠檬黄等明亮标题底色。</div>
+        </div>
+        <div class="sp-field" data-role="decor-progress-wrap" hidden>
+          <label>滑条进度 <span data-role="decor-progress-val">100%</span></label>
+          <input type="range" data-role="decor-progress" min="0" max="100" step="1" value="100">
+        </div>
+        <div class="sp-field">
+          <label>透明度 <span data-role="decor-opacity-val">100%</span></label>
+          <input type="range" data-role="decor-opacity" min="0" max="100" step="1" value="100">
+        </div>
+        <div class="sp-field">
+          <label>显示图层 <span data-role="decor-layer-state"></span></label>
+          <div class="sp-shape-switch" data-role="decor-layer">
+            <button type="button" data-layer="back">底层</button>
+            <button type="button" data-layer="front">顶层</button>
+          </div>
+          <div class="sp-hint">底层被文字节点覆盖；顶层覆盖文字。只有图案模式可选中装饰对象。</div>
+        </div>
+        <div class="sp-field" data-role="decor-stack-wrap">
+          <label>叠放顺序</label>
+          <div class="sp-shape-switch sp-multi decor-stack-actions" data-role="decor-stack-actions">
+            <button type="button" data-stack-action="bottom">移到底部</button>
+            <button type="button" data-stack-action="backward">下移一层</button>
+            <button type="button" data-stack-action="forward">上移一层</button>
+            <button type="button" data-stack-action="top">移到顶部</button>
+          </div>
+          <div class="sp-hint" data-role="decor-stack-hint">只调整所选图案在当前显示图层内的先后顺序。</div>
+        </div>
+        <button type="button" class="sp-reset sp-reset-compact" data-role="decor-reset-defaults">
+          重置新建预设
+        </button>
+        <button type="button" class="sp-reset sp-reset-danger" data-role="decor-delete">删除此装饰对象</button>
+      </div>
+    </div>
+    <div class="side-panel-note">图案、文字装饰与图片不会成为正文节点，也不会进入 Markdown 导出内容。</div>
+  </aside>
+
+  <!-- 5-6：思维导图模式 · 独立工作状态骨架（复用现有脑图排版命令）-->
+  <aside class="side-panel mindmap-panel" data-role="mindmap-panel" role="group" aria-label="思维导图模式">
+    <div class="side-panel-head">
+      <span class="side-panel-head-title" data-editor-i18n="mindMapMode">思维导图模式</span>
+      <button type="button" class="panel-dim-btn" data-role="panel-dim-toggle" aria-pressed="false" aria-label="熄灭面板">
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <g class="pd-beam">
+            <line x1="12" y1="2" x2="12" y2="0.8"/>
+            <line x1="8.2" y1="2.4" x2="7.2" y2="1.1"/>
+            <line x1="15.8" y1="2.4" x2="16.8" y2="1.1"/>
+          </g>
+          <path d="M18 6c0 2-2 2-2 4v10a2 2 0 0 1-2 2h-4a2 2 0 0 1-2-2V10c0-2-2-2-2-4V2h14v4Z"/>
+          <line x1="6" y1="6" x2="18" y2="6"/>
+        </svg>
+      </button>
+    </div>
+    <div class="side-panel-body">
+      <div class="mindmap-panel-preview" aria-hidden="true">
+        <span class="mmp-node mmp-node-center"></span>
+        <span class="mmp-node mmp-node-a"></span>
+        <span class="mmp-node mmp-node-b"></span>
+        <span class="mmp-node mmp-node-c"></span>
+        <span class="mmp-branch mmp-branch-a"></span>
+        <span class="mmp-branch mmp-branch-b"></span>
+        <span class="mmp-branch mmp-branch-c"></span>
+      </div>
+      <div class="sp-subhead" data-editor-i18n="presets">预设</div>
+      <div class="mindmap-preset-grid" data-role="mindmap-presets">
+        <div class="mindmap-preset-card active" data-mm-preset="paper" role="button" tabindex="0" title="经典枝桠：通用圆润分支，适合大多数脑图">
+          <span class="mindmap-preset-name" data-editor-i18n="classicBranches">经典枝桠</span>
+          <button type="button" class="mindmap-preset-apply" data-mm-preset-apply aria-label="应用经典枝桠并整理" title="应用并整理">✓</button>
+          <svg viewBox="0 0 80 16" aria-hidden="true"><path d="M2 12 C26 12 29 4 46 4 C62 4 66 11 78 11"/></svg>
+          <i style="--c:#5a9eab"></i><i style="--c:#d0ad4e"></i><i style="--c:#b66c82"></i>
+        </div>
+        <div class="mindmap-preset-card" data-mm-preset="scholar" role="button" tabindex="0" title="学术曲线：低饱和配色与规整贝塞尔曲线">
+          <span class="mindmap-preset-name" data-editor-i18n="academicCurves">学术曲线</span>
+          <button type="button" class="mindmap-preset-apply" data-mm-preset-apply aria-label="应用学术曲线并整理" title="应用并整理">✓</button>
+          <svg viewBox="0 0 80 16" aria-hidden="true"><path d="M2 12 C22 1 56 1 78 12"/></svg>
+          <i style="--c:#526c92"></i><i style="--c:#6f8a61"></i><i style="--c:#a77252"></i>
+        </div>
+        <div class="mindmap-preset-card" data-mm-preset="journal" role="button" tabindex="0" title="柔彩自然：轻柔配色与不对称自然曲线">
+          <span class="mindmap-preset-name" data-editor-i18n="softOrganic">柔彩自然</span>
+          <button type="button" class="mindmap-preset-apply" data-mm-preset-apply aria-label="应用柔彩自然并整理" title="应用并整理">✓</button>
+          <svg viewBox="0 0 80 16" aria-hidden="true"><path d="M2 12 C19 1 39 15 78 5"/></svg>
+          <i style="--c:#e49488"></i><i style="--c:#77b9a9"></i><i style="--c:#d6b96a"></i>
+        </div>
+        <div class="mindmap-preset-card" data-mm-preset="ink" role="button" tabindex="0" title="黑白直线：克制单色与利落直线">
+          <span class="mindmap-preset-name" data-editor-i18n="monoLines">黑白直线</span>
+          <button type="button" class="mindmap-preset-apply" data-mm-preset-apply aria-label="应用黑白直线并整理" title="应用并整理">✓</button>
+          <svg viewBox="0 0 80 16" aria-hidden="true"><path d="M2 12 L78 4"/></svg>
+          <i style="--c:#2f3437"></i><i style="--c:#7d858b"></i><i style="--c:#b8b0a6"></i>
+        </div>
+        <div class="mindmap-preset-card" data-mm-preset="forest" role="button" tabindex="0" title="层级标题：醒目的分支标题与紧凑叶节点">
+          <span class="mindmap-preset-name" data-editor-i18n="tieredTitles">层级标题</span>
+          <button type="button" class="mindmap-preset-apply" data-mm-preset-apply aria-label="应用层级标题并整理" title="应用并整理">✓</button>
+          <svg viewBox="0 0 80 16" aria-hidden="true"><path d="M2 12 C28 12 38 4 78 4"/><path d="M48 9 H76"/></svg>
+          <i style="--c:#4f7b62"></i><i style="--c:#c69a46"></i><i style="--c:#9b5f5f"></i>
+        </div>
+        <div class="mindmap-preset-card" data-mm-preset="blueprint" role="button" tabindex="0" title="蓝图 S 线：冷色主调与流动 S 曲线">
+          <span class="mindmap-preset-name" data-editor-i18n="blueprintS">蓝图 S 线</span>
+          <button type="button" class="mindmap-preset-apply" data-mm-preset-apply aria-label="应用蓝图 S 线并整理" title="应用并整理">✓</button>
+          <svg viewBox="0 0 80 16" aria-hidden="true"><path d="M2 12 C33 12 43 2 78 2"/></svg>
+          <i style="--c:#3d648f"></i><i style="--c:#3f8c8c"></i><i style="--c:#d07b5d"></i>
+        </div>
+        <div class="mindmap-preset-card" data-mm-preset="classroom" role="button" tabindex="0" title="高对比折线：明亮配色与清晰阶梯结构">
+          <span class="mindmap-preset-name" data-editor-i18n="highContrastElbow">高对比折线</span>
+          <button type="button" class="mindmap-preset-apply" data-mm-preset-apply aria-label="应用高对比折线并整理" title="应用并整理">✓</button>
+          <svg viewBox="0 0 80 16" aria-hidden="true"><path d="M2 12 H40 V4 H78"/></svg>
+          <i style="--c:#d94f4f"></i><i style="--c:#e7a62d"></i><i style="--c:#2f9b77"></i>
+        </div>
+        <div class="mindmap-preset-card" data-mm-preset="editorial" role="button" tabindex="0" title="杂志弧线：克制配色与醒目的拱形连接">
+          <span class="mindmap-preset-name" data-editor-i18n="editorialArcs">杂志弧线</span>
+          <button type="button" class="mindmap-preset-apply" data-mm-preset-apply aria-label="应用杂志弧线并整理" title="应用并整理">✓</button>
+          <svg viewBox="0 0 80 16" aria-hidden="true"><path d="M2 13 Q40 -2 78 13"/></svg>
+          <i style="--c:#25282b"></i><i style="--c:#c5534f"></i><i style="--c:#4f8fa3"></i>
+        </div>
+      </div>
+      <div class="mindmap-selection-state" data-role="mindmap-selection-state" aria-live="polite">
+        <span data-role="mindmap-selection-copy">先选中一个节点</span>
+      </div>
+      <div class="mindmap-section-title">
+        <div class="sp-subhead" data-editor-i18n="colors">配色</div>
+        <span class="mindmap-color-state" data-role="mindmap-color-state" data-state="none">
+          <i aria-hidden="true"></i><span>未选择</span>
+        </span>
+      </div>
+      <div class="mindmap-color-actions">
+        <button type="button" class="mindmap-color-tool" data-role="mindmap-color-brush" aria-pressed="false" disabled title="吸取所选节点的填充、边框与透明度">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14.7 4.3 19.7 9.3"/><path d="m7.4 16.6 8.8-8.8a2.1 2.1 0 0 1 3 3l-8.8 8.8"/><path d="M7.4 16.6c-2.6-.2-4.2.9-4.4 3.4 2.5-.2 3.6-1.8 3.4-4.4Z"/>
+          </svg>
+          <span>配色刷</span>
+        </button>
+        <button type="button" class="mindmap-color-tool" data-role="mindmap-match-parent" disabled title="恢复为当前父分支的自动配色">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M6 3v12"/><path d="M6 8h6a4 4 0 0 1 4 4v1"/><path d="m13 17 3 3 3-3"/>
+          </svg>
+          <span>匹配父分支</span>
+        </button>
+      </div>
+      <div class="sp-hint mindmap-color-hint">配色刷只复制节点颜色；右键或 Esc 退出。</div>
+      <div class="sp-subhead" data-editor-i18n="layout">排版</div>
+      <div class="sp-field">
+        <label>方向</label>
+        <div class="sp-shape-switch sp-multi mindmap-layout-switch" data-role="mindmap-layout">
+          <button type="button" data-mm-layout="auto" class="active">跟随分支</button>
+          <button type="button" data-mm-layout="balanced">均衡</button>
+          <button type="button" data-mm-layout="right">向右</button>
+          <button type="button" data-mm-layout="left">向左</button>
+          <button type="button" data-mm-layout="down">向下</button>
+          <button type="button" data-mm-layout="radial">放射</button>
+        </div>
+      </div>
+      <div class="sp-field">
+        <label>密度</label>
+        <div class="sp-shape-switch mindmap-density-switch" data-role="mindmap-density">
+          <button type="button" data-mm-density="compact">紧凑</button>
+          <button type="button" data-mm-density="balanced" class="active">均衡</button>
+          <button type="button" data-mm-density="relaxed">舒展</button>
+        </div>
+      </div>
+      <div class="mindmap-section-title">
+        <div class="sp-subhead" data-editor-i18n="nodeSize">节点尺寸</div>
+        <span class="mindmap-size-state" data-role="mindmap-size-state">自动适配文字</span>
+      </div>
+      <div class="sp-field mindmap-range-field">
+        <label for="mindmap-center-size">中心节点 <output data-role="mindmap-center-size-val">110%</output></label>
+        <div class="settings-slider-track-wrap">
+          <input id="mindmap-center-size" data-role="mindmap-center-size" type="range" min="75" max="145" step="5" value="110">
+          <span class="settings-slider-tick" style="--default-pos:50%" aria-hidden="true"></span>
+        </div>
+      </div>
+      <div class="sp-field mindmap-range-field">
+        <label for="mindmap-branch-size">一级分支 <output data-role="mindmap-branch-size-val">100%</output></label>
+        <div class="settings-slider-track-wrap">
+          <input id="mindmap-branch-size" data-role="mindmap-branch-size" type="range" min="70" max="140" step="5" value="100">
+          <span class="settings-slider-tick" style="--default-pos:42.8571%" aria-hidden="true"></span>
+        </div>
+      </div>
+      <div class="sp-field mindmap-range-field">
+        <label for="mindmap-leaf-size">二级及以后 <output data-role="mindmap-leaf-size-val">85%</output></label>
+        <div class="settings-slider-track-wrap">
+          <input id="mindmap-leaf-size" data-role="mindmap-leaf-size" type="range" min="70" max="140" step="5" value="85">
+          <span class="settings-slider-tick" style="--default-pos:21.4286%" aria-hidden="true"></span>
+        </div>
+      </div>
+      <div class="mindmap-size-actions">
+        <button type="button" class="mindmap-size-action" data-role="mindmap-size-auto" disabled title="清除手工宽度，恢复文字自动适配">
+          <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v6h6"/></svg><span>恢复自动</span>
+        </button>
+        <button type="button" class="mindmap-size-action" data-role="mindmap-size-equal" disabled title="让同一层级节点使用相同宽度">
+          <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M5 7h14M5 12h14M5 17h14"/><path d="M3 5v14M21 5v14"/></svg><span>同级等宽</span>
+        </button>
+        <button type="button" class="mindmap-size-action" data-role="mindmap-size-repair" disabled title="只整理发生重叠的分支">
+          <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="11" height="8" rx="2"/><rect x="10" y="11" width="11" height="8" rx="2"/><path d="m17 4 2-2 2 2"/></svg><span>整理重叠</span>
+        </button>
+      </div>
+      <div class="sp-hint">短标题保持紧凑，长标题自动换行；左右边缘调宽，角点调宽与留白，双击恢复自动。</div>
+      <div class="mindmap-line-controls">
+        <label class="sp-field" for="mindmap-curve">
+          <span>线型</span>
+          <select id="mindmap-curve" data-role="mindmap-curve">
+            <option value="preset">随预设</option>
+            <option value="branch">枝桠曲线</option>
+            <option value="organic">自然曲线</option>
+            <option value="arc">弧线</option>
+            <option value="smooth">平滑曲线</option>
+            <option value="bezier">曲线</option>
+            <option value="rounded-elbow">圆角折线</option>
+            <option value="straight">直线</option>
+            <option value="s-curve">S 曲线</option>
+          </select>
+        </label>
+        <label class="sp-field" for="mindmap-line-style">
+          <span>线条样式</span>
+          <select id="mindmap-line-style" data-role="mindmap-line-style">
+            <option value="preset">随预设</option>
+            <option value="solid">实线</option>
+            <option value="soft">柔线</option>
+            <option value="dashed">虚线</option>
+            <option value="dotted">点线</option>
+            <option value="glow">荧光</option>
+          </select>
+        </label>
+      </div>
+      <div class="sp-field mindmap-range-field" data-role="mindmap-level-gap-wrap">
+        <label for="mindmap-level-gap">层距 <output data-role="mindmap-level-gap-val">92px</output></label>
+        <input id="mindmap-level-gap" data-role="mindmap-level-gap" type="range" min="56" max="150" step="2" value="92">
+      </div>
+      <div class="sp-field mindmap-range-field" data-role="mindmap-branch-gap-wrap">
+        <label for="mindmap-branch-gap">分支距 <output data-role="mindmap-branch-gap-val">32px</output></label>
+        <input id="mindmap-branch-gap" data-role="mindmap-branch-gap" type="range" min="16" max="80" step="2" value="32">
+      </div>
+      <div class="sp-field mindmap-range-field" data-role="mindmap-radial-gap-wrap" hidden>
+        <label for="mindmap-radial-gap">放射半径 <output data-role="mindmap-radial-gap-val">220px</output></label>
+        <input id="mindmap-radial-gap" data-role="mindmap-radial-gap" type="range" min="150" max="330" step="5" value="220">
+      </div>
+      <button type="button" class="sp-reset mindmap-panel-run" data-role="mindmap-apply">
+        应用预设并整理
+      </button>
+      <div class="mindmap-secondary-actions">
+        <button type="button" class="sp-reset sp-reset-compact" data-role="mindmap-align-levels">仅对齐层级</button>
+        <button type="button" class="sp-reset sp-reset-compact" data-role="mindmap-style-only">只套用样式</button>
+      </div>
+      <div class="sp-hint">Tab 建子节点，Enter 建同级节点；新节点会继承当前脑图样式。</div>
+    </div>
+    <div class="side-panel-note">单选会整理与该节点相连的整张结构；多选只整理所选节点。“仅对齐层级”不会改变上下顺序。</div>
+  </aside>
+
+  <!-- 5-5：「简洁画布模式」专属 · 常用新建类型小浮窗（卡片 / 便签）。
+       完整类型和外观放在独立“样式”面板中，不显示大型画布模式面板。
+       且仅 body[data-mode="normal"][data-mode-submode="clean"] 时显示。
+       两枚按钮、无任何文字说明；切换"接下来新建是卡片还是便签"（便签默认仅本模式生效）。 -->
+  <aside class="normal-kind-fab" data-role="normal-kind" role="group" aria-label="新建节点类型">
+    <button type="button" class="nkf-btn active" data-kind="card" title="新建卡片节点" data-editor-i18n="card">卡片</button>
+    <button type="button" class="nkf-btn" data-kind="sticky" title="新建便签节点" data-editor-i18n="sticky">便签</button>
+    <button type="button" class="nkf-style-btn" data-action="open-clean-style"
+            aria-expanded="false" aria-controls="clean-style-panel"
+            title="设置简洁模式中新建节点与连线的默认样式" data-editor-i18n="style">样式</button>
+  </aside>
+
+  <!-- 简洁画布模式 · 独立上下文样式面板。无单选时编辑新建默认，
+       单选内容节点时编辑该节点；不启用完整属性检查器，也不切换 full。 -->
+  <aside class="clean-style-panel" id="clean-style-panel" data-role="clean-style-panel"
+         role="dialog" aria-label="简洁画布模式样式" aria-hidden="true" inert>
+    <div class="clean-style-head">
+      <div>
+        <strong data-editor-i18n="quietStyle">简洁样式</strong>
+        <span data-role="clean-style-scope" data-editor-i18n="newDefaults">新建默认</span>
+      </div>
+      <button type="button" data-action="close-clean-style" aria-label="关闭简洁样式面板">×</button>
+    </div>
+    <div class="clean-style-body">
+      <section class="clean-style-section">
+        <div class="clean-style-section-head">
+          <strong>节点</strong>
+          <span>类型与轮廓</span>
+        </div>
+        <div class="sp-field">
+          <label>类型</label>
+          <div class="sp-shape-switch sp-multi clean-kind-switch" data-role="clean-kind">
+            <button type="button" data-kind="index">索引</button>
+            <button type="button" data-kind="preview">预览</button>
+            <button type="button" data-kind="card" class="active">卡片</button>
+            <button type="button" data-kind="sticky">便签</button>
+            <button type="button" data-kind="code">代码</button>
+          </div>
+        </div>
+        <div class="sp-field">
+          <label>形状</label>
+          <div class="sp-shape-switch" data-role="clean-shape">
+            <button type="button" data-shape="rect" class="active">矩形</button>
+            <button type="button" data-shape="square">正方</button>
+            <button type="button" data-shape="circle">圆形</button>
+          </div>
+        </div>
+        <div class="clean-style-color-grid">
+          <div class="sp-field">
+            <label>背景</label>
+            <input type="color" data-role="clean-bg" value="#ffffff">
+          </div>
+          <div class="sp-field">
+            <label>边框</label>
+            <input type="color" data-role="clean-border" value="#000000">
+          </div>
+        </div>
+        <div class="sp-field">
+          <label>背景透明度 <span data-role="clean-opacity-val">100%</span></label>
+          <div class="settings-slider-track-wrap">
+            <input type="range" data-role="clean-opacity" min="0" max="100" step="5" value="100">
+            <span class="settings-slider-tick" style="--default-pos:100%" title="默认 100%"></span>
+          </div>
+        </div>
+        <label class="sp-check clean-style-check">
+          <input type="checkbox" data-role="clean-hide-chrome">
+          <span>隐藏节点背景</span>
+        </label>
+        <div class="clean-style-range-grid">
+          <div class="sp-field">
+            <label>圆角 <span data-role="clean-radius-val">10px</span></label>
+            <div class="settings-slider-track-wrap">
+              <input type="range" data-role="clean-radius" min="0" max="40" step="1" value="10">
+              <span class="settings-slider-tick" style="--default-pos:25%" title="默认 10px"></span>
+            </div>
+          </div>
+          <div class="sp-field">
+            <label>字重 <span data-role="clean-font-weight-val">默认</span></label>
+            <input type="range" data-role="clean-font-weight" min="100" max="900" step="10" value="400">
+          </div>
+        </div>
+        <div class="sp-field">
+          <label>文字比例 <span data-role="clean-font-scale-val">100%</span></label>
+          <div class="settings-slider-track-wrap">
+            <input type="range" data-role="clean-font-scale" min="75" max="160" step="1" value="100">
+            <span class="settings-slider-tick" style="--default-pos:29.4118%" title="默认 100%"></span>
+          </div>
+        </div>
+        <div class="sp-field">
+          <label>文字对齐</label>
+          <div class="sp-shape-switch" data-role="clean-text-align">
+            <button type="button" data-text-align="left" class="active">左</button>
+            <button type="button" data-text-align="center">中</button>
+            <button type="button" data-text-align="right">右</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="clean-style-section">
+        <div class="clean-style-section-head">
+          <strong>连线</strong>
+          <span>路径与箭头</span>
+        </div>
+        <div class="sp-field">
+          <label>线型</label>
+          <div class="sp-shape-switch" data-role="clean-curve">
+            <button type="button" data-curve="bezier" class="active">曲线</button>
+            <button type="button" data-curve="straight">直线</button>
+            <button type="button" data-curve="rounded-elbow">圆角折线</button>
+          </div>
+        </div>
+        <div class="sp-field">
+          <label>线条样式</label>
+          <div class="sp-shape-switch" data-role="clean-line-style">
+            <button type="button" data-line-style="solid" class="active">实线</button>
+            <button type="button" data-line-style="dashed">虚线</button>
+            <button type="button" data-line-style="soft">柔线</button>
+          </div>
+        </div>
+        <div class="clean-style-color-grid">
+          <div class="sp-field">
+            <label>线条颜色</label>
+            <input type="color" data-role="clean-color" value="#000000">
+          </div>
+          <div class="sp-field">
+            <label>线条粗细 <span data-role="clean-width-val">1.5</span></label>
+            <div class="settings-slider-track-wrap">
+              <input type="range" data-role="clean-width" min="1" max="6" step="0.5" value="1.5">
+              <span class="settings-slider-tick" style="--default-pos:10%" title="默认 1.5"></span>
+            </div>
+          </div>
+        </div>
+        <div class="sp-field">
+          <label>箭头</label>
+          <div class="sp-shape-switch" data-role="clean-arrow">
+            <button type="button" data-arrow="none" class="active">无</button>
+            <button type="button" data-arrow="one">单向</button>
+            <button type="button" data-arrow="both">双向</button>
+          </div>
+        </div>
+      </section>
+      <div class="clean-style-footer">
+        <button type="button" class="sp-reset" data-role="clean-reset">恢复简洁默认</button>
+        <div class="sp-hint" data-role="clean-style-hint">只影响简洁画布模式中之后新建的节点与连线。</div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- 全局背景设置：所有画布共用，不改节点样式 -->
+  <aside class="background-panel" id="background-panel" data-role="background-panel"
+         role="dialog" aria-label="画布背景" hidden>
+    <div class="background-panel-head">
+      <span>全局背景</span>
+      <button type="button" class="background-panel-close" data-action="background-close"
+              aria-label="关闭背景设置">×</button>
+    </div>
+    <div class="background-panel-body">
+      <button type="button" class="sp-reset background-reset" data-background-reset>
+        恢复默认纸白
+      </button>
+
+      <section class="background-section">
+        <div class="sp-subhead">柔和纯色</div>
+        <div class="background-swatches">
+          <button type="button" class="background-swatch" data-background-color="#f7f2e9"
+                  style="--preview: #f7f2e9" title="暖米"><span>暖米</span></button>
+          <button type="button" class="background-swatch" data-background-color="#eff4f1"
+                  style="--preview: #eff4f1" title="雾青"><span>雾青</span></button>
+          <button type="button" class="background-swatch" data-background-color="#edf1f5"
+                  style="--preview: #edf1f5" title="灰蓝"><span>灰蓝</span></button>
+          <button type="button" class="background-swatch" data-background-color="#eef2e9"
+                  style="--preview: #eef2e9" title="鼠尾草"><span>鼠尾草</span></button>
+          <button type="button" class="background-swatch" data-background-color="#f7efee"
+                  style="--preview: #f7efee" title="砂粉"><span>砂粉</span></button>
+          <button type="button" class="background-swatch" data-background-color="#f1f0ed"
+                  style="--preview: #f1f0ed" title="月灰"><span>月灰</span></button>
+        </div>
+        <label class="background-custom-color">
+          <span>自定义纯色</span>
+          <input type="color" data-role="background-custom-color" value="#fbfbfa">
+        </label>
+      </section>
+
+      <section class="background-section">
+        <div class="sp-subhead">柔和渐变</div>
+        <div class="background-gradients">
+          <button type="button" data-background-gradient="morning-mist" title="晨雾"><span>晨雾</span></button>
+          <button type="button" data-background-gradient="ivory-light" title="象牙光"><span>象牙光</span></button>
+          <button type="button" data-background-gradient="sage-smoke" title="松烟"><span>松烟</span></button>
+          <button type="button" data-background-gradient="after-rain" title="雨后"><span>雨后</span></button>
+          <button type="button" data-background-gradient="dusk-sand" title="暮砂"><span>暮砂</span></button>
+          <button type="button" data-background-gradient="moon-white" title="月白"><span>月白</span></button>
+        </div>
+      </section>
+
+      <section class="background-section">
+        <div class="sp-subhead">沉浸预设（浅色）</div>
+        <div class="background-gradients background-scenes">
+          <button type="button" data-background-gradient="quiet-dawn" data-background-layout="immersive"
+                  data-background-tone="light" title="清晨"><span>清晨</span></button>
+          <button type="button" data-background-gradient="cloud-lake" data-background-layout="immersive"
+                  data-background-tone="light" title="云湖"><span>云湖</span></button>
+          <button type="button" data-background-gradient="snow-ridge" data-background-layout="immersive"
+                  data-background-tone="light" title="雪岭"><span>雪岭</span></button>
+          <button type="button" data-background-gradient="almond-light" data-background-layout="immersive"
+                  data-background-tone="light" title="杏光"><span>杏光</span></button>
+          <button type="button" data-background-gradient="bamboo-mist" data-background-layout="immersive"
+                  data-background-tone="light" title="竹雾"><span>竹雾</span></button>
+          <button type="button" data-background-gradient="pearl-haze" data-background-layout="immersive"
+                  data-background-tone="light" title="珠雾"><span>珠雾</span></button>
+          <button type="button" data-background-gradient="rain-glass" data-background-layout="immersive"
+                  data-background-tone="light" title="雨玻"><span>雨玻</span></button>
+          <button type="button" data-background-gradient="rose-cloud" data-background-layout="immersive"
+                  data-background-tone="light" title="云霞"><span>云霞</span></button>
+          <button type="button" data-background-gradient="sky-azure" data-background-layout="immersive"
+                  data-background-tone="light" title="天青"><span>天青</span></button>
+          <button type="button" data-background-gradient="mint" data-background-layout="immersive"
+                  data-background-tone="light" title="薄荷"><span>薄荷</span></button>
+          <button type="button" data-background-gradient="lavender" data-background-layout="immersive"
+                  data-background-tone="light" title="薰衣"><span>薰衣</span></button>
+          <button type="button" data-background-gradient="lotus-haze" data-background-layout="immersive"
+                  data-background-tone="light" title="藕荷"><span>藕荷</span></button>
+          <button type="button" data-background-gradient="rice-paper" data-background-layout="immersive"
+                  data-background-tone="light" title="宣纸"><span>宣纸</span></button>
+        </div>
+      </section>
+
+      <section class="background-section">
+        <div class="sp-subhead">沉浸预设（深色）</div>
+        <div class="background-gradients background-scenes">
+          <button type="button" data-background-gradient="polar-light" data-background-layout="immersive"
+                  data-background-tone="dark" title="北极光"><span>北极光</span></button>
+          <button type="button" data-background-gradient="aurora-corona" data-background-layout="immersive"
+                  data-background-tone="dark" title="极冕"><span>极冕</span></button>
+          <button type="button" data-background-gradient="snow-aurora" data-background-layout="immersive"
+                  data-background-tone="dark" title="雪山极光"><span>雪山极光</span></button>
+          <button type="button" data-background-gradient="star-peaks" data-background-layout="immersive"
+                  data-background-tone="dark" title="星峦"><span>星峦</span></button>
+          <button type="button" data-background-gradient="full-moon" data-background-layout="immersive"
+                  data-background-tone="dark" title="皓月"><span>皓月</span></button>
+          <button type="button" data-background-gradient="lone-moon" data-background-layout="immersive"
+                  data-background-tone="dark" title="孤月"><span>孤月</span></button>
+          <button type="button" data-background-gradient="crescent" data-background-layout="immersive"
+                  data-background-tone="dark" title="新月"><span>新月</span></button>
+          <button type="button" data-background-gradient="dusk-lake" data-background-layout="immersive"
+                  data-background-tone="dark" title="暮湖"><span>暮湖</span></button>
+          <button type="button" data-background-gradient="dusk-bridge" data-background-layout="immersive"
+                  data-background-tone="dark" title="虹桥"><span>虹桥</span></button>
+          <button type="button" data-background-gradient="dusk-road" data-background-layout="immersive"
+                  data-background-tone="dark" title="暮途"><span>暮途</span></button>
+          <button type="button" data-background-gradient="evening-glow" data-background-layout="immersive"
+                  data-background-tone="dark" title="晚照"><span>晚照</span></button>
+          <button type="button" data-background-gradient="deep-forest" data-background-layout="immersive"
+                  data-background-tone="dark" title="幽林"><span>幽林</span></button>
+          <button type="button" data-background-gradient="night-boat" data-background-layout="immersive"
+                  data-background-tone="dark" title="夜泊"><span>夜泊</span></button>
+        </div>
+      </section>
+
+      <section class="background-section background-toolbar-section">
+        <div class="sp-subhead">标题栏</div>
+        <div class="sp-field">
+          <label>背景展示范围</label>
+          <div class="sp-shape-switch" data-role="background-layout">
+            <button type="button" data-layout="immersive">全屏沉浸</button>
+            <button type="button" data-layout="soft-toolbar">柔和工具栏</button>
+          </div>
+        </div>
+        <div class="sp-field" data-role="background-tone-wrap">
+          <label>背景语义</label>
+          <div class="sp-shape-switch" data-role="background-tone">
+            <button type="button" data-tone="light">浅色</button>
+            <button type="button" data-tone="dark">深色</button>
+          </div>
+          <div class="sp-hint">全屏沉浸时影响标题栏文字颜色；本地图片默认浅色。</div>
+        </div>
+        <div class="sp-field" data-role="background-readability-wrap">
+          <label>标题栏可读性保护</label>
+          <div class="sp-shape-switch" data-role="background-readability">
+            <button type="button" data-readability="off">关闭</button>
+            <button type="button" data-readability="light">轻</button>
+            <button type="button" data-readability="medium" data-i18n="backgroundReadabilityMedium" data-i18n-zh="中">中</button>
+          </div>
+          <div class="sp-hint">全屏沉浸时有效，仅在标题栏覆盖极淡保护层。</div>
+        </div>
+      </section>
+
+      <section class="background-section background-image-section">
+        <div class="sp-subhead">本地图片</div>
+        <button type="button" class="sp-reset" data-action="background-image-pick">选择图片</button>
+        <div class="background-image-name" data-role="background-image-name">尚未选择图片</div>
+        <div class="background-image-preview" data-role="background-image-preview" aria-label="拖动调整背景图片构图">
+          <div class="background-image-preview-layer" data-role="background-image-preview-layer"></div>
+          <div class="background-image-preview-toolbar" data-role="background-image-preview-toolbar">标题栏区域</div>
+          <span>拖动调整构图中心</span>
+        </div>
+        <div class="sp-field">
+          <label>图片透明度 <span data-role="background-opacity-val">22%</span></label>
+          <input type="range" data-role="background-opacity" min="0" max="100" step="1" value="22" disabled>
+        </div>
+        <div class="sp-field background-image-framing">
+          <label>图片缩放 <span data-role="background-scale-val">100%</span></label>
+          <input type="range" data-role="background-scale" min="100" max="250" step="1" value="100" disabled>
+          <label>水平位置 <span data-role="background-position-x-val">50%</span></label>
+          <input type="range" data-role="background-position-x" min="0" max="100" step="1" value="50" disabled>
+          <label>垂直位置 <span data-role="background-position-y-val">50%</span></label>
+          <input type="range" data-role="background-position-y" min="0" max="100" step="1" value="50" disabled>
+        </div>
+        <button type="button" class="sp-reset" data-action="background-image-framing-reset" disabled>
+          恢复默认构图
+        </button>
+        <button type="button" class="sp-reset" data-action="background-image-remove" disabled>
+          移除图片并恢复默认
+        </button>
+      </section>
+    </div>
+    <div class="side-panel-note">设置对所有画布生效；图片只记录本地绝对路径，移动文件后会回退为默认背景。</div>
+  </aside>
+
+  <!-- 当前画布关系图谱：从博客图谱本土化而来，只读浏览并可点击定位原节点 -->
+  <div class="graph-overlay" id="graph-overlay" data-role="graph-overlay" hidden>
+    <section class="graph-window" data-role="graph-window" role="dialog" aria-modal="true"
+             aria-label="当前画布图谱">
+      <header class="graph-window-head" data-role="graph-drag-handle">
+        <div class="graph-window-title">
+          <span class="graph-window-kicker">关系视图</span>
+          <h2 data-role="graph-title">图谱</h2>
+        </div>
+        <div class="graph-window-tools">
+          <label class="graph-opacity-control" title="调节悬浮窗透明度">
+            <span class="graph-opacity-label">透明度</span>
+            <input type="range" data-role="graph-opacity" min="36" max="100" step="1" value="94">
+            <output data-role="graph-opacity-val">94%</output>
+          </label>
+          <button type="button" class="graph-tool-btn" data-action="graph-relax"
+                  title="重新舒展图谱布局">
+            <svg class="graph-tool-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+              <path d="M7.2 4.2H4.2v3M12.8 4.2h3v3M7.2 15.8h-3v-3M12.8 15.8h3v-3"/>
+              <path d="M8 8 4.4 4.4M12 8l3.6-3.6M8 12l-3.6 3.6M12 12l3.6 3.6"/>
+            </svg>
+            <span data-editor-i18n="graphRelax">舒展</span>
+          </button>
+          <button type="button" class="graph-tool-btn" data-action="graph-reset-view"
+                  title="恢复图谱视野">
+            <svg class="graph-tool-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+              <path d="M15.7 7.1A6.2 6.2 0 1 0 16 12"/>
+              <path d="M15.7 3.8v3.5h-3.5"/>
+            </svg>
+            <span>复位</span>
+          </button>
+          <button type="button" class="graph-window-close" data-action="graph-close"
+                  aria-label="关闭图谱">
+            <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+              <path d="m6 6 8 8M14 6l-8 8"/>
+            </svg>
+          </button>
+        </div>
+      </header>
+      <div class="graph-stage" data-role="graph-stage">
+        <div class="graph-hint" data-role="graph-hint" hidden>当前节点之间还没有连线</div>
+        <canvas class="graph-canvas" data-role="graph-canvas" aria-label="当前画布图谱"></canvas>
+        <div class="graph-tooltip" data-role="graph-tooltip" hidden></div>
+        <div class="graph-empty" data-role="graph-empty" hidden>当前画布还没有内容节点</div>
+        <div class="graph-legend" aria-hidden="true">
+          <span><strong data-role="graph-node-count">0</strong> 节点</span>
+          <span><strong data-role="graph-edge-count">0</strong> 连线</span>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- 索引/正文节点阅读浮层：画布本身可只放标题，长正文在此专注阅读 -->
+  <div class="text-reader-overlay" data-role="text-reader" hidden>
+    <section class="text-reader-card" role="dialog" aria-modal="true" aria-label="正文节点阅读">
+      <header class="text-reader-head">
+        <div>
+          <div class="text-reader-kicker" data-role="text-reader-kicker">索引节点</div>
+          <h2 class="text-reader-title" data-role="text-reader-title">未命名索引</h2>
+        </div>
+        <div class="node-reader-tools">
+          <button type="button" class="md-tool" data-role="node-annot-pen" title="钢笔：在正文上手绘批注（1 / P）">钢笔</button>
+          <button type="button" class="md-tool" data-role="node-annot-box" title="盒子：拖拽框出重点区域（2 / B）">盒子</button>
+          <span class="md-tool-colors">
+            <button type="button" class="md-color" data-node-annot-color="#e8482f" style="--mdc:#e8482f" title="红" aria-label="红"></button>
+            <button type="button" class="md-color" data-node-annot-color="#f4b740" style="--mdc:#f4b740" title="黄" aria-label="黄"></button>
+            <button type="button" class="md-color" data-node-annot-color="#3a9d5d" style="--mdc:#3a9d5d" title="绿" aria-label="绿"></button>
+            <button type="button" class="md-color" data-node-annot-color="#1a1a1a" style="--mdc:#1a1a1a" title="墨" aria-label="墨"></button>
+          </span>
+          <button type="button" class="md-tool" data-role="node-annot-eraser" title="橡皮：擦除整笔或盒子（3 / E）">橡皮</button>
+        </div>
+        <div class="index-depth-switch" data-role="index-depth-switch" role="group" aria-label="目录最大层级">
+          <button type="button" class="index-depth-opt" data-depth="2" title="只显示一、二级目录">2</button>
+          <button type="button" class="index-depth-opt" data-depth="3" title="显示到三级目录">3</button>
+          <button type="button" class="index-depth-opt" data-depth="4" title="显示到四级目录">4</button>
+          <button type="button" class="index-depth-opt" data-depth="6" title="显示全部层级">全部</button>
+        </div>
+        <label class="reader-opacity-control" title="调节阅读窗口透明度：往左让画布隐约透出，往右更纯净专注">
+          <span>透明度</span>
+          <input type="range" data-role="reader-opacity" min="50" max="100" step="1" value="80" aria-label="阅读窗口透明度">
+          <output data-role="reader-opacity-val">80%</output>
+        </label>
+        <button type="button" class="text-reader-close" data-role="text-reader-close"
+                aria-label="关闭阅读窗口">×</button>
+      </header>
+      <div class="text-reader-main">
+        <!-- 索引节点专用：左侧常驻目录栏（点目录项在右栏阅读，双击跳到画布节点）。仅索引模式显示。 -->
+        <nav class="index-reader-nav" data-role="index-reader-nav" aria-label="索引目录" hidden></nav>
+        <nav class="text-reader-toc" data-role="text-reader-toc" aria-label="正文目录" hidden></nav>
+        <div class="text-reader-scroll" data-role="text-reader-scroll" tabindex="0">
+          <!-- 索引右栏小标题：当前正在阅读的目录项类型 + 名称。仅索引模式有内容时显示。 -->
+          <div class="index-pane-head" data-role="index-pane-head" hidden>
+            <div class="index-pane-kicker" data-role="index-pane-kicker"></div>
+            <h3 class="index-pane-title" data-role="index-pane-title"></h3>
+          </div>
+          <article class="text-reader-content" data-role="text-reader-content"></article>
+          <!-- 索引右栏 MD 专用宿主：在 .text-reader-content 之外，复用 MD 专用浮层的 .md-reader-content/.node-text
+               样式，使排版逐行与浮层一致 → 复刻的笔迹/盒子批注才能贴合。仅显示 MD 附件时启用。 -->
+          <div class="index-pane-md-host" data-role="index-pane-md-host" hidden></div>
+          <div class="text-reader-empty" data-role="text-reader-empty" hidden>
+            <span data-role="text-reader-empty-text">这张索引节点还没有正文。点击这里开始录入内容。</span>
+          </div>
+          <textarea class="text-reader-editor" data-role="text-reader-editor" hidden
+                    placeholder="输入正文。支持 Markdown 与数学公式；点击正文外区域返回阅读预览。"
+                    spellcheck="false"></textarea>
+          <div class="text-reader-editor text-reader-rich-editor" data-role="text-reader-rich-editor"
+               contenteditable="true" aria-label="正文富文本编辑器" data-editor-i18n-aria="richBodyEditor" spellcheck="false" hidden></div>
+        </div>
+      </div>
+      <footer class="text-reader-foot" data-role="text-reader-foot">
+        点击正文编辑 · <kbd>1</kbd>钢笔 <kbd>2</kbd>盒子 <kbd>3</kbd>橡皮 · 再按一次取消工具 · <kbd>Ctrl</kbd>+<kbd>Z</kbd>/<kbd>Y</kbd> 撤销重做 · 正文变化时空间批注自动清除 · <kbd>F</kbd> / <kbd>Esc</kbd> 返回画布
+      </footer>
+    </section>
+  </div>
+
+  <!-- PDF 阅读 + 批注浮层：双击 PDF 附件 / 单选后按 F 打开 -->
+  <div class="pdf-reader-overlay" data-role="pdf-reader" hidden>
+    <section class="pdf-reader-card" role="dialog" aria-modal="true" aria-label="PDF 阅读与批注">
+      <header class="pdf-reader-head">
+        <h2 class="pdf-reader-title" data-role="pdf-reader-title">PDF</h2>
+        <div class="pdf-reader-tools" role="toolbar" aria-label="批注工具">
+          <button type="button" class="pdf-tool" data-pdf-tool="thl" title="划词高光：选中原文加高光（1）">划词高光</button>
+          <button type="button" class="pdf-tool" data-pdf-tool="tul" title="划词下划线：选中原文加下划线（2）">下划线</button>
+          <button type="button" class="pdf-tool" data-pdf-tool="pen" title="钢笔（3）">钢笔</button>
+          <button type="button" class="pdf-tool" data-pdf-tool="hl" title="荧光笔（4）">荧光笔</button>
+          <button type="button" class="pdf-tool" data-pdf-tool="box" title="盒子：拖拽框出重点区域（5）">盒子</button>
+          <button type="button" class="pdf-tool" data-pdf-tool="note" title="便签：点空白处贴便签（6）">便签</button>
+          <button type="button" class="pdf-tool" data-pdf-tool="eraser" title="橡皮（7）">橡皮</button>
+          <span class="pdf-tool-sep"></span>
+          <div class="pdf-color-dd" data-role="pdf-color-dd">
+            <button type="button" class="pdf-color-trigger" data-role="pdf-color-trigger" title="颜色与粗细">
+              <span class="pdf-color-dot" data-role="pdf-color-dot"></span>
+              <span class="pdf-color-caret">▾</span>
+            </button>
+            <div class="pdf-color-pop" data-role="pdf-color-pop" hidden>
+              <div class="pdf-color-grid" data-role="pdf-colors"></div>
+              <div class="pdf-size-row">
+                <span class="pdf-size-label">大小</span>
+                <input type="range" class="pdf-size-range" data-role="pdf-size" min="1" max="5" step="0.5" value="2" aria-label="笔与荧光笔粗细">
+                <span class="pdf-size-val" data-role="pdf-size-val">2.0</span>
+              </div>
+            </div>
+          </div>
+          <span class="pdf-tool-sep"></span>
+          <button type="button" class="pdf-tool pdf-tool-ghost" data-role="pdf-undo" title="撤销（Ctrl+Z）">↶</button>
+          <button type="button" class="pdf-tool pdf-tool-ghost" data-role="pdf-redo" title="重做（Ctrl+Y）">↷</button>
+          <button type="button" class="pdf-tool pdf-tool-ghost" data-role="pdf-clear-page" title="清空本页批注">清空本页</button>
+          <span class="pdf-reader-status" data-role="pdf-reader-status"></span>
+        </div>
+        <button type="button" class="pdf-reader-close" data-role="pdf-reader-close"
+                aria-label="关闭阅读窗口">×</button>
+      </header>
+      <div class="pdf-reader-scroll" data-role="pdf-reader-scroll" tabindex="0">
+        <div class="pdf-reader-pages" data-role="pdf-reader-pages"></div>
+      </div>
+      <footer class="pdf-reader-foot">
+        <kbd>1</kbd>划词高光 <kbd>2</kbd>下划线 <kbd>3</kbd>钢笔 <kbd>4</kbd>荧光笔 <kbd>5</kbd>盒子 <kbd>6</kbd>便签 <kbd>7</kbd>橡皮 · 只读时点已有标注可改色 / 删 · <kbd>Ctrl</kbd>+<kbd>Z</kbd>/<kbd>Y</kbd> 撤销重做 · 批注随 PDF 保存（伴生文件）· <kbd>Esc</kbd> 返回画布
+      </footer>
+    </section>
+  </div>
+
+  <!-- Markdown 附件阅读浮层：双击 MD 附件 / 单选后按 F 打开，大版面只读阅读 + 复用选区高光 -->
+  <div class="text-reader-overlay md-reader-overlay" data-role="md-reader" hidden>
+    <section class="text-reader-card" role="dialog" aria-modal="true" aria-label="Markdown 附件阅读">
+      <header class="text-reader-head">
+        <div>
+          <div class="text-reader-kicker">MARKDOWN 附件</div>
+          <h2 class="text-reader-title" data-role="md-reader-title">Markdown 文档</h2>
+        </div>
+        <div class="md-reader-tools">
+          <button type="button" class="md-tool" data-role="md-open-external"
+                  title="用系统默认程序（如 Typora）打开这份 Markdown 副本编辑">外部打开</button>
+          <span class="md-tool-sep"></span>
+          <button type="button" class="md-tool" data-role="md-pen"
+                   title="钢笔：在正文上手绘批注（1 / P）">钢笔</button>
+          <button type="button" class="md-tool" data-role="md-box"
+                  title="盒子：拖拽框出重点区域（2 / B）">盒子</button>
+          <span class="md-tool-colors">
+            <button type="button" class="md-color" data-md-color="#e8482f" style="--mdc:#e8482f" title="红" aria-label="红"></button>
+            <button type="button" class="md-color" data-md-color="#f4b740" style="--mdc:#f4b740" title="黄" aria-label="黄"></button>
+            <button type="button" class="md-color" data-md-color="#3a9d5d" style="--mdc:#3a9d5d" title="绿" aria-label="绿"></button>
+            <button type="button" class="md-color" data-md-color="#1a1a1a" style="--mdc:#1a1a1a" title="墨" aria-label="墨"></button>
+          </span>
+          <button type="button" class="md-tool" data-role="md-eraser"
+                  title="橡皮：擦笔迹、盒子，也能点掉文字高光 / 字色 / 字号（3 / E）">橡皮</button>
+          <span class="md-tool-sep"></span>
+          <label class="reader-opacity-control" title="调节阅读窗口透明度：往左让画布隐约透出，往右更纯净专注">
+            <span>透明度</span>
+            <input type="range" data-role="reader-opacity" min="50" max="100" step="1" value="80" aria-label="阅读窗口透明度">
+            <output data-role="reader-opacity-val">80%</output>
+          </label>
+          <button type="button" class="text-reader-close" data-role="md-reader-close"
+                  aria-label="关闭阅读窗口">×</button>
+        </div>
+      </header>
+      <div class="text-reader-main">
+        <nav class="text-reader-toc" data-role="md-reader-toc" aria-label="附件目录" hidden></nav>
+        <div class="text-reader-scroll" data-role="md-reader-scroll" tabindex="0">
+          <article class="md-reader-content" data-role="md-reader-content"></article>
+        </div>
+      </div>
+      <footer class="text-reader-foot">
+        选中文字加高光 / 字色 / 字号 · <kbd>1</kbd>钢笔 <kbd>2</kbd>盒子 <kbd>3</kbd>橡皮 · 再按一次取消工具 · 未选工具时点盒子可换色 / <kbd>Delete</kbd> 删除 · <kbd>Ctrl</kbd>+<kbd>Z</kbd>/<kbd>Y</kbd> 撤销重做 · 批注随附件保存 · <kbd>F</kbd> / <kbd>Esc</kbd> 返回
+      </footer>
+    </section>
+  </div>
+
+  <!-- 选中文字浮动工具栏：编辑节点文字 / 正文时选中一段文字即浮现（高光 / 文字颜色 / 字号）-->
+  <div class="sel-toolbar" data-role="sel-toolbar" hidden>
+    <button type="button" class="sel-swatch" data-hl-color="y" data-hl-bg="yellow" title="黄色高光"></button>
+    <button type="button" class="sel-swatch" data-hl-color="b" data-hl-bg="blue" title="蓝色高光"></button>
+    <button type="button" class="sel-swatch" data-hl-color="g" data-hl-bg="green" title="绿色高光"></button>
+    <button type="button" class="sel-swatch" data-hl-color="r" data-hl-bg="red" title="红色高光"></button>
+    <button type="button" class="sel-swatch" data-hl-color="p" data-hl-bg="purple" title="紫色高光"></button>
+    <button type="button" class="sel-tool-clear" data-hl-action="clear" title="清除高光">清高光</button>
+    <span class="sel-tool-sep"></span>
+    <span class="sel-tool-label">字色</span>
+    <button type="button" class="sel-text-color" data-tc-color="r" title="红色文字">A</button>
+    <button type="button" class="sel-text-color" data-tc-color="b" title="蓝色文字">A</button>
+    <button type="button" class="sel-text-color" data-tc-color="g" title="绿色文字">A</button>
+    <button type="button" class="sel-text-color" data-tc-color="o" title="橙色文字">A</button>
+    <button type="button" class="sel-text-color" data-tc-color="p" title="紫色文字">A</button>
+    <button type="button" class="sel-tool-clear" data-tc-action="clear" title="清除文字颜色">清字色</button>
+    <span class="sel-tool-sep" data-role="sel-font-size-control"></span>
+    <span class="sel-tool-label" data-role="sel-font-size-control">字号</span>
+    <button type="button" class="sel-font-size small" data-role="sel-font-size-control" data-fs-size="sm" title="小字号">小</button>
+    <button type="button" class="sel-font-size normal" data-role="sel-font-size-control" data-fs-action="clear" title="恢复默认字号">默认</button>
+    <button type="button" class="sel-font-size large" data-role="sel-font-size-control" data-fs-size="lg" title="大字号">大</button>
+    <button type="button" class="sel-font-size xlarge" data-role="sel-font-size-control" data-fs-size="xl" title="特大字号">特大</button>
+  </div>
+
+  <!-- 常驻文字属性带：全部控件共用同一个单行容器；没有可操作上下文时只把相应按钮置灰。 -->
+  <div class="text-format-dock" data-role="text-format-dock" hidden>
+    <div class="text-format-row" id="text-format-row" data-role="text-format-row" role="toolbar"
+         data-editor-i18n-aria="textDockAria" aria-label="文字格式">
+      <div class="text-color-rail" data-role="text-color-rail" role="group"
+           data-editor-i18n-aria="textColorRailAria" aria-label="柔和颜色">
+        <button type="button" class="td-swatch" data-text-tone="y" data-color="yellow" data-editor-i18n-title="textToneYellow" title="柔和黄"></button>
+        <button type="button" class="td-swatch" data-text-tone="o" data-color="orange" data-editor-i18n-title="textToneOrange" title="柔和橙"></button>
+        <button type="button" class="td-swatch" data-text-tone="r" data-color="red" data-editor-i18n-title="textToneRed" title="柔和红"></button>
+        <button type="button" class="td-swatch" data-text-tone="p" data-color="purple" data-editor-i18n-title="textTonePurple" title="柔和紫"></button>
+        <button type="button" class="td-swatch" data-text-tone="b" data-color="blue" data-editor-i18n-title="textToneBlue" title="柔和蓝"></button>
+        <button type="button" class="td-swatch" data-text-tone="c" data-color="cyan" data-editor-i18n-title="textToneCyan" title="柔和青"></button>
+        <button type="button" class="td-swatch" data-text-tone="g" data-color="green" data-editor-i18n-title="textToneGreen" title="柔和绿"></button>
+        <button type="button" class="td-swatch" data-text-tone="k" data-color="gray" data-editor-i18n-title="textToneGray" title="柔和灰"></button>
+      </div>
+      <span class="text-dock-sep" aria-hidden="true"></span>
+      <div class="text-dock-inline-group text-dock-size-group" role="group"
+           data-editor-i18n-aria="textSize" aria-label="字号">
+        <button type="button" class="text-dock-btn td-size-choice" data-text-size="sm" data-editor-i18n-title="textSizeSmall" title="小字号"><span class="td-size-sm">A</span></button>
+        <button type="button" class="text-dock-btn td-size-choice" data-text-size="" data-editor-i18n-title="textSizeDefault" title="默认字号"><span class="td-size-md">A</span></button>
+        <button type="button" class="text-dock-btn td-size-choice" data-text-size="lg" data-editor-i18n-title="textSizeLarge" title="大字号"><span class="td-size-lg">A</span></button>
+        <button type="button" class="text-dock-btn td-size-choice" data-text-size="xl" data-editor-i18n-title="textSizeXL" title="特大字号"><span class="td-size-xl">A</span></button>
+      </div>
+      <span class="text-dock-sep" aria-hidden="true"></span>
+      <button type="button" class="text-dock-btn td-bold" data-text-action="bold"
+              data-editor-i18n-title="textBold" data-editor-i18n-aria="textBold" title="加粗" aria-label="加粗">B</button>
+      <button type="button" class="text-dock-btn td-highlight" data-text-action="highlight"
+              data-editor-i18n-title="textHighlight" data-editor-i18n-aria="textHighlight" title="应用高光" aria-label="应用高光">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m7 3 7 7-5 5-5-5 5-5M3 16h10"/></svg><i aria-hidden="true"></i>
+      </button>
+      <button type="button" class="text-dock-btn td-color" data-text-action="color"
+              data-editor-i18n-title="textColor" data-editor-i18n-aria="textColor" title="应用文字颜色" aria-label="应用文字颜色">A<i aria-hidden="true"></i></button>
+      <span class="text-dock-sep" aria-hidden="true"></span>
+      <div class="text-dock-inline-group text-dock-align-group" role="group"
+           data-editor-i18n-aria="textAlign" aria-label="对齐">
+        <button type="button" class="text-dock-btn" data-text-align="left" data-editor-i18n-title="textAlignLeft" title="左对齐"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 5h12M4 9h8M4 13h12M4 17h7"/></svg></button>
+        <button type="button" class="text-dock-btn" data-text-align="center" data-editor-i18n-title="textAlignCenter" title="居中"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 5h12M6 9h8M4 13h12M6.5 17h7"/></svg></button>
+        <button type="button" class="text-dock-btn" data-text-align="right" data-editor-i18n-title="textAlignRight" title="右对齐"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 5h12M8 9h8M4 13h12M9 17h7"/></svg></button>
+      </div>
+      <span class="text-dock-sep" aria-hidden="true"></span>
+      <button type="button" class="text-dock-btn td-bind" data-text-bind-action="toggle"
+              data-editor-i18n-title="textBindToggle" title="绑定到所选节点 / 解除跟随"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7.2 12.8 5.6 14.4a3 3 0 0 1-4.2-4.2L4.6 7a3 3 0 0 1 4.2 0M12.8 7.2l1.6-1.6a3 3 0 0 1 4.2 4.2L15.4 13a3 3 0 0 1-4.2 0M6.8 13.2l6.4-6.4"/></svg></button>
+      <button type="button" class="text-dock-btn" data-text-bind-action="convert"
+              data-editor-i18n-title="textConvertMindmap" title="将文本框转为所选节点的导图子节点"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="5" cy="10" r="2"/><circle cx="15" cy="5" r="2"/><circle cx="15" cy="15" r="2"/><path d="M7 10h3c2 0 2-5 3-5M10 10c2 0 2 5 3 5"/></svg></button>
+      <button type="button" class="text-dock-btn" data-text-action="clear"
+              data-editor-i18n-title="textClear" data-editor-i18n-aria="textClear" title="清除格式" aria-label="清除格式">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 14 8-8 3 3-6 6H7zM3 17h14M8 6l6 6"/></svg>
+      </button>
+    </div>
+    <button type="button" class="text-dock-collapse" data-role="text-dock-collapse"
+            data-editor-i18n-title="textDockCollapse" data-editor-i18n-aria="textDockCollapse"
+            title="收起文字工具栏" aria-label="收起文字工具栏" aria-expanded="true" aria-controls="text-format-row">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5.5 7.5 4.5 4.5 4.5-4.5"/></svg>
+    </button>
+  </div>
+
+  <!-- 公式 / 符号快捷插入面板：编辑节点标题 / 正文 / 阅读浮层时点右下角 fx 唤出（按钮由 canvas.js 生成）-->
+  <button type="button" class="formula-fab" data-role="formula-btn"
+          data-editor-i18n-title="formulaTitle" data-editor-i18n-aria="formulaAria"
+          title="插入公式 / 数学符号" aria-label="插入公式与数学符号"
+          aria-expanded="false" aria-controls="formula-panel">fx</button>
+  <div class="formula-panel" id="formula-panel" data-role="formula-panel"
+       role="dialog" aria-label="公式与符号" hidden>
+    <div class="formula-panel-head">
+      <span class="formula-panel-title">公式 / 符号</span>
+      <button type="button" class="formula-panel-close" data-role="formula-close"
+              aria-label="关闭公式面板">×</button>
+    </div>
+    <div class="formula-panel-hint" data-role="formula-hint">
+      先双击节点编辑标题，或选中索引 / 卡片节点按 <kbd>F</kbd> 编辑正文，再点这里插入。
+    </div>
+    <div class="formula-grid" data-role="formula-grid"></div>
+  </div>
+
+  <!-- 快捷键速查浮层（按 ? 或点右下角 ? 按钮打开）-->
+  <div class="shortcuts-overlay" data-role="shortcuts" hidden>
+    <div class="shortcuts-card" role="dialog" aria-label="快捷键速查" aria-modal="true">
+      <div class="shortcuts-head">
+        <h2 class="shortcuts-title">快捷键速查</h2>
+        <button type="button" class="shortcuts-close" data-role="shortcuts-close"
+                aria-label="关闭">×</button>
+      </div>
+      <button type="button" class="shortcuts-replay-hints" data-role="onboarding-reset">
+        <span class="shortcuts-replay-icon" aria-hidden="true">↻</span>
+        <span class="shortcuts-replay-copy">
+          <strong data-role="onboarding-reset-label">重新学习画布编辑器</strong>
+          <small data-role="onboarding-reset-hint">10 个动画演示 · 随时重新上手</small>
+        </span>
+        <span class="shortcuts-replay-arrow" aria-hidden="true">→</span>
+      </button>
+      <section class="shortcuts-starter" aria-label="最先记住的五个操作">
+        <div class="shortcuts-starter-copy">
+          <strong>最先记住这 5 个</strong>
+          <span>从空白画布到第一组结构，先记住这些。</span>
+        </div>
+        <div class="shortcuts-starter-grid">
+          <div><kbd>双击空白</kbd><span>写想法</span></div>
+          <div><kbd>Alt</kbd><b>+</b><kbd>拖</kbd><span>节点间连线</span></div>
+          <div><kbd>Tab</kbd><span>子节点</span></div>
+          <div><kbd>Enter</kbd><span>同级节点</span></div>
+          <div><kbd>空格</kbd><b>+</b><kbd>拖</kbd><span>平移</span></div>
+        </div>
+      </section>
+      <div class="shortcuts-grid">
+        <section class="shortcuts-group">
+          <h3>节点</h3>
+          <dl>
+            <div><dt><kbd>双击空白</kbd> / 无选中时 <kbd>N</kbd></dt><dd>在画布 / 导图中新建内容节点</dd></div>
+            <div><dt><kbd>双击节点</kbd> / <kbd>F2</kbd></dt><dd>编辑文字</dd></div>
+            <div><dt>选中内容节点后<kbd>直接打字</kbd></dt><dd>替换标题并进入编辑</dd></div>
+            <div><dt><kbd>Enter</kbd></dt><dd>在下方建兄弟节点</dd></div>
+            <div><dt><kbd>Shift</kbd>+<kbd>Enter</kbd></dt><dd>在上方插入兄弟节点</dd></div>
+            <div><dt><kbd>Tab</kbd></dt><dd>沿当前分支方向建子节点 + 连线</dd></div>
+            <div><dt><kbd>Shift</kbd>+<kbd>Tab</kbd></dt><dd>导图节点提升一级</dd></div>
+            <div><dt><kbd>Ctrl</kbd>+<kbd>D</kbd></dt><dd>复制选中节点</dd></div>
+            <div><dt><kbd>Delete</kbd> / <kbd>Backspace</kbd></dt><dd>删除选中的节点 / 连线 / 图案</dd></div>
+            <div><dt><kbd>右键节点</kbd></dt><dd>快速换色 / 复制 / 删除</dd></div>
+          </dl>
+        </section>
+        <section class="shortcuts-group">
+          <h3>正文节点 · 阅读 · 批注</h3>
+          <dl>
+            <div><dt>画布·完整 <kbd>3</kbd> / <kbd>4</kbd> / <kbd>5</kbd> / <kbd>6</kbd></dt><dd>切换接下来新建索引 / 预览 / 卡片 / 代码</dd></div>
+            <div><dt>画布·简洁 <kbd>3</kbd> / <kbd>4</kbd></dt><dd>切换接下来新建卡片 / 便签</dd></div>
+            <div><dt>索引/预览/卡片/便签 + <kbd>F</kbd></dt><dd>放大阅读并编辑正文</dd></div>
+            <div><dt>代码节点 + <kbd>F</kbd></dt><dd>放大读写代码（只着色，不批注）</dd></div>
+            <div><dt>PDF / Markdown 附件 + <kbd>F</kbd></dt><dd>打开放大阅读与附件批注</dd></div>
+            <div><dt>正文 / Markdown 阅读层 <kbd>1</kbd> / <kbd>2</kbd> / <kbd>3</kbd></dt><dd>钢笔 / 盒子 / 橡皮</dd></div>
+            <div><dt>PDF 阅读层 <kbd>1</kbd>–<kbd>7</kbd></dt><dd>高亮 / 下划线 / 钢笔 / 荧光笔 / 盒子 / 便签 / 橡皮</dd></div>
+            <div><dt>代码节点内 <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd></dt><dd>增加 / 减少缩进</dd></div>
+            <div><dt>正文编辑内 <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>K</kbd></dt><dd>插入 Markdown 代码块</dd></div>
+          </dl>
+        </section>
+        <section class="shortcuts-group">
+          <h3>思维导图</h3>
+          <dl>
+            <div><dt>单选节点 + <kbd>应用预设并整理</kbd></dt><dd>整理整条相连结构</dd></div>
+            <div><dt>多选节点 + <kbd>应用预设并整理</kbd></dt><dd>只整理所选节点</dd></div>
+            <div><dt><kbd>仅对齐层级</kbd></dt><dd>拉齐层级，保留同层顺序</dd></div>
+            <div><dt><kbd>跟随分支</kbd></dt><dd>左侧继续向左，右侧继续向右</dd></div>
+            <div><dt>拖动同级节点</dt><dd>调整顺序并自动整理所在分支</dd></div>
+            <div><dt>拖到另一个节点上</dt><dd>整棵分支改为它的子节点</dd></div>
+            <div><dt><kbd>配色刷</kbd></dt><dd>复制节点配色，不改变尺寸与连线</dd></div>
+            <div><dt><kbd>匹配父分支</kbd></dt><dd>恢复所选节点的自动分支配色</dd></div>
+            <div><dt>预设右上角 <kbd>✓</kbd></dt><dd>立即套用该预设并整理结构</dd></div>
+            <div><dt>三档节点尺寸滑条</dt><dd>分别调整中心、一级分支与二级及以后节点尺寸</dd></div>
+            <div><dt>拖动节点左右边缘</dt><dd>手工设置宽度；双击边缘恢复自动</dd></div>
+            <div><dt>拖动节点角点</dt><dd>自由调整宽度与最小高度，文字不会被裁切</dd></div>
+            <div><dt><kbd>整理重叠</kbd></dt><dd>只重新排布发生碰撞的分支</dd></div>
+            <div><dt>一级分支越过中心</dt><dd>整条分支切换到另一侧</dd></div>
+            <div><dt>拖动中心节点</dt><dd>移动整张思维导图</dd></div>
+          </dl>
+        </section>
+        <section class="shortcuts-group">
+          <h3>连线</h3>
+          <dl>
+            <div><dt>按住 <kbd>Alt</kbd>，从一个节点拖到另一个</dt><dd>创建节点间连线</dd></div>
+            <div><dt><kbd>双击连线</kbd></dt><dd>给连线写文字</dd></div>
+          </dl>
+          <h3 data-i18n="shortcutsSelectionHeading" data-i18n-zh="选择">选择</h3>
+          <dl>
+            <div><dt><kbd>Shift</kbd>+点击</dt><dd>加选 / 减选</dd></div>
+            <div><dt>空白处<kbd data-i18n="shortcutsDragAction" data-i18n-zh="拖动">拖动</kbd></dt><dd>框选</dd></div>
+            <div><dt><kbd>Ctrl</kbd>+<kbd>A</kbd></dt><dd>全选所有节点</dd></div>
+          </dl>
+        </section>
+        <section class="shortcuts-group">
+          <h3>图片 · 分组 · 图案</h3>
+          <dl>
+            <div><dt><kbd>拖入图片文件</kbd></dt><dd>导入到鼠标落点（任意模式可拖动 / 删除）</dd></div>
+            <div><dt>框选一组节点 → <kbd>+ 分组</kbd></dt><dd>原地建立语义分组，不打乱节点位置</dd></div>
+            <div><dt>框选空白区域 → <kbd>+ 盒子</kbd></dt><dd>按选框大小生成带标题的分区盒子</dd></div>
+            <div><dt>画布空白处<kbd>右键拖动</kbd></dt><dd>在任意模式按拖拽范围创建纯色色块</dd></div>
+            <div><dt>画布空白处<kbd>右键单击</kbd></dt><dd>退出绘制并切回「选择」工具</dd></div>
+          </dl>
+          <h3>界面 / 工具</h3>
+          <dl>
+            <div><dt>鼠标移到<kbd>画布左缘</kbd></dt><dd>浮现左侧手写工具栏（笔 / 橡皮 / 文字 / 箭头 / 手绘图形）</dd></div>
+            <div><dt><kbd>1</kbd> / <kbd>2</kbd></dt><dd><kbd>1</kbd>选择；<kbd>2</kbd>画笔，再按一次切到橡皮（反复按 <kbd>2</kbd> 在画笔 ↔ 橡皮间切换）</dd></div>
+            <div><dt>再点<kbd>画笔</kbd>图标</dt><dd>弹出画笔配置（笔型 / 粗细 / 压感 / 书法笔锋…逐项见下表）</dd></div>
+            <div><dt>再点<kbd>橡皮</kbd>图标</dt><dd>在「整笔擦 / 局部擦」间切换；局部擦只擦圆圈内一段，其余保留</dd></div>
+            <div><dt>长按<kbd>画笔 / 箭头</kbd></dt><dd>恢复该工具默认设置；按钮轻弹表示已生效</dd></div>
+            <div><dt>左侧手绘图形<kbd>点按</kbd></dt><dd>放小图标；拖动则按框定尺寸</dd></div>
+            <div><dt>重复点击当前<kbd>画布 / 导图 / 图案</kbd></dt><dd>切换该模式自己的「简洁 / 完整」状态</dd></div>
+            <div><dt>导图 / 图案或画布·简洁中，无选中时 <kbd>Tab</kbd></dt><dd>临时收起 / 展开当前右侧面板</dd></div>
+            <div><dt>完整状态下选中对象</dt><dd>自动打开对应属性检查器（可在设置中分别关闭）</dd></div>
+            <div><dt>右下<kbd>⚙</kbd></dt><dd>语言、速度与延迟、三个检查器、深色优化、压感和自动保存等</dd></div>
+            <div><dt>右下<kbd>?</kbd></dt><dd>打开本速查；顶部绿色按钮可重学完整新手引导</dd></div>
+          </dl>
+        </section>
+        <section class="shortcuts-group">
+          <h3>画笔配置（再点<kbd>画笔</kbd>图标弹出）</h3>
+          <dl>
+            <div><dt><kbd>笔型</kbd></dt><dd>钢笔（实色）/ 马克笔（更粗）/ 荧光笔（半透明，盖在字上仍可读）</dd></div>
+            <div><dt><kbd>粗细</kbd> / <kbd>不透明度</kbd></dt><dd>线条的宽度与透明度</dd></div>
+            <div><dt><kbd>稳定器</kbd></dt><dd>越高越抗抖，但笔迹更慢跟手；写字建议低到中</dd></div>
+            <div><dt><kbd>顺滑度</kbd></dt><dd>越高越把折点修成圆滑曲线；写小字别开太高</dd></div>
+            <div><dt><kbd>压感</kbd></dt><dd>手写笔按下笔力度自动变粗细（鼠标无效）；总开关在右下<kbd>⚙</kbd></dd></div>
+            <div><dt><kbd>压感曲线</kbd></dt><dd>软＝轻轻一碰就变粗 · 正常 · 硬＝要用力才变粗</dd></div>
+            <div><dt><kbd>笔锋渐细</kbd></dt><dd>笔画两端自动收尖；没压感的笔也有手写味</dd></div>
+            <div><dt><kbd>书法笔锋</kbd></dt><dd>横细竖粗的书法 / 钢笔体；配下面的「笔尖角度」一起用</dd></div>
+            <div><dt><kbd>笔尖角度</kbd></dt><dd>书法笔尖的朝向（45° 最常用）；支持倾斜的手写笔躺下去会更粗</dd></div>
+          </dl>
+        </section>
+        <section class="shortcuts-group">
+          <h3>画布导航</h3>
+          <dl>
+            <div><dt><kbd>滚轮</kbd></dt><dd>以鼠标为中心缩放</dd></div>
+            <div><dt><kbd>空格</kbd>+拖动</dt><dd>平移画布</dd></div>
+            <div><dt>短按<kbd>空格</kbd></dt><dd>定位最近新建的节点</dd></div>
+            <div><dt><kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd> / <kbd>WASD</kbd></dt><dd>持续平移画布（单选内容节点时字母优先进入编辑）</dd></div>
+            <div><dt><kbd>Ctrl</kbd>+<kbd>0</kbd></dt><dd>重置到 100%</dd></div>
+            <div><dt><kbd>Ctrl</kbd>+<kbd>1</kbd></dt><dd>缩放到容纳全部</dd></div>
+            <div><dt><kbd>Ctrl</kbd>+<kbd>F</kbd></dt><dd>搜索节点（Enter 跳下一个）</dd></div>
+          </dl>
+        </section>
+        <section class="shortcuts-group">
+          <h3>文件 / 历史</h3>
+          <dl>
+            <div><dt><kbd>Ctrl</kbd>+<kbd>S</kbd></dt><dd>立即保存（默认开自动保存，改完约 1.5 秒自动写盘）</dd></div>
+            <div><dt><kbd>Ctrl</kbd>+<kbd>Z</kbd></dt><dd>撤销</dd></div>
+            <div><dt><kbd>Ctrl</kbd>+<kbd>Y</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd></dt><dd>重做</dd></div>
+            <div><dt>顶栏<kbd>导出</kbd></dt><dd>导出 Markdown 或 PNG 图片</dd></div>
+            <div><dt>顶栏<kbd>清理附件</kbd></dt><dd>删除 .assets 里未被引用的图片 / 附件</dd></div>
+          </dl>
+          <h3>编辑节点时</h3>
+          <dl>
+            <div><dt><kbd>Ctrl</kbd>+<kbd>Enter</kbd></dt><dd>提交</dd></div>
+            <div><dt><kbd>Enter</kbd></dt><dd>换行</dd></div>
+            <div><dt><kbd>Esc</kbd></dt><dd>取消修改</dd></div>
+          </dl>
+        </section>
+        <section class="shortcuts-group shortcuts-group-wide">
+          <h3>文字格式（Markdown / 公式）</h3>
+          <dl class="shortcuts-md">
+            <div><dt><kbd>## 标题</kbd></dt><dd>二级标题（### 三级）</dd></div>
+            <div><dt><kbd>**加粗**</kbd></dt><dd>加粗 &nbsp; <kbd>*斜体*</kbd> 斜体</dd></div>
+            <div><dt><kbd>- 列表项</kbd></dt><dd>无序列表（1. 有序）</dd></div>
+            <div><dt><kbd>`代码`</kbd></dt><dd>行内代码</dd></div>
+            <div><dt><kbd>$E=mc^2$</kbd></dt><dd>行内公式（$$…$$ 块级）</dd></div>
+            <div><dt><kbd>==高光==</kbd></dt><dd>选中文字后可在工具栏换色</dd></div>
+            <div><dt><kbd>{tc:red|文字}</kbd></dt><dd>文字颜色（工具栏彩色 A）</dd></div>
+            <div><dt><kbd>{fs:lg|文字}</kbd></dt><dd>文字字号（小 / 默认 / 大 / 特大）</dd></div>
+            <div><dt>右下角 <kbd>fx</kbd></dt><dd>公式 / 符号面板，向正在编辑处插入 LaTeX 片段</dd></div>
+            <div><dt>选中文字框 <kbd>+</kbd> / <kbd>-</kbd> / <kbd>0</kbd></dt><dd>放大 / 缩小 / 还原文字框字号</dd></div>
+            <div><dt><kbd>\label</kbd> / <kbd>\eqref</kbd></dt><dd>同一正文内点击公式引用，跳转并闪烁目标</dd></div>
+          </dl>
+        </section>
+        <section class="shortcuts-group shortcuts-group-wide">
+          <h3>看不到更新 / 页面不对劲？</h3>
+          <dl class="shortcuts-md">
+            <div><dt><kbd>Ctrl</kbd>+<kbd>F5</kbd></dt><dd>强制刷新清缓存——改了东西没生效时先按这个</dd></div>
+            <div><dt><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>N</kbd></dt><dd>强刷还不行 → 开无痕窗口访问同一地址，绕开一切缓存</dd></div>
+            <div><dt>“文件已不在”</dt><dd>起步页带此标签的是已删除/移动的文件，点它可从列表移除</dd></div>
+          </dl>
+        </section>
+      </div>
+      <div class="shortcuts-foot">
+        <span><span data-i18n="shortcutsPress" data-i18n-zh="按">按</span> <kbd>?</kbd> <span data-i18n="shortcutsOr" data-i18n-zh="或">或</span> <kbd>Esc</kbd> <span data-i18n="shortcutsCloseSuffix" data-i18n-zh="即可关闭">即可关闭</span></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- 节点右键菜单（右键节点弹出：改颜色 / 复制 / 删除）-->
+  <div class="node-menu" data-role="node-menu" hidden>
+    <div class="node-menu-colors" data-role="node-menu-normal-colors">
+      <button type="button" class="color-dot color-default" data-color="" title="默认（无色）"></button>
+      <button type="button" class="color-dot" data-color="gray" title="灰"></button>
+      <button type="button" class="color-dot" data-color="blue" title="蓝"></button>
+      <button type="button" class="color-dot" data-color="green" title="绿"></button>
+      <button type="button" class="color-dot" data-color="yellow" title="黄"></button>
+      <button type="button" class="color-dot" data-color="red" title="红"></button>
+      <button type="button" class="color-dot" data-color="purple" title="紫"></button>
+    </div>
+    <div class="node-menu-colors sticky-palette" data-role="node-menu-sticky-colors" hidden></div>
+    <button type="button" class="node-menu-item node-menu-random" data-action="sticky-random" hidden>随机换色</button>
+    <div class="node-menu-sep"></div>
+    <button type="button" class="node-menu-item" data-action="duplicate">复制（Ctrl+D）</button>
+    <button type="button" class="node-menu-item" data-action="delete">删除（Delete）</button>
+  </div>
+
+  <!-- 连线右键菜单（右键连线弹出：编辑文字 / 删除连线）-->
+  <div class="node-menu" data-role="edge-menu" hidden>
+    <button type="button" class="node-menu-item" data-action="edge-edit">编辑文字（双击）</button>
+    <button type="button" class="node-menu-item" data-action="edge-delete">删除连线（Delete）</button>
+  </div>
+
+  <!-- 打开本地文件前的确认框（C2）-->
+  <div class="confirm-overlay" data-role="confirm" hidden>
+    <div class="confirm-box" role="dialog" aria-modal="true" aria-label="确认操作">
+      <div class="confirm-title" data-role="confirm-title">用系统默认程序打开这个文件？</div>
+      <div class="confirm-path" data-role="confirm-path"></div>
+      <div class="confirm-actions">
+        <button type="button" class="btn-text" data-role="confirm-cancel">取消</button>
+        <button type="button" class="btn btn-primary confirm-ok" data-role="confirm-ok">打开</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 顶栏改名失败提示：避免退回突兀的系统 alert -->
+  <div class="confirm-overlay" data-role="rename-notice" hidden>
+    <div class="confirm-box" role="dialog" aria-modal="true" aria-labelledby="rename-notice-title">
+      <div class="confirm-title" id="rename-notice-title">画布名称没有改动</div>
+      <div class="confirm-path confirm-copy" data-role="rename-notice-detail"></div>
+      <div class="confirm-actions">
+        <button type="button" class="btn btn-primary confirm-ok" data-role="rename-notice-close">知道了</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- AI 助手：右侧滑出对话栏（阶段 1 纯对话；阶段 2 起接入"注入画布"）。
+       配置经后端存 data/ai.json，不写入 .canvas、不长期留前端。 -->
+  <aside class="ai-panel" id="ai-panel" data-role="ai-panel" role="dialog" aria-label="AI 助手" hidden>
+    <header class="ai-panel-head">
+      <div class="ai-panel-title">
+        <span class="ai-panel-kicker">AI 助手</span>
+        <span class="ai-panel-sub">对话生成 · 整理笔记</span>
+      </div>
+      <div class="ai-panel-head-tools">
+        <button type="button" class="ai-head-btn" data-role="ai-help"
+                aria-expanded="false" title="AI 助手使用指南" aria-label="AI 助手使用指南">?</button>
+        <button type="button" class="ai-head-btn" data-role="ai-gear"
+                aria-expanded="false" title="设置 API Key / 模型 / 清空上下文" aria-label="AI 设置">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+        </button>
+        <button type="button" class="ai-head-btn ai-head-close" data-role="ai-close"
+                title="关闭（Esc）" aria-label="关闭 AI 助手">×</button>
+      </div>
+    </header>
+
+    <div class="ai-settings" data-role="ai-settings" hidden>
+      <label class="ai-field">
+        <span class="ai-field-label">API Key
+          <span class="ai-key-hint" data-role="ai-key-hint">尚未设置</span></span>
+        <input type="password" class="ai-input-text" data-role="ai-key"
+               placeholder="粘贴 DeepSeek API Key（留空=不修改）" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="ai-field">
+        <span class="ai-field-label">模型名字</span>
+        <input type="text" class="ai-input-text" data-role="ai-model"
+               placeholder="deepseek-chat" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="ai-field">
+        <span class="ai-field-label">接口地址</span>
+        <input type="text" class="ai-input-text" data-role="ai-base"
+               placeholder="https://api.deepseek.com" autocomplete="off" spellcheck="false">
+      </label>
+      <div class="ai-settings-actions">
+        <button type="button" class="ai-btn-secondary" data-role="ai-clear"
+                title="清空当前对话上下文">清空上下文</button>
+        <span class="ai-config-feedback" data-role="ai-config-feedback" aria-live="polite"></span>
+        <button type="button" class="ai-btn-secondary" data-role="ai-test"
+                title="用当前设置发一条极短请求，检查 Key / 模型 / 接口地址是否可用">测试连接</button>
+        <button type="button" class="ai-btn-primary" data-role="ai-save-config">保存设置</button>
+      </div>
+      <div class="ai-settings-note">Key 只存在本机 data/ai.json，不写入笔记、不上传别处。模型改动保存后对下一条消息生效。</div>
+      <div class="ai-settings-danger-row">
+        <button type="button" class="ai-btn-danger" data-role="ai-clear-key"
+                title="把本机保存的 API Key 清空（分发前用，防止误带出去）">清除我的 Key</button>
+      </div>
+    </div>
+
+    <div class="ai-help" data-role="ai-help-panel" role="dialog" aria-label="AI 助手使用指南" hidden>
+      <nav class="ai-help-spine" aria-label="AI 教程翻页">
+        <span class="ai-help-spine-slider" data-role="ai-help-spine-slider" aria-hidden="true"></span>
+        <button type="button" class="active" data-ai-help-page="start" title="先分清按钮"><span></span></button>
+        <button type="button" data-ai-help-page="generate" title="从零生成"><span></span></button>
+        <button type="button" data-ai-help-page="attach" title="挂到选中"><span></span></button>
+        <button type="button" data-ai-help-page="polish" title="补充与整理精炼"><span></span></button>
+        <button type="button" data-ai-help-page="context" title="上下文控制"><span></span></button>
+        <button type="button" data-ai-help-page="templates" title="提示词模板"><span></span></button>
+        <button type="button" data-ai-help-page="trouble" title="排错"><span></span></button>
+      </nav>
+      <div class="ai-help-main">
+        <nav class="ai-help-nav" aria-label="AI 教程目录">
+          <span class="ai-help-nav-slider" data-role="ai-help-nav-slider" aria-hidden="true"></span>
+          <button type="button" class="active" data-ai-help-page="start">入门</button>
+          <button type="button" data-ai-help-page="generate">生成</button>
+          <button type="button" data-ai-help-page="attach">挂到选中</button>
+          <button type="button" data-ai-help-page="polish">补充整理</button>
+          <button type="button" data-ai-help-page="context">上下文</button>
+          <button type="button" data-ai-help-page="templates">模板</button>
+          <button type="button" data-ai-help-page="trouble">排错</button>
+        </nav>
+        <div class="ai-help-book">
+          <div class="ai-help-page" data-role="ai-help-page">
+            <div class="ai-help-page-copy" data-role="ai-help-page-copy"></div>
+          </div>
+        </div>
+        <footer class="ai-help-foot">
+          <span>左侧圆点滚轮或 ← → 翻页</span>
+          <div class="ai-help-pager">
+            <button type="button" data-action="ai-help-prev" aria-label="上一页">‹</button>
+            <span data-role="ai-help-position">01 / 07</span>
+            <button type="button" data-action="ai-help-next" aria-label="下一页">›</button>
+          </div>
+        </footer>
+      </div>
+    </div>
+
+    <div class="ai-context" data-role="ai-context">
+      <button type="button" class="ai-context-toggle" data-role="ai-context-toggle"
+              aria-expanded="false" title="管理 AI 对话上下文">
+        <span class="ai-context-main" data-role="ai-context-label">上下文：连续对话</span>
+        <span class="ai-context-count" data-role="ai-context-count">0 条</span>
+      </button>
+      <div class="ai-context-menu" data-role="ai-context-menu" hidden>
+        <div class="ai-context-title">对话上下文</div>
+        <p>这里控制的是右侧聊天历史是否随下一次请求发给 AI；画布内容只会在你点“基于画布补充 / 整理精炼 / 挂到选中”时另外发送。</p>
+        <div class="ai-context-options" role="group" aria-label="上下文模式">
+          <button type="button" data-ai-context-mode="continuous">连续对话</button>
+          <button type="button" data-ai-context-mode="single">单次请求</button>
+        </div>
+        <div class="ai-context-hint" data-role="ai-context-hint"></div>
+        <div class="ai-context-actions">
+          <button type="button" class="ai-btn-secondary" data-role="ai-context-clear">清空上下文</button>
+          <button type="button" class="ai-btn-secondary" data-role="ai-context-close">收起</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="ai-messages" data-role="ai-messages">
+      <div class="ai-empty" data-role="ai-empty">
+        <div class="ai-empty-title">问点什么，或让我帮你做笔记</div>
+        <div class="ai-empty-hint"><b>发送</b>（→）用于聊天问答；上方快捷按钮会把内容做成卡片，直接画进当前画布。<br>第一次用请先点右上角齿轮填入 API Key。</div>
+        <div class="ai-empty-templates" data-role="ai-empty-templates">
+          <div class="ai-empty-templates-label">试试 · 点一下填进输入框，再点上方「✦ 生成到画布」</div>
+          <button type="button" class="ai-empty-template" data-prompt="整理牛顿第二定律：生成定义、公式 F=ma、变量含义、生活例子、典型题、易错点，连成一张知识网络。">⚡ 牛顿第二定律 · 复习卡组</button>
+          <button type="button" class="ai-empty-template" data-prompt="系统讲解 C 语言指针，做成一张知识网络画布：基本概念、取地址与解引用、指针与数组、指针与函数、多级指针、动态内存、常见错误。">🧩 C 指针 · 知识网络</button>
+          <button type="button" class="ai-empty-template" data-prompt="围绕一个研究想法，生成一张研究计划画布：研究问题、假设、现有证据、实验设计、风险、下一步。">🔬 科研想法 · 研究计划</button>
+        </div>
+      </div>
+    </div>
+
+    <form class="ai-composer" data-role="ai-composer">
+      <!-- 预设快捷按钮：点一下=带对应意图把笔记画进画布（不是聊天）。data-mode 决定意图。 -->
+      <div class="ai-compose-chips" data-role="ai-chips">
+        <button type="button" class="ai-chip" data-mode="generate"
+                title="按你写的内容，从零生成卡片并画进当前画布">✦ 生成到画布</button>
+        <button type="button" class="ai-chip" data-mode="attach"
+                title="先选中一张卡片，再把新生成内容挂到这张卡片下面">↳ 挂到选中</button>
+        <button type="button" class="ai-chip" data-mode="supplement"
+                title="读当前画布，找出还缺的概念/例子/推导帮你补上，并连到相关卡片（只新增，不改原卡片）">🔗 基于画布补充</button>
+        <button type="button" class="ai-chip" data-mode="beautify"
+                title="读当前画布，把已有内容重新整理成一套更有条理的卡片（目录/定义/例题/易错，带 Callout 与配色）；只新增，不改你的原卡片">✨ 整理精炼</button>
+      </div>
+      <textarea class="ai-input" data-role="ai-input" rows="1"
+                placeholder="输入消息，Enter 发送，Shift+Enter 换行" spellcheck="false"></textarea>
+      <div class="ai-composer-actions">
+        <span class="ai-composer-tip">Enter / → 发送＝聊天问答 · 上面按钮＝画进画布</span>
+        <button type="button" class="ai-cancel" data-role="ai-cancel"
+                title="停止等待本次 AI 生成，不改动画布" hidden>取消</button>
+        <button type="submit" class="ai-send" data-role="ai-send" title="发送（Enter）" aria-label="发送">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M4 12 L20 12 M13 5 L20 12 L13 19"/>
+          </svg>
+        </button>
+      </div>
+    </form>
+  </aside>
+
+  <script src="i18n.js" defer></script>
+  <script src="desktop-shell.js" defer></script>
+  <script src="mermaid-renderer.js" defer></script>
+  <script src="richtext.js" defer></script>
+  <script src="markdown.js" defer></script>
+  <script src="canvas.js" defer></script>
+  <script src="graph-gl.js" defer></script>
+  <script src="graph-engine.js" defer></script>
+  <script src="graph-view.js" defer></script>
+  <script src="editor.js" defer></script>
+  <script src="editor-onboarding.js" defer></script>
+  <script src="ai.js" defer></script>
+  <script src="tooltip.js" defer></script>
+</body>
+</html>

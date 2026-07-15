@@ -1,0 +1,22294 @@
+// 画布交互核心 — 阶段 3 A/B + X 轮（键盘大礼包）
+// 在阶段 2 的基础上加：
+// - 节点多行文本：编辑态用 contenteditable=plaintext-only，Enter 自然换行、
+//   Ctrl/Cmd+Enter 提交、Esc 取消；连线标签仍然是单行
+// - 节点 Markdown 渲染：显示态用 window.MarkdownMini.render(...) 渲成 HTML；
+//   字号/字色/高光/粗体使用 textMarks/bodyMarks 结构化保存，编辑态不显示增强语法
+// - 数学公式：$...$ 行内、$$...$$ 块级，每次显示态渲染后 typesetMath(textEl)
+//   调用 MathJax；MathJax 未加载完时静默跳过，加载好后会一次性 typeset 所有现有节点
+// - 编辑期间打字 → 节点尺寸变化 → 相邻连线实时跟随
+//
+// X 轮快捷键（高频操作）：
+//   未选中任何节点 → N 键 → 在视口中心建新节点 + 进编辑
+//   单选节点时：
+//     F2     → 进编辑（光标在末尾）
+//     Tab    → 右侧建子节点 + 自动连线 + 进编辑（思维导图）
+//     Enter  → 下方建兄弟节点 + 进编辑
+//     字母数字等单字符键 → Figma 风格：进编辑 + 用该字符替换节点内容
+//   双击仍然保留（鼠标用户友好）
+//
+// 阶段 2 已落地：连线 CRUD、多选/框选、撤销栈 { nodes, edges }、Alt+拖拉线
+// 阶段 1b 已落地：节点 CRUD、拖动、单选撤销
+//
+// 对外接口：
+//   window.CanvasModule.init({ viewport, surface, emptyHint, edgesLayer, data, onChange })
+// data 由 editor.js 传入，本模块直接 mutate data.nodes / data.edges；editor.js
+// 在 Ctrl+S 时把整个 data 发给后端。
+
+(function (global) {
+  'use strict';
+
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const HISTORY_LIMIT = 50;
+  const DRAG_THRESHOLD = 4;            // 像素：超过才算拖动
+  const NODE_DEFAULT_HALF_W = 80;
+  const NODE_DEFAULT_HALF_H = 18;
+
+  // 普通画布节点使用“较深边框 + 柔和浅背景”的成对配色，保证现有深色文字仍清楚。
+  // 预设只负责颜色，不夹带形状、透明度或排版；节点与连线面板共用同一份来源。
+  const NORMAL_NODE_COLOR_PRESETS = [
+    { id: 'plain', zh: '黑框白底', en: 'Ink & White', borderColor: '#000000', bgColor: '#ffffff' },
+    { id: 'graphite', zh: '石墨灰', en: 'Graphite', borderColor: '#626965', bgColor: '#f3f4f1' },
+    { id: 'ivory', zh: '象牙纸', en: 'Ivory', borderColor: '#9e835e', bgColor: '#f6f0df' },
+    { id: 'gold', zh: '暖金黄', en: 'Warm Gold', borderColor: '#b99a48', bgColor: '#f8edc3' },
+    { id: 'apricot', zh: '杏橙', en: 'Apricot', borderColor: '#b97954', bgColor: '#f7e2d2' },
+    { id: 'coral', zh: '珊瑚红', en: 'Coral', borderColor: '#b86662', bgColor: '#f7dfdf' },
+    { id: 'rose', zh: '藕粉', en: 'Dusty Rose', borderColor: '#a77b87', bgColor: '#f3e5e9' },
+    { id: 'sage', zh: '鼠尾草绿', en: 'Sage', borderColor: '#73866f', bgColor: '#e8f0e5' },
+    { id: 'teal', zh: '湖水青', en: 'Lake Teal', borderColor: '#5f8f88', bgColor: '#e2f0ed' },
+    { id: 'mist', zh: '雾蓝', en: 'Mist Blue', borderColor: '#718da3', bgColor: '#e6eff4' },
+    { id: 'slate', zh: '灰蓝', en: 'Slate Blue', borderColor: '#6f7f9f', bgColor: '#e7ebf4' },
+    { id: 'lavender', zh: '淡紫', en: 'Lavender', borderColor: '#88789e', bgColor: '#ece7f3' },
+  ];
+  const NORMAL_EDGE_COLOR_PRESETS = [
+    { id: 'ink', zh: '墨黑', en: 'Ink', color: '#000000' },
+    { id: 'graphite', zh: '石墨灰', en: 'Graphite', color: '#626965' },
+    { id: 'gold', zh: '暖金', en: 'Warm Gold', color: '#a98535' },
+    { id: 'apricot', zh: '杏橙', en: 'Apricot', color: '#b97954' },
+    { id: 'coral', zh: '珊瑚红', en: 'Coral', color: '#b86662' },
+    { id: 'sage', zh: '草木绿', en: 'Sage', color: '#667f62' },
+    { id: 'teal', zh: '湖水青', en: 'Lake Teal', color: '#4f8580' },
+    { id: 'mist', zh: '雾蓝', en: 'Mist Blue', color: '#62849b' },
+    { id: 'lavender', zh: '灰紫', en: 'Lavender', color: '#7e7094' },
+  ];
+  // 便签创建、节点右键菜单与完整画布单选面板共用同一份果冻色表。
+  // 不在各入口复制颜色，避免以后只改到其中一处。
+  const STICKY_SWATCHES = [
+    { key: 'pink', zh: '粉', en: 'Pink', hex: '#ffbdd6' },
+    { key: 'blue', zh: '蓝', en: 'Blue', hex: '#b4d4ff' },
+    { key: 'purple', zh: '紫', en: 'Purple', hex: '#d0bcff' },
+    { key: 'green', zh: '绿', en: 'Green', hex: '#b2e9cd' },
+    { key: 'yellow', zh: '黄', en: 'Yellow', hex: '#ffe69e' },
+    { key: 'orange', zh: '橙', en: 'Orange', hex: '#ffc7a0' },
+    { key: 'teal', zh: '青绿', en: 'Teal', hex: '#a9e6d8' },
+    { key: 'sky', zh: '天蓝', en: 'Sky Blue', hex: '#b6e2f7' },
+    { key: 'lavender', zh: '薰衣草', en: 'Lavender', hex: '#c8c4f6' },
+    { key: 'coral', zh: '珊瑚', en: 'Coral', hex: '#ffc1b4' },
+    { key: 'lime', zh: '青柠', en: 'Lime', hex: '#d9eca8' },
+    { key: 'rose', zh: '玫瑰', en: 'Rose', hex: '#ffb1c0' },
+    { key: 'mint', zh: '薄荷', en: 'Mint', hex: '#bdeccf' },
+    { key: 'apricot', zh: '杏色', en: 'Apricot', hex: '#ffd6a3' },
+  ];
+
+  function normalizedFontWeight(value, min, max) {
+    if (value == null || value === '') return NaN;
+    const weight = Number(value);
+    if (!Number.isFinite(weight)) return NaN;
+    return Math.max(min == null ? 100 : min, Math.min(max == null ? 900 : max, weight));
+  }
+
+  // fontWeight 缺失不是“400”，而是沿用节点类型自己的排版语义。
+  // 面板、底部 B 与实际 CSS 共用这份解析，避免相同数字对应不同外观。
+  function nodeFontWeightInfo(node, fallbackKind) {
+    const source = node && typeof node === 'object' ? node : {};
+    const mindmap = !!(source.mindmapStyleRole || source.mindmapStylePreset || source.mindmapRoot);
+    if (mindmap) {
+      const explicitMindmap = normalizedFontWeight(source.mindmapFontWeight);
+      if (Number.isFinite(explicitMindmap)) {
+        return { value: explicitMindmap, isDefault: false, kind: 'mindmap', bodyValue: null };
+      }
+      return { value: 500, isDefault: true, kind: 'mindmap', bodyValue: null };
+    }
+
+    const kind = source.kind || fallbackKind || '';
+    const explicit = kind === 'textBox'
+      ? normalizedFontWeight(source.fontWeight, 400, 800)
+      : normalizedFontWeight(source.fontWeight);
+    if (Number.isFinite(explicit)) {
+      return { value: explicit, isDefault: false, kind: kind || 'normal', bodyValue: null };
+    }
+
+    if (kind === 'textBox') return { value: 400, isDefault: true, kind: kind, bodyValue: null };
+    if (kind === 'card') return { value: 620, isDefault: true, kind: kind, bodyValue: 400 };
+    if (kind === 'preview') return { value: 580, isDefault: true, kind: kind, bodyValue: 400 };
+    if (kind === 'sticky') return { value: 460, isDefault: true, kind: kind, bodyValue: null };
+    if (kind === 'index' || kind === 'text') return { value: 600, isDefault: true, kind: 'index', bodyValue: null };
+    return { value: 440, isDefault: true, kind: kind || 'normal', bodyValue: null };
+  }
+
+  function nodeFontWeightLabel(info, english) {
+    if (!info) return '';
+    if (!info.isDefault) return String(info.value);
+    if (info.bodyValue != null && info.bodyValue !== info.value) {
+      return english
+        ? 'Default · title ' + info.value + ' / body ' + info.bodyValue
+        : '默认 · 标题' + info.value + ' / 正文' + info.bodyValue;
+    }
+    return english ? 'Default · ' + info.value : '默认 · ' + info.value;
+  }
+
+  function nodeFontWeightDefaultInfo(node, fallbackKind) {
+    const source = node && typeof node === 'object' ? { ...node } : {};
+    delete source.fontWeight;
+    delete source.mindmapFontWeight;
+    return nodeFontWeightInfo(source, fallbackKind);
+  }
+
+  // 离散滑条：保留原生 range 的键盘、触摸和指针能力，只接管视觉层。
+  // 字重以十位为可选档，整百只负责视觉主刻度；类型默认值用可点击的动态提示线标出。
+  const discreteRangeStates = new WeakMap();
+  function enhanceDiscreteRange(input, options) {
+    if (!input) return null;
+    const existing = discreteRangeStates.get(input);
+    if (existing) return existing;
+
+    const min = Number(input.min) || 0;
+    const max = Number(input.max) || 100;
+    const detent = Math.max(1, Number(options && options.detent) || Number(input.dataset.detent) || 1);
+    const fineStep = Math.max(1, Number(options && options.fineStep) || detent);
+    const majorStep = Math.max(detent, Number(options && options.majorStep) || detent);
+    const pageStep = Math.max(detent, Number(options && options.pageStep) || majorStep);
+    const wrapper = document.createElement('div');
+    const visual = document.createElement('div');
+    const track = document.createElement('span');
+    const fill = document.createElement('span');
+    const ticks = document.createElement('span');
+    const thumb = document.createElement('span');
+    const defaultMarker = document.createElement('button');
+
+    wrapper.className = 'discrete-range';
+    visual.className = 'discrete-range-visual';
+    track.className = 'discrete-range-track';
+    fill.className = 'discrete-range-fill';
+    ticks.className = 'discrete-range-ticks';
+    thumb.className = 'discrete-range-thumb';
+    defaultMarker.type = 'button';
+    defaultMarker.className = 'discrete-range-default';
+    defaultMarker.hidden = true;
+    track.setAttribute('aria-hidden', 'true');
+    track.append(fill, ticks, thumb);
+    visual.append(track, defaultMarker);
+    input.parentNode.insertBefore(wrapper, input);
+    wrapper.append(input, visual);
+    input.classList.add('discrete-range-input');
+    input.step = String(fineStep);
+
+    for (let value = min; value <= max + majorStep / 2; value += majorStep) {
+      const tick = document.createElement('i');
+      const progress = max === min ? 0 : ((value - min) / (max - min)) * 100;
+      tick.style.setProperty('--tick-position', progress + '%');
+      ticks.append(tick);
+    }
+
+    function clampedValue(value) {
+      return Math.min(max, Math.max(min, Number(value) || min));
+    }
+    function snappedValue(value) {
+      return clampedValue(min + Math.round((clampedValue(value) - min) / detent) * detent);
+    }
+    function sync() {
+      const value = clampedValue(input.value);
+      const progress = max === min ? 0 : ((value - min) / (max - min)) * 100;
+      wrapper.style.setProperty('--range-progress', progress + '%');
+    }
+    function setDefaultValue(value) {
+      const next = Number(value);
+      const visible = Number.isFinite(next) && next >= min && next <= max;
+      defaultMarker.hidden = !visible;
+      if (!visible) {
+        wrapper.removeAttribute('data-default-value');
+        return;
+      }
+      const progress = max === min ? 0 : ((next - min) / (max - min)) * 100;
+      wrapper.dataset.defaultValue = String(next);
+      defaultMarker.style.setProperty('--default-position', progress + '%');
+      const english = document.documentElement.dataset.uiLanguage === 'en';
+      const label = english ? 'Restore default weight ' + next : '恢复默认字重 ' + next;
+      defaultMarker.title = label;
+      defaultMarker.setAttribute('aria-label', label);
+    }
+    function emitInput() {
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    function commit() {
+      wrapper.classList.remove('is-dragging');
+      const before = Number(input.value);
+      const snapped = snappedValue(before);
+      if (snapped !== before) {
+        input.value = String(snapped);
+        sync();
+        emitInput();
+      } else {
+        sync();
+      }
+    }
+    function commitKeyboardValue(value) {
+      input.value = String(snappedValue(value));
+      sync();
+      emitInput();
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    function adjacentDetent(direction, distance) {
+      const offset = (clampedValue(input.value) - min) / detent;
+      const count = Math.max(1, distance || 1);
+      const index = direction > 0
+        ? Math.floor(offset + 1e-9) + count
+        : Math.ceil(offset - 1e-9) - count;
+      return min + index * detent;
+    }
+
+    defaultMarker.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      input.dispatchEvent(new CustomEvent('discrete-range:restore-default', {
+        bubbles: true,
+        detail: { value: Number(wrapper.dataset.defaultValue) },
+      }));
+    });
+
+    let pointerStartX = 0;
+    input.addEventListener('pointerdown', (event) => {
+      pointerStartX = event.clientX;
+      wrapper.classList.add('is-pointer-active');
+    });
+    input.addEventListener('pointermove', (event) => {
+      if (!wrapper.classList.contains('is-pointer-active')) return;
+      if (Math.abs(event.clientX - pointerStartX) >= DRAG_THRESHOLD) {
+        wrapper.classList.add('is-dragging');
+      }
+    });
+    input.addEventListener('pointerup', () => {
+      wrapper.classList.remove('is-pointer-active', 'is-dragging');
+    });
+    input.addEventListener('pointercancel', () => {
+      wrapper.classList.remove('is-pointer-active', 'is-dragging');
+      commit();
+    });
+    input.addEventListener('input', sync);
+    input.addEventListener('change', commit);
+    input.addEventListener('keydown', (event) => {
+      let target = null;
+      if (event.key === 'ArrowRight' || event.key === 'ArrowUp') target = adjacentDetent(1, 1);
+      else if (event.key === 'ArrowLeft' || event.key === 'ArrowDown') target = adjacentDetent(-1, 1);
+      else if (event.key === 'PageUp') target = clampedValue(input.value) + pageStep;
+      else if (event.key === 'PageDown') target = clampedValue(input.value) - pageStep;
+      else if (event.key === 'Home') target = min;
+      else if (event.key === 'End') target = max;
+      if (target == null) return;
+      event.preventDefault();
+      commitKeyboardValue(target);
+    });
+
+    const state = { input, wrapper, sync, commit, setDefaultValue, detent, majorStep };
+    discreteRangeStates.set(input, state);
+    setDefaultValue(options && options.defaultValue);
+    sync();
+    return state;
+  }
+
+  global.CanvasDiscreteRange = {
+    enhance: enhanceDiscreteRange,
+    sync(input, options) {
+      const state = discreteRangeStates.get(input);
+      if (!state) return;
+      if (options && Object.prototype.hasOwnProperty.call(options, 'defaultValue')) {
+        state.setDefaultValue(options.defaultValue);
+      }
+      state.sync();
+    },
+  };
+
+  function newNodeId() {
+    return 'n_' + Date.now().toString(36) + '_'
+      + Math.random().toString(36).slice(2, 5);
+  }
+
+  function newEdgeId() {
+    return 'e_' + Date.now().toString(36) + '_'
+      + Math.random().toString(36).slice(2, 5);
+  }
+
+  function newInkId() {
+    return 'i_' + Date.now().toString(36) + '_'
+      + Math.random().toString(36).slice(2, 5);
+  }
+
+  function clonePoint(p) {
+    if (Array.isArray(p)) return { x: Number(p[0]) || 0, y: Number(p[1]) || 0 };
+    const out = { x: Number(p && p.x) || 0, y: Number(p && p.y) || 0 };
+    // 手写笔压感：保留每点的 p（0..1），否则历史快照 / 存盘会丢压感
+    if (p && p.p != null && Number.isFinite(Number(p.p))) out.p = Number(p.p);
+    // 书法笔锋：保留每点的倾斜量 tilt（0..1）
+    if (p && p.tilt != null && Number.isFinite(Number(p.tilt))) out.tilt = Number(p.tilt);
+    return out;
+  }
+
+  // 折线箭头（左侧工具栏「直线箭头」）：直线创建，选中后可加无限转折点。
+  // 老的自由箭头无 kind，按二次贝塞尔曲线渲染，向后兼容。
+  function isPolyArrow(a) { return !!(a && a.kind === 'poly'); }
+
+  function cloneInk(ink) {
+    const source = ink && typeof ink === 'object' ? ink : {};
+    return {
+      version: 1,
+      strokes: Array.isArray(source.strokes)
+        ? source.strokes.map((s) => ({
+          ...s,
+          points: Array.isArray(s.points) ? s.points.map(clonePoint) : [],
+        }))
+        : [],
+      arrows: Array.isArray(source.arrows)
+        ? source.arrows.map((a) => {
+          const c = { ...a, start: clonePoint(a.start), end: clonePoint(a.end) };
+          // 折线箭头的 waypoints 必须深拷，否则撤销快照与实时数据共享数组、拖拽污染历史（同 5-3 连线拐点的坑）
+          if (Array.isArray(a.waypoints)) c.waypoints = a.waypoints.map(clonePoint);
+          if (a.control) c.control = clonePoint(a.control);
+          return c;
+        })
+        : [],
+    };
+  }
+
+  // 5-3：连线深拷贝——waypoints 是对象数组，必须深拷，否则撤销快照与实时数据
+  // 共享同一数组/对象，拖拽拐点时会污染历史
+  function cloneEdge(e) {
+    const c = { ...e };
+    if (Array.isArray(e.waypoints)) {
+      c.waypoints = e.waypoints.map((w) => ({ x: w.x, y: w.y }));
+    }
+    return c;
+  }
+
+  function cloneNode(n) {
+    const c = { ...n };
+    if (Array.isArray(n.groupMemberIds)) c.groupMemberIds = n.groupMemberIds.slice();
+    if (Array.isArray(n.textMarks)) c.textMarks = n.textMarks.map((mark) => ({ ...mark }));
+    if (Array.isArray(n.bodyMarks)) c.bodyMarks = n.bodyMarks.map((mark) => ({ ...mark }));
+    return c;
+  }
+
+  function cloneState(nodes, edges, ink) {
+    return {
+      nodes: nodes.map(cloneNode),
+      edges: edges.map(cloneEdge),
+      ink: cloneInk(ink),
+    };
+  }
+
+  // ── 几何 ──────────────────────────────────────
+  // 从矩形中心 (cx,cy)、半宽 hw、半高 hh，沿方向 (dx,dy) 打到矩形边的点
+  // + 它落在哪一条边上（top / right / bottom / left）
+  function sideOfExit(cx, cy, hw, hh, dx, dy, radius) {
+    if (dx === 0 && dy === 0) {
+      return { side: 'right', x: cx + hw, y: cy };
+    }
+    const sx = dx === 0 ? Infinity : hw / Math.abs(dx);
+    const sy = dy === 0 ? Infinity : hh / Math.abs(dy);
+    let side, exitX, exitY;
+    if (sx < sy) {
+      side = dx > 0 ? 'right' : 'left';
+      exitX = cx + Math.sign(dx) * hw;
+      exitY = cy + dy * sx;
+    } else {
+      side = dy > 0 ? 'bottom' : 'top';
+      exitX = cx + dx * sy;
+      exitY = cy + Math.sign(dy) * hh;
+    }
+    // 无圆角或圆角为 0：直接返回矩形边上的交点
+    const r = radius && radius > 0 ? Math.min(radius, hw, hh) : 0;
+    if (r <= 0) return { side: side, x: exitX, y: exitY };
+    // 判断端点是否落在角落区域（距角 ≤ r），若是则求射线与四分之一圆弧的交点
+    var cornerCX, cornerCY;
+    if (side === 'right') {
+      cornerCX = cx + hw - r;
+      cornerCY = exitY < cy ? cy - hh + r : cy + hh - r;
+    } else if (side === 'left') {
+      cornerCX = cx - hw + r;
+      cornerCY = exitY < cy ? cy - hh + r : cy + hh - r;
+    } else if (side === 'top') {
+      cornerCX = exitX < cx ? cx - hw + r : cx + hw - r;
+      cornerCY = cy - hh + r;
+    } else { // bottom
+      cornerCX = exitX < cx ? cx - hw + r : cx + hw - r;
+      cornerCY = cy + hh - r;
+    }
+    if (Math.abs(exitX - cornerCX) > r || Math.abs(exitY - cornerCY) > r) {
+      // 端点在边的直线段 — 不受圆角影响
+      return { side: side, x: exitX, y: exitY };
+    }
+    // 端点在角落区域 — 计算射线与四分之一圆弧的交点
+    var a = dx * dx + dy * dy;
+    var b = 2 * (dx * (cx - cornerCX) + dy * (cy - cornerCY));
+    var c = (cx - cornerCX) * (cx - cornerCX) + (cy - cornerCY) * (cy - cornerCY) - r * r;
+    var disc = b * b - 4 * a * c;
+    if (disc < 0) return { side: side, x: exitX, y: exitY };
+    var sqrtD = Math.sqrt(disc);
+    var t = Math.max((-b - sqrtD) / (2 * a), (-b + sqrtD) / (2 * a));
+    if (t <= 0) return { side: side, x: exitX, y: exitY };
+    var arcX = cx + t * dx;
+    var arcY = cy + t * dy;
+    // 验证交点落在正确的四分之一圆弧上
+    var onArc = false;
+    if (side === 'right') {
+      onArc = arcX >= cornerCX && (exitY < cy ? arcY <= cornerCY : arcY >= cornerCY);
+    } else if (side === 'left') {
+      onArc = arcX <= cornerCX && (exitY < cy ? arcY <= cornerCY : arcY >= cornerCY);
+    } else if (side === 'top') {
+      onArc = arcY <= cornerCY && (exitX < cx ? arcX <= cornerCX : arcX >= cornerCX);
+    } else { // bottom
+      onArc = arcY >= cornerCY && (exitX < cx ? arcX <= cornerCX : arcX >= cornerCX);
+    }
+    if (onArc) return { side: side, x: arcX, y: arcY };
+    return { side: side, x: exitX, y: exitY };
+  }
+
+  function normalForSide(side) {
+    if (side === 'right') return { x: 1, y: 0 };
+    if (side === 'left') return { x: -1, y: 0 };
+    if (side === 'bottom') return { x: 0, y: 1 };
+    return { x: 0, y: -1 }; // top
+  }
+
+  // 两个节点矩形之间的贝塞尔曲线（返回 path "d" 字串 + 中点）
+  function bezierBetween(srcRect, tgtRect) {
+    const sCx = srcRect.x + srcRect.w / 2;
+    const sCy = srcRect.y + srcRect.h / 2;
+    const tCx = tgtRect.x + tgtRect.w / 2;
+    const tCy = tgtRect.y + tgtRect.h / 2;
+    const dx = tCx - sCx;
+    const dy = tCy - sCy;
+    const srcExit = sideOfExit(sCx, sCy, srcRect.w / 2, srcRect.h / 2, dx, dy, srcRect.r);
+    const tgtExit = sideOfExit(tCx, tCy, tgtRect.w / 2, tgtRect.h / 2, -dx, -dy, tgtRect.r);
+
+    const dist = Math.hypot(dx, dy);
+    const offset = Math.max(30, Math.min(dist * 0.4, 120));
+
+    const sN = normalForSide(srcExit.side);
+    const tN = normalForSide(tgtExit.side);
+
+    const c1x = srcExit.x + sN.x * offset;
+    const c1y = srcExit.y + sN.y * offset;
+    const c2x = tgtExit.x + tN.x * offset;
+    const c2y = tgtExit.y + tN.y * offset;
+
+    // 三次贝塞尔 t=0.5 的点
+    const midX = 0.125 * srcExit.x + 0.375 * c1x + 0.375 * c2x + 0.125 * tgtExit.x;
+    const midY = 0.125 * srcExit.y + 0.375 * c1y + 0.375 * c2y + 0.125 * tgtExit.y;
+
+    return {
+      d: 'M ' + srcExit.x + ' ' + srcExit.y
+        + ' C ' + c1x + ' ' + c1y + ', ' + c2x + ' ' + c2y
+        + ', ' + tgtExit.x + ' ' + tgtExit.y,
+      midX: midX,
+      midY: midY,
+    };
+  }
+
+  // 从某节点拉到任意点 (px, py) 的预览曲线
+  function bezierToPoint(srcRect, px, py) {
+    const sCx = srcRect.x + srcRect.w / 2;
+    const sCy = srcRect.y + srcRect.h / 2;
+    const dx = px - sCx;
+    const dy = py - sCy;
+    const srcExit = sideOfExit(sCx, sCy, srcRect.w / 2, srcRect.h / 2, dx, dy, srcRect.r);
+    const dist = Math.hypot(dx, dy);
+    const offset = Math.max(30, Math.min(dist * 0.4, 120));
+    const sN = normalForSide(srcExit.side);
+    const c1x = srcExit.x + sN.x * offset;
+    const c1y = srcExit.y + sN.y * offset;
+    return 'M ' + srcExit.x + ' ' + srcExit.y
+      + ' C ' + c1x + ' ' + c1y + ', ' + px + ' ' + py + ', ' + px + ' ' + py;
+  }
+
+  // 5-2：两节点矩形之间的直线（端点同样落在最近边上，和贝塞尔一致）
+  function straightBetween(srcRect, tgtRect) {
+    const sCx = srcRect.x + srcRect.w / 2;
+    const sCy = srcRect.y + srcRect.h / 2;
+    const tCx = tgtRect.x + tgtRect.w / 2;
+    const tCy = tgtRect.y + tgtRect.h / 2;
+    const dx = tCx - sCx;
+    const dy = tCy - sCy;
+    const s = sideOfExit(sCx, sCy, srcRect.w / 2, srcRect.h / 2, dx, dy, srcRect.r);
+    const t = sideOfExit(tCx, tCy, tgtRect.w / 2, tgtRect.h / 2, -dx, -dy, tgtRect.r);
+    return {
+      d: 'M ' + s.x + ' ' + s.y + ' L ' + t.x + ' ' + t.y,
+      midX: (s.x + t.x) / 2,
+      midY: (s.y + t.y) / 2,
+    };
+  }
+
+  // 5-3：折线（直线模式 + 拐点）
+  const EDGE_CURVES = ['bezier', 'straight', 'elbow', 'rounded-elbow', 's-curve', 'smooth', 'branch', 'arc', 'organic'];
+  const EDGE_LINE_STYLES = ['solid', 'dashed', 'dotted', 'soft', 'glow'];
+
+  function edgeCurveType(edge) {
+    const curve = edge && edge.curve;
+    return EDGE_CURVES.indexOf(curve) >= 0 ? curve : 'bezier';
+  }
+
+  function edgeLineStyle(edge) {
+    const style = edge && edge.lineStyle;
+    return EDGE_LINE_STYLES.indexOf(style) >= 0 ? style : 'solid';
+  }
+
+  function darkEdgeOptimizationActive() {
+    if (!document.body || document.body.dataset.backgroundTone !== 'dark') return false;
+    try { return localStorage.getItem('canvas:darkEdgeOptimization') !== '0'; }
+    catch (e) { return true; }
+  }
+
+  function edgeVisualLineStyle(edge) {
+    const style = edgeLineStyle(edge);
+    return darkEdgeOptimizationActive() && style !== 'glow' ? 'glow' : style;
+  }
+
+  function edgeStrokeColor(edge) {
+    if (edge && edge.color) return edge.color;            // 用户自定义线条颜色优先
+    return edgeVisualLineStyle(edge) === 'glow' ? '#4f8df7' : '#000';   // 无自定义：默认黑，荧光保持旧蓝
+  }
+
+  function clampValue(v, lo, hi) {
+    return Math.max(lo, Math.min(hi, v));
+  }
+
+  function rectCenter(rect) {
+    return { x: rect.x + rect.w / 2, y: rect.y + rect.h / 2 };
+  }
+
+  function orthogonalRoutePoints(srcRect, tgtRect, mode) {
+    const sC = rectCenter(srcRect);
+    const tC = rectCenter(tgtRect);
+    const dx = tC.x - sC.x;
+    const dy = tC.y - sC.y;
+    const horizontal = mode === 'horizontal'
+      ? true
+      : (mode === 'vertical' ? false : Math.abs(dx) >= Math.abs(dy));
+    const sx = dx === 0 ? 1 : Math.sign(dx);
+    const sy = dy === 0 ? 1 : Math.sign(dy);
+    const s = horizontal
+      ? sideOfExit(sC.x, sC.y, srcRect.w / 2, srcRect.h / 2, sx, 0, srcRect.r)
+      : sideOfExit(sC.x, sC.y, srcRect.w / 2, srcRect.h / 2, 0, sy, srcRect.r);
+    const t = horizontal
+      ? sideOfExit(tC.x, tC.y, tgtRect.w / 2, tgtRect.h / 2, -sx, 0, tgtRect.r)
+      : sideOfExit(tC.x, tC.y, tgtRect.w / 2, tgtRect.h / 2, 0, -sy, tgtRect.r);
+    if (horizontal) {
+      const mx = (s.x + t.x) / 2;
+      return [{ x: s.x, y: s.y }, { x: mx, y: s.y }, { x: mx, y: t.y }, { x: t.x, y: t.y }];
+    }
+    const my = (s.y + t.y) / 2;
+    return [{ x: s.x, y: s.y }, { x: s.x, y: my }, { x: t.x, y: my }, { x: t.x, y: t.y }];
+  }
+
+  function roundedPolylineD(pts, radius) {
+    if (!pts || pts.length < 2) return '';
+    let d = 'M ' + pts[0].x + ' ' + pts[0].y;
+    for (let i = 1; i < pts.length - 1; i++) {
+      const prev = pts[i - 1];
+      const cur = pts[i];
+      const next = pts[i + 1];
+      const lenA = Math.hypot(cur.x - prev.x, cur.y - prev.y);
+      const lenB = Math.hypot(next.x - cur.x, next.y - cur.y);
+      const r = Math.min(radius, lenA / 2, lenB / 2);
+      if (r <= 0.5) {
+        d += ' L ' + cur.x + ' ' + cur.y;
+        continue;
+      }
+      const p1 = {
+        x: cur.x - (cur.x - prev.x) / lenA * r,
+        y: cur.y - (cur.y - prev.y) / lenA * r,
+      };
+      const p2 = {
+        x: cur.x + (next.x - cur.x) / lenB * r,
+        y: cur.y + (next.y - cur.y) / lenB * r,
+      };
+      d += ' L ' + p1.x + ' ' + p1.y + ' Q ' + cur.x + ' ' + cur.y + ', ' + p2.x + ' ' + p2.y;
+    }
+    const last = pts[pts.length - 1];
+    return d + ' L ' + last.x + ' ' + last.y;
+  }
+
+  function polylineD(pts) {
+    let d = 'M ' + pts[0].x + ' ' + pts[0].y;
+    for (let i = 1; i < pts.length; i++) d += ' L ' + pts[i].x + ' ' + pts[i].y;
+    return d;
+  }
+  // 5-3：Catmull-Rom（张力 1/6）转三次贝塞尔，平滑穿过所有点
+  function smoothD(pts) {
+    if (pts.length < 3) return polylineD(pts);
+    let d = 'M ' + pts[0].x + ' ' + pts[0].y;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p0 = pts[i - 1] || pts[i];
+      const p1 = pts[i];
+      const p2 = pts[i + 1];
+      const p3 = pts[i + 2] || p2;
+      const c1x = p1.x + (p2.x - p0.x) / 6;
+      const c1y = p1.y + (p2.y - p0.y) / 6;
+      const c2x = p2.x - (p3.x - p1.x) / 6;
+      const c2y = p2.y - (p3.y - p1.y) / 6;
+      d += ' C ' + c1x + ' ' + c1y + ', ' + c2x + ' ' + c2y + ', ' + p2.x + ' ' + p2.y;
+    }
+    return d;
+  }
+  function midOfPolyline(pts) {
+    const k = Math.floor((pts.length - 1) / 2);
+    return { x: (pts[k].x + pts[k + 1].x) / 2, y: (pts[k].y + pts[k + 1].y) / 2 };
+  }
+  // 5-3：有拐点时，两端锚点朝向相邻的拐点（而非对方节点中心）
+  function geomFromPoints(pts, rounded) {
+    const mid = midOfPolyline(pts);
+    return {
+      d: rounded ? roundedPolylineD(pts, 18) : polylineD(pts),
+      midX: mid.x,
+      midY: mid.y,
+    };
+  }
+
+  function elbowBetween(srcRect, tgtRect, rounded) {
+    return geomFromPoints(orthogonalRoutePoints(srcRect, tgtRect, 'auto'), rounded);
+  }
+
+  function smoothBetween(srcRect, tgtRect) {
+    const pts = orthogonalRoutePoints(srcRect, tgtRect, 'auto');
+    const mid = midOfPolyline(pts);
+    return { d: smoothD(pts), midX: mid.x, midY: mid.y };
+  }
+
+  function sCurveBetween(srcRect, tgtRect) {
+    const sC = rectCenter(srcRect);
+    const tC = rectCenter(tgtRect);
+    const dx = tC.x - sC.x;
+    const dy = tC.y - sC.y;
+    const horizontal = Math.abs(dx) >= Math.abs(dy);
+    const sx = dx === 0 ? 1 : Math.sign(dx);
+    const sy = dy === 0 ? 1 : Math.sign(dy);
+    const s = horizontal
+      ? sideOfExit(sC.x, sC.y, srcRect.w / 2, srcRect.h / 2, sx, 0, srcRect.r)
+      : sideOfExit(sC.x, sC.y, srcRect.w / 2, srcRect.h / 2, 0, sy, srcRect.r);
+    const t = horizontal
+      ? sideOfExit(tC.x, tC.y, tgtRect.w / 2, tgtRect.h / 2, -sx, 0, tgtRect.r)
+      : sideOfExit(tC.x, tC.y, tgtRect.w / 2, tgtRect.h / 2, 0, -sy, tgtRect.r);
+    const dist = Math.hypot(t.x - s.x, t.y - s.y);
+    const offset = clampValue(dist * 0.55, 70, 260);
+    const c1 = horizontal
+      ? { x: s.x + sx * offset, y: s.y }
+      : { x: s.x, y: s.y + sy * offset };
+    const c2 = horizontal
+      ? { x: t.x - sx * offset, y: t.y }
+      : { x: t.x, y: t.y - sy * offset };
+    const midX = 0.125 * s.x + 0.375 * c1.x + 0.375 * c2.x + 0.125 * t.x;
+    const midY = 0.125 * s.y + 0.375 * c1.y + 0.375 * c2.y + 0.125 * t.y;
+    return {
+      d: 'M ' + s.x + ' ' + s.y + ' C ' + c1.x + ' ' + c1.y
+        + ', ' + c2.x + ' ' + c2.y + ', ' + t.x + ' ' + t.y,
+      midX: midX,
+      midY: midY,
+    };
+  }
+
+  function branchCurvePoints(srcRect, tgtRect) {
+    const sC = rectCenter(srcRect);
+    const tC = rectCenter(tgtRect);
+    const dx = tC.x - sC.x;
+    const dy = tC.y - sC.y;
+    const horizontal = Math.abs(dx) >= Math.abs(dy);
+    const sx = dx === 0 ? 1 : Math.sign(dx);
+    const sy = dy === 0 ? 1 : Math.sign(dy);
+    const s = horizontal
+      ? sideOfExit(sC.x, sC.y, srcRect.w / 2, srcRect.h / 2, sx, 0, srcRect.r)
+      : sideOfExit(sC.x, sC.y, srcRect.w / 2, srcRect.h / 2, 0, sy, srcRect.r);
+    const t = horizontal
+      ? sideOfExit(tC.x, tC.y, tgtRect.w / 2, tgtRect.h / 2, -sx, 0, tgtRect.r)
+      : sideOfExit(tC.x, tC.y, tgtRect.w / 2, tgtRect.h / 2, 0, -sy, tgtRect.r);
+    if (horizontal) {
+      const midX = s.x + (t.x - s.x) * 0.46;
+      return [s, { x: midX, y: s.y }, { x: midX, y: t.y }, t];
+    }
+    const midY = s.y + (t.y - s.y) * 0.46;
+    return [s, { x: s.x, y: midY }, { x: t.x, y: midY }, t];
+  }
+
+  function arcCurvePoints(srcRect, tgtRect) {
+    const sC = rectCenter(srcRect);
+    const tC = rectCenter(tgtRect);
+    const dx = tC.x - sC.x;
+    const dy = tC.y - sC.y;
+    const s = sideOfExit(sC.x, sC.y, srcRect.w / 2, srcRect.h / 2, dx, dy, srcRect.r);
+    const t = sideOfExit(tC.x, tC.y, tgtRect.w / 2, tgtRect.h / 2, -dx, -dy, tgtRect.r);
+    const vx = t.x - s.x;
+    const vy = t.y - s.y;
+    const len = Math.max(1, Math.hypot(vx, vy));
+    const bend = clampValue(len * 0.16, 22, 68);
+    const sign = Math.abs(vx) >= Math.abs(vy) ? (vy >= 0 ? -1 : 1) : (vx >= 0 ? 1 : -1);
+    return [s, {
+      x: (s.x + t.x) / 2 + (-vy / len) * bend * sign,
+      y: (s.y + t.y) / 2 + (vx / len) * bend * sign,
+    }, t];
+  }
+
+  function organicCurvePoints(srcRect, tgtRect) {
+    const sC = rectCenter(srcRect);
+    const tC = rectCenter(tgtRect);
+    const dx = tC.x - sC.x;
+    const dy = tC.y - sC.y;
+    const s = sideOfExit(sC.x, sC.y, srcRect.w / 2, srcRect.h / 2, dx, dy, srcRect.r);
+    const t = sideOfExit(tC.x, tC.y, tgtRect.w / 2, tgtRect.h / 2, -dx, -dy, tgtRect.r);
+    const vx = t.x - s.x;
+    const vy = t.y - s.y;
+    const len = Math.max(1, Math.hypot(vx, vy));
+    const nx = -vy / len;
+    const ny = vx / len;
+    const bend = clampValue(len * 0.075, 10, 34) * (vx + vy >= 0 ? 1 : -1);
+    return [
+      s,
+      { x: s.x + vx * 0.30 + nx * bend, y: s.y + vy * 0.30 + ny * bend },
+      { x: s.x + vx * 0.72 - nx * bend * 0.55, y: s.y + vy * 0.72 - ny * bend * 0.55 },
+      t,
+    ];
+  }
+
+  function cubicCurveGeom(pts) {
+    const p0 = pts[0], p1 = pts[1], p2 = pts[2], p3 = pts[3];
+    return {
+      d: 'M ' + p0.x + ' ' + p0.y + ' C ' + p1.x + ' ' + p1.y + ', ' + p2.x + ' ' + p2.y + ', ' + p3.x + ' ' + p3.y,
+      midX: 0.125 * p0.x + 0.375 * p1.x + 0.375 * p2.x + 0.125 * p3.x,
+      midY: 0.125 * p0.y + 0.375 * p1.y + 0.375 * p2.y + 0.125 * p3.y,
+    };
+  }
+
+  function arcCurveGeom(pts) {
+    const p0 = pts[0], p1 = pts[1], p2 = pts[2];
+    return {
+      d: 'M ' + p0.x + ' ' + p0.y + ' Q ' + p1.x + ' ' + p1.y + ', ' + p2.x + ' ' + p2.y,
+      midX: 0.25 * p0.x + 0.5 * p1.x + 0.25 * p2.x,
+      midY: 0.25 * p0.y + 0.5 * p1.y + 0.25 * p2.y,
+    };
+  }
+
+  function edgeAnchors(srcRect, tgtRect, wps) {
+    const sCx = srcRect.x + srcRect.w / 2, sCy = srcRect.y + srcRect.h / 2;
+    const tCx = tgtRect.x + tgtRect.w / 2, tCy = tgtRect.y + tgtRect.h / 2;
+    const a1 = wps[0], a2 = wps[wps.length - 1];
+    return {
+      s: sideOfExit(sCx, sCy, srcRect.w / 2, srcRect.h / 2, a1.x - sCx, a1.y - sCy, srcRect.r),
+      t: sideOfExit(tCx, tCy, tgtRect.w / 2, tgtRect.h / 2, a2.x - tCx, a2.y - tCy, tgtRect.r),
+    };
+  }
+
+  // 5-2/5-3：按 edge.curve 选直线/贝塞尔；有 waypoints 时穿过各拐点
+  function edgeGeom(edge, srcRect, tgtRect) {
+    const wps = (edge && Array.isArray(edge.waypoints) && edge.waypoints.length)
+      ? edge.waypoints : null;
+    const curve = edgeCurveType(edge);
+    if (!wps) {
+      if (curve === 'straight') return straightBetween(srcRect, tgtRect);
+      if (curve === 'elbow') return elbowBetween(srcRect, tgtRect, false);
+      if (curve === 'rounded-elbow') return elbowBetween(srcRect, tgtRect, true);
+      if (curve === 's-curve') return sCurveBetween(srcRect, tgtRect);
+      if (curve === 'smooth') return smoothBetween(srcRect, tgtRect);
+      if (curve === 'branch') return cubicCurveGeom(branchCurvePoints(srcRect, tgtRect));
+      if (curve === 'arc') return arcCurveGeom(arcCurvePoints(srcRect, tgtRect));
+      if (curve === 'organic') return cubicCurveGeom(organicCurvePoints(srcRect, tgtRect));
+      return bezierBetween(srcRect, tgtRect);
+    }
+    const a = edgeAnchors(srcRect, tgtRect, wps);
+    const pts = [{ x: a.s.x, y: a.s.y }]
+      .concat(wps.map((w) => ({ x: w.x, y: w.y })))
+      .concat([{ x: a.t.x, y: a.t.y }]);
+    const d = (curve === 'straight' || curve === 'elbow')
+      ? polylineD(pts)
+      : (curve === 'rounded-elbow' ? roundedPolylineD(pts, 18) : smoothD(pts));
+    const mid = midOfPolyline(pts);
+    return { d: d, midX: mid.x, midY: mid.y };
+  }
+
+  function init(opts) {
+    const viewport = opts.viewport;
+    const surface = opts.surface;
+    const emptyHint = opts.emptyHint || null;
+    const edgesLayer = opts.edgesLayer || null;
+    const edgesCanvas = opts.edgesCanvas || null;
+    const inkLayer = opts.inkLayer || null;
+    const drawToolbar = opts.drawToolbar || null;
+    const zoomIndicator = opts.zoomIndicator || null;
+    // 顶栏新控件（W 轮：方向键平移 + 定位 + 偏好缩放）
+    const panSpeedInput = opts.panSpeedInput || null;
+    const panInertiaInput = opts.panInertiaInput || null;
+    const zoomSpeedInput = opts.zoomSpeedInput || null;
+    const locateBtn = opts.locateBtn || null;
+    const spaceLocateInput = opts.spaceLocateInput || null;
+    const zoomPresetBtn = opts.zoomPresetBtn || null;
+    const zoomPrefInput = opts.zoomPrefInput || null;
+    // 速查表浮层（Y1 轮）
+    const shortcutsOverlay = opts.shortcutsOverlay || null;
+    const shortcutsClose = opts.shortcutsClose || null;
+    const helpBtn = opts.helpBtn || null;
+    const onboardingHint = opts.onboardingHint || null;
+    const onboardingReset = opts.onboardingReset || null;
+    // 节点右键菜单（C1 轮：颜色 + 复制 + 删除）
+    const nodeMenu = opts.nodeMenu || null;
+    const edgeMenu = opts.edgeMenu || null;   // 连线右键菜单（编辑文字 / 删除）
+    let menuEdgeId = null;                     // 当前右键菜单作用的连线 id
+    const editPanel = opts.editPanel || null;  // 5-4：编辑模式右侧抽屉
+    const decorPanel = opts.decorPanel || null; // 新版 EXE 第 7 项：图案/图片装饰对象
+    const textReader = opts.textReader || null; // 文本节点：长正文专注阅读浮层
+    const pdfReader = opts.pdfReader || null;   // PDF 附件：放大阅读 + 批注浮层
+    const mdReader = opts.mdReader || null;     // MD 附件：放大阅读浮层（只读 + 复用选区高光）
+    const selToolbar = opts.selToolbar || null; // 选中文字浮动工具栏（高光 / 字色 / 字号）
+    const textDock = opts.textDock || null;     // 底部文字上下文工具栏（节点 / 文本框 / 新建默认）
+    const formulaPanel = opts.formulaPanel || null; // LaTeX 公式 / 符号快捷插入面板
+    const formulaBtn = opts.formulaBtn || null;     // 唤出公式面板的 fx 浮动按钮
+    // 外部链接（C2 轮）：确认框 + 当前 .canvas 路径（相对链接相对它所在目录解析）
+    const confirmOverlay = opts.confirmOverlay || null;
+    // 节点搜索（阶段 4）：搜索栏 + 输入框 + 计数 + 上/下/关闭按钮
+    const searchBar = opts.searchBar || null;
+    const searchInput = opts.searchInput || null;
+    const searchCount = opts.searchCount || null;
+    const searchPrev = opts.searchPrev || null;
+    const searchNext = opts.searchNext || null;
+    const searchClose = opts.searchClose || null;
+    // 小地图（阶段 4）：容器 + 节点层 + 取景框
+    const minimap = opts.minimap || null;
+    const minimapNodes = opts.minimapNodes || null;
+    const minimapViewbox = opts.minimapViewbox || null;
+    let filePath = opts.filePath || '';
+    const initialViewport = opts.initialViewport || null;
+    // 当前 .canvas 文件所在目录（去掉最后一段文件名）
+    const baseDir = filePath.replace(/[\\/][^\\/]*$/, '');
+    const data = opts.data;
+    const onViewportChange = opts.onViewportChange || function () {};
+    const ONBOARDING_ACTIVE_KEY = 'canvas:onboardingActive';
+    const ONBOARDING_STAGES = ['empty', 'connect', 'outline', 'box', 'pdf', 'pdf-tools'];
+    let onboardingTimer = null;
+    let onboardingSwapTimer = null;
+    const ONBOARDING_EXIT_MS = 440;      // 与 CSS 淡出时长对齐：旧提示送走后再迎新的
+    let onboardingActive = !!opts.fresh || localStorage.getItem(ONBOARDING_ACTIVE_KEY) === '1';
+    if (opts.fresh) localStorage.setItem(ONBOARDING_ACTIVE_KEY, '1');
+
+    function onboardingSeenKey(stage) {
+      return 'canvas:onboardingSeen:' + stage;
+    }
+
+    function hideOnboardingHint() {
+      if (!onboardingHint) return;
+      window.clearTimeout(onboardingTimer);
+      window.clearTimeout(onboardingSwapTimer);
+      onboardingHint.classList.remove('show');
+    }
+
+    function showOnboardingHint(stage, html, duration) {
+      if (!onboardingActive || !onboardingHint || localStorage.getItem(onboardingSeenKey(stage)) === '1') return;
+      localStorage.setItem(onboardingSeenKey(stage), '1');
+      window.clearTimeout(onboardingTimer);
+      window.clearTimeout(onboardingSwapTimer);
+      // 胶囊始终在页面里、靠透明度切换（不再 display 切换），起点 opacity:0 已渲染过，
+      // 加 .show 即可稳定触发淡入；无需再靠 rAF 跨越 display:none → 显示的赛跑。
+      const present = () => {
+        onboardingHint.innerHTML = html;
+        requestAnimationFrame(() => onboardingHint.classList.add('show'));
+        onboardingTimer = window.setTimeout(hideOnboardingHint, duration || 4200);
+      };
+      if (onboardingHint.classList.contains('show')) {
+        // 上一条还在显示：先让它淡出落地，再换文字淡入，避免硬切覆盖
+        onboardingHint.classList.remove('show');
+        onboardingSwapTimer = window.setTimeout(present, ONBOARDING_EXIT_MS);
+      } else {
+        present();
+      }
+    }
+
+    function showRelevantOnboardingHint() {
+      const contentNodes = data.nodes.filter((node) => !isDecorationNode(node));
+      // 空画布交给左上角常驻提示，这里不再弹同义胶囊（避免与静态提示重复）；
+      // 胶囊只负责"下一步"：有了第一个节点教连线，多个节点教 Tab/Enter。
+      if (contentNodes.length === 0) {
+        showOnboardingHint('empty', '双击空白处，写下第一个想法');
+        return;
+      }
+      if (contentNodes.length === 1) {
+        showOnboardingHint('connect', '按住 <kbd>Alt</kbd> 从节点拖出，可以连接想法');
+      } else {
+        showOnboardingHint('outline', '按 <kbd>Tab</kbd> 创建子节点，按 <kbd>Enter</kbd> 创建同级节点', 5200);
+      }
+    }
+
+    function resetOnboardingHints() {
+      ONBOARDING_STAGES.forEach((stage) => localStorage.removeItem(onboardingSeenKey(stage)));
+      localStorage.setItem(ONBOARDING_ACTIVE_KEY, '1');
+      onboardingActive = true;
+      closeShortcuts();
+      window.setTimeout(showRelevantOnboardingHint, 180);
+    }
+    const onChange = opts.onChange || function () {};
+
+    if (!viewport || !surface || !edgesLayer || !data) {
+      console.warn('[画布] CanvasModule.init 缺参数');
+      return null;
+    }
+    if (!Array.isArray(data.nodes)) data.nodes = [];
+    if (!Array.isArray(data.edges)) data.edges = [];
+    const RichText = global.RelatumRichText;
+    let richMigrationChanged = false;
+
+    function richMarksKey(field) { return field === 'body' ? 'bodyMarks' : 'textMarks'; }
+    function richMarks(node, field) {
+      if (!node || !RichText) return [];
+      return RichText.normalize(String(node[field] || ''), node[richMarksKey(field)]);
+    }
+    function storeRichMarks(node, field, marks) {
+      if (!node || !RichText) return;
+      const key = richMarksKey(field);
+      const normalized = RichText.normalize(String(node[field] || ''), marks);
+      if (normalized.length) node[key] = normalized;
+      else delete node[key];
+    }
+    function normalizeNodeRichText(node) {
+      if (!node || typeof node !== 'object' || !RichText) return false;
+      let changed = false;
+      ['text', 'body'].forEach(function (field) {
+        if (field === 'body' && node.kind === 'code') {
+          if (node.bodyMarks) { delete node.bodyMarks; changed = true; }
+          return;
+        }
+        if (node[field] == null) return;
+        const value = String(node[field]);
+        const key = richMarksKey(field);
+        if (Array.isArray(node[key])) {
+          const normalized = RichText.normalize(value, node[key]);
+          const before = JSON.stringify(node[key]);
+          if (normalized.length) node[key] = normalized;
+          else { delete node[key]; changed = true; }
+          if (before !== JSON.stringify(normalized)) changed = true;
+          return;
+        }
+        const parsed = RichText.parseLegacy(value);
+        if (!parsed.changed) return;
+        node[field] = parsed.text;
+        if (parsed.marks.length) node[key] = parsed.marks;
+        changed = true;
+      });
+      return changed;
+    }
+    function richSource(node, field, text, marks) {
+      const raw = String(text == null ? (node && node[field]) || '' : text);
+      if (!RichText) return raw;
+      return RichText.serialize(raw, marks == null ? richMarks(node, field) : marks);
+    }
+    function richSlice(node, field, start, end) {
+      if (!RichText || !node) return [];
+      return RichText.slice(String(node[field] || ''), richMarks(node, field), start, end);
+    }
+    data.nodes.forEach(function (node) {
+      if (node && node.kind === 'text') node.kind = 'index';
+      if (normalizeNodeRichText(node)) richMigrationChanged = true;
+    });
+    if (data.version !== 2) { data.version = 2; richMigrationChanged = true; }
+    data.ink = cloneInk(data.ink);
+
+    // ── 内部状态 ──────────────────────────────
+    const nodeMap = new Map();           // id → element
+    const edgeMap = new Map();           // id → { path, hit, labelEl }
+    // 节点 id 索引：连线绘制与拖拽每帧都会大量查端点，不能反复线性扫描 data.nodes。
+    const nodeById = new Map();
+    function rebuildNodeIndex() {
+      nodeById.clear();
+      data.nodes.forEach(function (node) {
+        if (node && node.id) nodeById.set(node.id, node);
+      });
+    }
+    function indexNodeData(node) {
+      if (node && node.id) {
+        if (normalizeNodeRichText(node)) richMigrationChanged = true;
+        nodeById.set(node.id, node);
+      }
+    }
+    function unindexNodeData(node) {
+      if (node && node.id && nodeById.get(node.id) === node) nodeById.delete(node.id);
+    }
+    rebuildNodeIndex();
+    // ── 连线 canvas 层（阶段①：与 SVG 并存做 A/B；默认关 = 行为零变化）──
+    // 几何复用 edgeGeom() 吐的 SVG 路径字符串，经 new Path2D(d) 直接在 canvas 上描；
+    // 几何没变就复用缓存的 Path2D，平移/缩放只是按相机重描，屏外连线跳过。
+    const edgesCtx = edgesCanvas ? edgesCanvas.getContext('2d') : null;
+    const edgePathCache = new Map();     // id → { d, path }
+    const edgeMidpointCache = new Map(); // id → { d, x, y }，名称与选中标记共用真实路径中点
+    const EDGE_CANVAS_ON = !!edgesCtx
+      && typeof Path2D === 'function'
+      && typeof requestAnimationFrame === 'function';  // 可用时启用；否则自动回退 SVG
+    let edgeCanvasLiveCoords = null;     // 拖动/脑图滑行动画中的临时节点坐标
+    let edgeCanvasRaf = null;            // 多条连线变化合并到下一帧重画
+    if (edgesCanvas) edgesCanvas.hidden = !EDGE_CANVAS_ON;
+    viewport.classList.toggle('edges-canvas-on', EDGE_CANVAS_ON);
+    function setEdgesSvgLive(active) {
+      if (!EDGE_CANVAS_ON) return;
+      viewport.classList.toggle('edges-svg-live', !!active);
+    }
+    // 节点尺寸缓存：供小地图 / 连线锚点查表，避免平移·缩放每帧现读 offsetWidth 触发强制回流。
+    const nodeSizeCache = new Map();     // id → { w, h }
+    // 单个 ResizeObserver 异步、批量地把尺寸写进缓存（不落在每帧渲染路径上读布局）。
+    const nodeSizeObserver = (typeof ResizeObserver === 'function')
+      ? new ResizeObserver(function (entries) {
+          const resizedIds = new Set();
+          for (let i = 0; i < entries.length; i++) {
+            const entry = entries[i];
+            const id = entry.target && entry.target.dataset ? entry.target.dataset.id : '';
+            if (!id) continue;
+            // unobserve/remove 前已入队的 ResizeObserver 通知仍可能延后送达。
+            // 只接受 nodeMap 里当前那个活体元素，避免已删/快照旧 DOM 把尺寸缓存又添回来。
+            if (nodeMap.get(id) !== entry.target) continue;
+            const box = entry.borderBoxSize && entry.borderBoxSize[0];
+            if (box) nodeSizeCache.set(id, { w: box.inlineSize, h: box.blockSize });
+            else nodeSizeCache.set(id, { w: entry.target.offsetWidth, h: entry.target.offsetHeight });
+            resizedIds.add(id);
+          }
+          if (!resizedIds.size) return;
+          edgesIncidentTo(resizedIds).forEach(function (edge) {
+            edgePathCache.delete(edge.id);
+            updateEdgePath(edge);
+          });
+          requestEdgesCanvasRender();
+        })
+      : null;
+    // ── 视口裁剪（阶段 2）：节点多时把屏外节点 visibility:hidden，省缩放重栅格 / 平移重绘。
+    //    visibility:hidden 保留布局盒子 → 尺寸缓存 / 连线锚点 / 小地图全不受影响，且不裁装饰。
+    const CULL_MIN_NODES = 150;        // 节点数 ≤ 此值完全不裁，小画布行为与从前一致
+    const CULL_MARGIN = 0.8;           // 视口外扩约 0.8 屏作预渲染余量，正常操作看不到弹出
+    let cullActive = false;
+    let cullVpW = 0, cullVpH = 0;      // 缓存视口尺寸，逐帧守卫不读布局（不引入每帧回流）
+    let lastCullPanX = NaN, lastCullPanY = NaN, lastCullScale = NaN;
+    const selectedNodeIds = new Set();
+    const selectedEdgeIds = new Set();
+    let editingNodeId = null;
+    let editingEdgeId = null;
+    let editingOriginalText = '';
+    let editingOriginalMarks = [];
+    let editingIsNew = false;            // 仅用于节点
+    let drag = null;                     // 见 start* 函数
+    let dragRaf = null;
+    let previewPath = null;              // 拉线预览（兼容单线引用）
+    let previewPaths = [];               // 多选 Alt 拉线时的多条预览
+    let frameEl = null;                  // 框选矩形
+    let frameActionBtn = null;           // 左键空框选后出现的「创建盒子」按钮
+    let frameIndexBtn = null;            // 框选到多个节点后出现的「生成索引」按钮
+    let frameIndexHideTimer = null;      // 「生成索引」按钮自动慢淡出计时器
+    let frameTemplateBtn = null;         // 套索圈选后出现的「保存到模板？」按钮
+    let frameTemplateHideTimer = null;   // 「保存到模板？」按钮自动慢淡出计时器
+    let frameTemplateNameBox = null;     // 点「保存到模板？」后就地起名的小输入条
+    let indexHoverEl = null;             // 悬停索引节点时左侧渐显的目录预览浮层
+    let indexHoverNodeId = null;         // 当前正在预览的索引节点 id
+    let indexHoverHideTimer = null;      // 预览浮层淡出后移除计时器
+    let indexHoverOpenTimer = null;      // 悬停后延迟弹目录的计时器
+    let indexHoverPendingId = null;      // 延迟排队中的索引节点 id（防同节点内移动反复重排）
+    let indexHoverEnabled = true;        // 齿轮开关：是否启用悬停弹目录（默认开）
+    let indexHoverDelay = 400;           // 齿轮滑条：悬停多久后弹目录（ms，默认 0.4s，0=瞬发）
+    let suppressNextContextMenu = false; // 右键拖动创建色块后，吞掉随后的 contextmenu
+    let activeDecorShapeType = null;     // 图案模式：当前被选中的拖拽创建工具
+    let activeDecorTextPreset = null;
+    let decorPaletteButtons = [];
+    let activeDecorTitleNodeId = null;   // 点击盒子标题时复用浮动调色工具栏
+    let editingDecorTitleId = null;
+    let editingDecorTitleOriginal = '';
+    let editingTextBoxId = null;
+    let editingTextBoxOriginal = '';
+    let editingTextBoxOriginalMarks = [];
+    let editingTextBoxIsNew = false;
+    let textSnapEnabled = false;         // 齿轮开关：文本框拖动时是否显示参考线并自动对齐（默认关）
+    let textSnapGuideX = null;
+    let textSnapGuideY = null;
+    let suppressDecorTitleClick = false;
+    let decorTitleLongPressTimer = null;
+    let decorTitleLongPressTriggered = false;
+    let decorTitleLongPressNodeId = null;
+    // 长按节点 → 切换删除线（视觉划掉）
+    let nodeStrikeLongPressTimer = null;
+    let nodeStrikeLongPressTriggered = false;
+    // X 轮 fix：始终追踪最后一次鼠标 client 坐标——N 键建节点用
+    let lastMouseClientX = -1;
+    let lastMouseClientY = -1;
+
+    try { textSnapEnabled = localStorage.getItem('canvas:textSnapEnabled') === '1'; } catch (e) {}
+    document.addEventListener('canvas:text-snap-enabled', function (e) {
+      textSnapEnabled = !!e.detail;
+      if (!textSnapEnabled) hideTextSnapGuides();
+    });
+
+    // ── Z 轮：视口系统（缩放 + 平移）────────
+    // 数据：surface 上挂 transform: translate(curPanX, curPanY) scale(curScale)
+    //       transform-origin 是 (0, 0)（在 css 里设了）
+    // 坐标关系：client_x = viewport_left + curPanX + curScale * surface_x
+    //          → surface_x = (client_x - viewport_left - curPanX) / curScale
+    // 缓动：target* 是用户操作设的目标；cur* 是当前显示值；raf 把 cur 向 target 缓动
+    const MIN_SCALE = 0.25;
+    const MAX_SCALE = 4;
+    const EASE = 0.32;                  // 缓动系数：越大越快接近 target（@60fps 每帧逼近比例）
+    const FRAME_MS = 1000 / 60;         // 基准帧时长：所有"每帧固定比例"按它换算成真实帧时长
+    // 把"每帧固定比例 r（@60fps）"换算成按真实帧时长归一化的比例，
+    // 使 60Hz 与 120/144Hz 高刷屏的收敛速度/手感一致（同 graph-view 的 dt 归一化思路）。
+    function frameRatio(r, dtFrames) { return 1 - Math.pow(1 - r, dtFrames); }
+    // 把上一帧时间戳换算成"多少个 60fps 帧"，并夹紧（防标签页切回/卡顿后一下蹦过去）。
+    function tickFrames(ts, lastTs) {
+      let d = lastTs ? (ts - lastTs) / FRAME_MS : 1;
+      if (!(d > 0)) d = 1;
+      return Math.max(0.35, Math.min(3, d));
+    }
+    let curScale = 1, curPanX = 0, curPanY = 0;
+    let targetScale = 1, targetPanX = 0, targetPanY = 0;
+    let animRaf = null;
+    let panInertiaRaf = null;           // W 轮：平移松手惯性循环
+    let panVel = null;                  // { x, y } px/ms，松手时延续的平移速度
+    let mindmapGlideRaf = null;         // 脑图自动排版滑行循环
+    let mindmapGlideState = null;       // { moves, affectedEdges }，供中断时收尾到终态
+    let viewportTickTs = 0;             // 上一帧时间戳（视口缓动 dt 归一化用；0=新一段缓动）
+    let spaceHeld = false;              // 空格被按住（等待平移）
+    let viewportHasUserPosition = false; // 已恢复或用户调整过时，后台排版不再强制重定位
+    let rememberedViewportCenter = null; // 保持关注点稳定，窗口改尺寸也不漂走
+
+    // ── W 轮：方向键平移 + 偏好 ──────────────
+    // 这两个是用户偏好，存 localStorage（不进 .canvas 文件）
+    let panSpeed = 8;                   // 像素/帧（@60fps ≈ 480 px/秒）
+    let panInertia = 0.15;              // 空格拖拽松手惯性倍率；0=关闭，1=旧版完整惯性
+    let zoomSpeed = 1.0;                // 滚轮缩放速度倍率（0.5-3.0）
+    let zoomPref = 1.0;                 // 偏好缩放（25%-400%）
+    let spaceLocateEnabled = false;     // 短按空格定位最近节点；不影响空格+拖拽平移（默认关闭，齿轮里打开）
+    const horizontalScrollState = new WeakMap(); // MD 宽内容：Shift+滚轮目标值 + RAF 缓动
+    let spaceUsedForPan = false;        // 本次空格按住期间是否拖动过（区分"短按定位" vs "按住平移"）
+    let shortcutsOpen = false;          // 速查表浮层是否打开（Y1 轮）
+    let externalOverlayOpen = false;    // 图谱等外部浮窗显示时暂停底层画布快捷操作
+    let drawTool = 'select';
+    let eraserChanged = false;
+    // 橡皮两种模式：'stroke' 整笔擦（默认，碰到就整条删）/ 'area' 局部擦（只擦橡皮圈内的一段）。再点橡皮切换。
+    let eraserMode = (function () { try { return localStorage.getItem('canvas:eraserMode') === 'area' ? 'area' : 'stroke'; } catch (e) { return 'stroke'; } })();
+    const ERASER_AREA_RADIUS_PX = 14;   // 局部擦圈半径（屏幕像素；除以缩放=画布坐标，故屏幕上看着恒定）
+    const ERASER_MIN_FRAG_POINTS = 2;   // 切剩不足这点数的碎片直接丢，避免留孤点
+    let selectedArrowId = null;     // 当前选中的折线箭头（仅编辑模式可选/可改）
+    let arrowHandleEls = [];        // 折线箭头的端点 + 拐点手柄（SVG 圆）
+    // 阶段 4：节点搜索
+    let searchOpen = false;             // 搜索栏是否打开
+    let searchMatches = [];             // 命中节点 id 数组（按 data.nodes 顺序）
+    let searchIndex = -1;               // 当前命中在 searchMatches 中的下标
+    let textReaderOpen = false;         // 文本节点阅读浮层是否打开
+    let readingNodeId = null;           // 当前正在阅读的文本节点
+    let textReaderEditing = false;      // 阅读浮层内是否正在编辑正文
+    let textReaderOriginalBody = '';    // 进入阅读编辑时的正文，用于一次性入历史
+    let textReaderOriginalMarks = [];
+    let indexReaderTargetId = null;     // 索引阅读双栏：右栏当前正在读的目录项 id（null=看索引节点自身正文/提示）
+    let indexPaneMdToken = 0;           // 索引右栏 MD 异步加载防竞态：快速连点不同项时只认最后一次
+    // 索引右栏内嵌 PDF：独立一份 PDF.js 文档 + 懒渲染监听，与画布卡片/批注浮层的 attachPdfState 互不影响，切项/关闭即销毁
+    let indexPanePdfDoc = null;
+    let indexPanePdfLoadingTask = null;
+    let indexPanePdfObserver = null;
+    let indexPanePdfToken = 0;          // 右栏 PDF 异步防竞态（快速切项时作废旧加载）
+    let indexPanePdfRatio = 1.414;      // 首页宽高比，用于未渲染前的占位高度
+    let indexPanePdfNodeId = null;      // 右栏当前内嵌的 PDF 节点 id（同一篇仅层级重渲时不重载）
+    let indexPanePdfAnnot = {};         // 右栏当前 PDF 的批注（页号→数组），独立 fetch、不碰全局 pdfAnnot（专用浮层用的）
+    // 右栏 MD 批注（只读显示）：净快照独立于卡片/浮层；覆盖层画笔迹+盒子
+    let indexPaneMdBase = null;
+    let indexPaneMdSvg = null;
+    let indexPaneMdNodeId = null;
+    let indexPaneMdRefW = 760;          // 右栏 MD 固定渲染宽度 = MD 专用浮层对这篇的真实正文宽（实测，笔迹按此宽归一才贴合）
+    // 正文节点阅读批注：独立存进 `<画布名>.assets/node-annotations.json`，不改 node.body / Markdown DOM。
+    let nodeAnnotData = { version: 1, nodes: {} };
+    let nodeAnnotLoaded = false;
+    let nodeAnnotLoadPromise = null;
+    let nodeAnnotSaveTimer = null;
+    let nodeAnnotDirty = false;
+    let nodeAnnotTool = null;           // null=只读 / pen / box / eraser
+    let nodeAnnotColor = '#e8482f';
+    let nodeAnnotSvg = null;
+    let nodeAnnotHistory = [];
+    let nodeAnnotRedo = [];
+    const NODE_ANNOT_VW = 1000;
+    // MD 附件阅读浮层状态（只读 + 复用选区高光，marks 与小框共用一份）
+    let mdReaderOpen = false;
+    let mdReaderNodeId = null;
+    let mdReaderBase = null;            // 浮层正文"无批注净 DOM"快照（套高光时回滚的基准）
+    // MD 阅读浮层手绘批注：固定版心 + SVG 覆盖层，坐标按内容框「宽度」归一化（与 PDF 同套，永不漂移）。
+    let mdAnnotTool = null;            // null=只读(可选字加高光) / 'pen'(钢笔) / 'box'(盒子) / 'eraser'(通用橡皮)
+    let mdAnnotColor = '#e8482f';      // 钢笔颜色（红/黄/绿/墨，无蓝）
+    let mdReaderSvg = null;            // 当前浮层的批注 SVG 覆盖层
+    let mdSelBox = null;               // 只读模式点选中的 MD 盒子
+    const MD_ANNOT_VW = 1000;          // 批注虚拟坐标宽度（高=VW*内容框高/宽）
+    let mdHistory = [];                // MD 批注撤销栈（每项=本节点 {marks,strokes} 深克隆快照）
+    let mdRedo = [];                   // 重做栈；开浮层时清空，只在浮层内生效
+    // PDF 阅读 + 批注浮层状态
+    let pdfReaderOpen = false;
+    let pdfReaderNodeId = null;
+    let pdfReaderDoc = null;            // 浮层专用 PDF.js 文档（关闭即销毁）
+    let pdfReaderLoadingTask = null;     // PDFDocumentLoadingTask；关闭/重开时立即中止网络、解析与 worker
+    let pdfReaderRatio = 1.414;         // 首页 高/宽，用于占位高度
+    let pdfReaderObserver = null;       // 页面懒渲染监听
+    let pdfReaderToken = 0;             // 快速关闭/重开时作废旧文档、页面与文字层回调
+    let pdfReaderSetup = false;
+    let pdfAnnotTool = null;            // null=只读 / 'pen' / 'hl'(荧光笔) / 'box'(盒子) / 'eraser' / 'thl'(划词高光) / 'note'(便签)
+    let pdfAnnotColor = '#e8482f';
+    // 每页批注项数组：笔画(无 kind)= {tool:'pen'|'hl',color,w,pts}；划词高光 = {kind:'thl',color,rects:[[x,y,w,h]]}；
+    // 盒子 = {kind:'box',x,y,w,h,color}；便签 = {kind:'note',x,y,w,h,text,color}。坐标一律按"页宽"归一化。
+    let pdfAnnot = { version: 1, pages: {} };
+    let pdfAnnotSaveTimer = null;
+    let pdfAnnotDirty = false;
+    let pdfHistory = [];                // 批注撤销栈（深克隆 pages 快照）
+    let pdfRedo = [];
+    const pdfReaderPageState = new Map();        // 页号 -> { wrap, svg, textLayer, noteLayer, VH, ratio }
+    const PDF_ANNOT_VW = 1000;                   // 每页批注虚拟坐标宽度（高=VW*ratio）
+    const PDF_NOTE_COLORS = ['#ffe9a3', '#cde7c6', '#cfe3f7', '#f7cfd6', '#e7dcc3'];   // 便签纸色（带透明度）
+    // 批注调色板（9 色，追平 Zotero）。蓝是「批注内容色」非 UI 强调色，符合禁蓝铁律的例外。
+    const PDF_ANNOT_COLORS = [
+      ['#f4b740', '黄'], ['#e8482f', '红'], ['#3aa66e', '绿'], ['#4a8fe0', '蓝'], ['#9b6dd6', '紫'],
+      ['#e15fd0', '洋红'], ['#ef8a3c', '橙'], ['#9aa0a6', '灰'], ['#1a1a1a', '墨'],
+    ];
+    // 笔/荧光笔粗细：滑条值 1..5（默认 2 = 现有基准宽度）；存 localStorage。划词高光/下划线/便签不受其影响。
+    let pdfDrawSizeVal = (function () {
+      try { const v = parseFloat(localStorage.getItem('canvas:pdfAnnotSize')); return (v >= 1 && v <= 5) ? v : 2; } catch (e) { return 2; }
+    })();
+    let pdfSelAnnot = null;            // 只读模式下点选中的标注 { pageNo, item }（笔画/划词高光/下划线）
+    let pdfAnnotPop = null;            // 点选标注后的改色/删除浮层（setupPdfReader 时建一次）
+    let formulaDrag = null;            // 从 fx 面板拖符号到画布生成文字框
+    let suppressNextFormulaClick = false;
+    // 阶段 4：小地图
+    const mmNodeMap = new Map();        // node id → 小地图里的小矩形 div
+    let mmMap = null;                   // 最近一次映射参数 { minX, minY, s, ox, oy }（供反映射）
+    let mmViewbox = null;               // 最近一次取景框矩形 { left, top, w, h }（命中判断用）
+    let imeComposing = false;           // 中文输入法合成中（Y2：合成期间不刷高亮，结束补刷）
+    // 方向键按住状态 + raf（持续平移，松开停）
+    const arrowKeys = {
+      ArrowUp: false, ArrowDown: false, ArrowLeft: false, ArrowRight: false,
+    };
+    // WASD 是方向键平移的字母别名，映射到 arrowKeys 的同名槽位（大小写都认）
+    const WASD_TO_ARROW = { w: 'ArrowUp', s: 'ArrowDown', a: 'ArrowLeft', d: 'ArrowRight' };
+    let arrowPanRaf = null;
+    let arrowTickTs = 0;               // 方向键平移上一帧时间戳（dt 归一化用）
+    // 追踪"本会话最近新建的节点"——按钮 A 定位用
+    let lastCreatedNodeId = null;
+    // 普通模式刚插入的装饰对象：只在当前选中期间临时可移动，不写入 .canvas。
+    let transientMovableDecorId = null;
+
+    // 从 localStorage 读偏好值（容错：拿到非法值就用默认）
+    try {
+      const sp = parseInt(localStorage.getItem('canvas:panSpeed'), 10);
+      if (Number.isFinite(sp) && sp >= 1 && sp <= 20) panSpeed = sp;
+      const pi = parseFloat(localStorage.getItem('canvas:panInertia'));
+      if (Number.isFinite(pi) && pi >= 0 && pi <= 1) panInertia = pi;
+      const zs = parseFloat(localStorage.getItem('canvas:zoomSpeed'));
+      if (Number.isFinite(zs) && zs >= 0.5 && zs <= 3) zoomSpeed = zs;
+      const zp = parseFloat(localStorage.getItem('canvas:zoomPref'));
+      if (Number.isFinite(zp) && zp >= 0.25 && zp <= 4) zoomPref = zp;
+      const sl = localStorage.getItem('canvas:spaceLocateEnabled');
+      if (sl === '0') spaceLocateEnabled = false;
+      else if (sl === '1') spaceLocateEnabled = true;
+    } catch (err) { /* 隐私模式可能禁用 storage，忽略 */ }
+
+    function sketchShapeTypeFromTool(tool) {
+      if (tool === 'sketch-rounded-rect') return 'sketch-rounded-rect';
+      if (tool === 'sketch-diamond') return 'sketch-diamond';
+      if (tool === 'sketch-ellipse') return 'sketch-ellipse';
+      return null;
+    }
+
+    function isSketchShapeTool(tool) {
+      return !!sketchShapeTypeFromTool(tool);
+    }
+
+    function activateDecorMode() {
+      if (global.EditorShell && typeof global.EditorShell.setMode === 'function') {
+        global.EditorShell.setMode('decor');
+        return;
+      }
+      try { localStorage.setItem('canvas:mode', 'decor'); } catch (e) {}
+      document.body.dataset.mode = 'decor';
+      document.querySelectorAll('[data-role="mode-switch"] .editor-mode-btn').forEach((button) => {
+        button.classList.toggle('active', button.dataset.mode === 'decor');
+      });
+      if (global.CanvasModule && typeof global.CanvasModule.setMode === 'function') {
+        global.CanvasModule.setMode('decor');
+      } else {
+        renderEdgeHandles();
+        refreshEditPanel();
+        refreshDecorPanel();
+      }
+    }
+
+    function activateDecorModeForSketchTool() {
+      activateDecorMode();
+    }
+
+    function setDrawTool(tool) {
+      drawTool = tool || 'select';
+      closeToolConfig();
+      if (drawToolbar) {
+        drawToolbar.querySelectorAll('[data-canvas-tool]').forEach((button) => {
+          button.classList.toggle('active', button.dataset.canvasTool === drawTool);
+        });
+      }
+      viewport.classList.toggle('draw-tool-active', drawTool !== 'select');
+      updateEraserCursor();
+      scheduleTextDock();
+    }
+
+    function isConfigurableTool(tool) {
+      return tool === 'pen' || tool === 'text' || tool === 'arrow' || tool === 'arrow-cw' || tool === 'arrow-line';
+    }
+
+    let toolResetPress = null;
+    let suppressToolClickUntil = 0;
+    const TOOL_RESET_HOLD_MS = 720;
+
+    if (drawToolbar) {
+      drawToolbar.addEventListener('mousedown', (event) => event.stopPropagation());
+      drawToolbar.addEventListener('pointerdown', beginToolResetPress);
+      drawToolbar.addEventListener('pointermove', onToolResetPointerMove);
+      drawToolbar.addEventListener('pointercancel', cancelToolResetPress);
+      drawToolbar.addEventListener('pointerleave', cancelToolResetPress);
+      document.addEventListener('pointerup', finishToolResetPress, true);
+      drawToolbar.addEventListener('click', (event) => {
+        const historyButton = event.target.closest('[data-canvas-history]');
+        if (historyButton) {
+          event.preventDefault();
+          if (historyButton.dataset.canvasHistory === 'undo') undo();
+          else if (historyButton.dataset.canvasHistory === 'redo') redo();
+          return;
+        }
+        const button = event.target.closest('[data-canvas-tool]');
+        if (!button) return;
+        event.preventDefault();
+        if (performance.now() < suppressToolClickUntil) return;
+        const tool = button.dataset.canvasTool || 'select';
+        // 再次点击当前已激活的可配置工具 → 弹出/收起配置浮层
+        if (isConfigurableTool(tool) && drawTool === tool) {
+          toggleToolConfig(tool, button);
+          return;
+        }
+        // 再次点击已激活的橡皮 → 在「整笔擦 / 局部擦」间切换（默认整笔擦）
+        if (tool === 'eraser' && drawTool === 'eraser') {
+          eraserMode = (eraserMode === 'area') ? 'stroke' : 'area';
+          try { localStorage.setItem('canvas:eraserMode', eraserMode); } catch (e) {}
+          updateEraserCursor();
+          showCanvasToast(eraserMode === 'area' ? '橡皮 · 局部擦' : '橡皮 · 整笔擦');
+          return;
+        }
+        closeToolConfig();
+        setDrawTool(tool);
+      });
+    }
+
+    // ── 左侧工具配置浮层（再次点击图标弹出；只设“接下来新画的”默认样式）──────────
+    const PEN_PRESETS = {
+      pen: { width: 3, opacity: 1, hl: false },
+      marker: { width: 8, opacity: 0.95, hl: false },
+      highlighter: { width: 18, opacity: 0.4, hl: true },
+    };
+    function clampNum(v, lo, hi, dft) {
+      const n = parseFloat(v);
+      return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dft;
+    }
+    function toolDefaultsKey(tool) {
+      if (tool === 'pen') return 'canvas:penDefaults';
+      if (tool === 'text') return 'canvas:textDefaults';
+      if (tool === 'arrow' || tool === 'arrow-cw') return 'canvas:arrowDefaults';
+      return 'canvas:arrowLineDefaults';
+    }
+    function defaultToolDefaults(tool) {
+      if (tool === 'pen') {
+        return {
+          brushVersion: 2,
+          preset: 'pen',
+          color: '#1a1a1a',
+          width: PEN_PRESETS.pen.width,
+          opacity: PEN_PRESETS.pen.opacity,
+          taper: false,
+          pressure: false,
+          pressureCurve: 'normal',
+          calligraphy: false,
+          nibAngle: 45,
+          stabilizer: 20,
+          smoothing: 35,
+        };
+      }
+      if (tool === 'text') {
+        return { fontSize: 34, color: '#1a1a1a', opacity: 1, fontWeight: 400, textAlign: 'center' };
+      }
+      if (tool === 'arrow' || tool === 'arrow-cw') {
+        return { color: '#1a1a1a', width: 2.2, bend: 0.18 };
+      }
+      return { color: '#1a1a1a', width: 2.2, curve: 'straight' };
+    }
+    function readToolDefaults(tool) {
+      let raw = {};
+      try { raw = JSON.parse(localStorage.getItem(toolDefaultsKey(tool)) || '{}') || {}; }
+      catch (e) { raw = {}; }
+      if (tool === 'pen') {
+        const preset = (raw.preset === 'marker' || raw.preset === 'highlighter') ? raw.preset : 'pen';
+        const base = PEN_PRESETS[preset];
+        const migrated = raw.brushVersion === 2;
+        return {
+          brushVersion: 2,
+          preset: preset,
+          color: typeof raw.color === 'string' ? raw.color : '#1a1a1a',
+          width: clampNum(raw.width, 1, 40, base.width),
+          opacity: clampNum(raw.opacity, 0.1, 1, base.opacity),
+          hl: base.hl,
+          taper: !!raw.taper,
+          pressure: migrated ? raw.pressure === true : false,
+          pressureCurve: (raw.pressureCurve === 'soft' || raw.pressureCurve === 'hard') ? raw.pressureCurve : 'normal',
+          calligraphy: migrated ? raw.calligraphy === true : false,
+          nibAngle: clampNum(raw.nibAngle, 0, 179, 45),
+          stabilizer: clampNum(raw.stabilizer, 0, 100, 20),
+          smoothing: clampNum(raw.smoothing, 0, 100, 35),
+        };
+      }
+      if (tool === 'text') {
+        return {
+          fontSize: clampNum(raw.fontSize, 12, 96, 34),
+          color: typeof raw.color === 'string' ? raw.color : '#1a1a1a',
+          opacity: clampNum(raw.opacity, 0.1, 1, 1),
+          fontWeight: clampNum(raw.fontWeight, 400, 800, 400),
+          textAlign: raw.textAlign === 'left' || raw.textAlign === 'right' ? raw.textAlign : 'center',
+        };
+      }
+      if (tool === 'arrow' || tool === 'arrow-cw') {
+        return {
+          color: typeof raw.color === 'string' ? raw.color : '#1a1a1a',
+          width: clampNum(raw.width, 1, 10, 2.2),
+          bend: clampNum(raw.bend, 0.02, 0.45, 0.18),
+        };
+      }
+      return {
+        color: typeof raw.color === 'string' ? raw.color : '#1a1a1a',
+        width: clampNum(raw.width, 1, 10, 2.2),
+        curve: raw.curve === 'smooth' ? 'smooth' : 'straight',
+      };
+    }
+    function writeToolDefaults(tool, obj) {
+      if (tool === 'pen') obj = { ...obj, brushVersion: 2 };
+      try { localStorage.setItem(toolDefaultsKey(tool), JSON.stringify(obj)); } catch (e) {}
+    }
+    function resetToolDefaults(tool, btn) {
+      writeToolDefaults(tool, defaultToolDefaults(tool));
+      if (toolConfigFor === tool) rebuildToolConfig(tool);
+      else if ((tool === 'arrow' || tool === 'arrow-cw') && (toolConfigFor === 'arrow' || toolConfigFor === 'arrow-cw')) {
+        rebuildToolConfig(toolConfigFor);
+      }
+      playToolResetDone(btn);
+      const labels = { pen: '画笔', text: '文字', arrow: '逆时针箭头', 'arrow-cw': '顺时针箭头', 'arrow-line': '直线箭头' };
+      showCanvasToast((labels[tool] || '工具') + '已恢复默认设置');
+    }
+    function beginToolResetPress(event) {
+      if (event.button != null && event.button !== 0) return;
+      const btn = event.target.closest && event.target.closest('[data-canvas-tool]');
+      if (!btn || !drawToolbar.contains(btn)) return;
+      const tool = btn.dataset.canvasTool || '';
+      if (!isConfigurableTool(tool)) return;
+      cancelToolResetPress();
+      toolResetPress = {
+        tool: tool,
+        btn: btn,
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        triggered: false,
+        timer: null,
+      };
+      btn.style.setProperty('--tool-reset-hold-ms', TOOL_RESET_HOLD_MS + 'ms');
+      btn.classList.remove('reset-done');
+      btn.classList.add('reset-holding');
+      toolResetPress.timer = setTimeout(function () {
+        if (!toolResetPress || toolResetPress.btn !== btn) return;
+        toolResetPress.triggered = true;
+        suppressToolClickUntil = performance.now() + 480;
+        btn.classList.remove('reset-holding');
+        resetToolDefaults(tool, btn);
+      }, TOOL_RESET_HOLD_MS);
+    }
+    function onToolResetPointerMove(event) {
+      if (!toolResetPress || event.pointerId !== toolResetPress.pointerId) return;
+      if (Math.hypot(event.clientX - toolResetPress.startX, event.clientY - toolResetPress.startY) > 10) {
+        cancelToolResetPress();
+      }
+    }
+    function finishToolResetPress(event) {
+      if (!toolResetPress || event.pointerId !== toolResetPress.pointerId) return;
+      const triggered = toolResetPress.triggered;
+      cancelToolResetPress({ keepDone: triggered });
+      if (triggered) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    }
+    function cancelToolResetPress(opts) {
+      if (!toolResetPress) return;
+      if (toolResetPress.timer) clearTimeout(toolResetPress.timer);
+      if (toolResetPress.btn && !(opts && opts.keepDone)) {
+        toolResetPress.btn.classList.remove('reset-holding');
+      }
+      toolResetPress = null;
+    }
+    function playToolResetDone(btn) {
+      if (!btn) return;
+      btn.classList.remove('reset-holding', 'reset-done');
+      void btn.offsetWidth;
+      btn.classList.add('reset-done');
+      setTimeout(function () { btn.classList.remove('reset-done'); }, 920);
+      if (toolConfigPop) {
+        toolConfigPop.classList.remove('reset-flash');
+        void toolConfigPop.offsetWidth;
+        toolConfigPop.classList.add('reset-flash');
+        setTimeout(function () { if (toolConfigPop) toolConfigPop.classList.remove('reset-flash'); }, 720);
+      }
+    }
+
+    let toolConfigPop = null;
+    let toolConfigFor = null;
+    function closeToolConfig() {
+      if (toolConfigPop) { toolConfigPop.remove(); toolConfigPop = null; toolConfigFor = null; }
+    }
+    document.addEventListener('editor:toolbox-hidden', closeToolConfig);
+    function toggleToolConfig(tool, btn) {
+      if (toolConfigFor === tool) { closeToolConfig(); return; }
+      openToolConfig(tool, btn);
+    }
+    function escAttr(s) { return String(s).replace(/"/g, '&quot;'); }
+    function toolConfigMarkup(tool) {
+      const d = readToolDefaults(tool);
+      let title = '';
+      let body = '';
+      const colorRow = '<label class="tc-row"><span>颜色</span>'
+        + '<input type="color" data-tc="color" value="' + escAttr(d.color) + '"></label>';
+      if (tool === 'pen') {
+        title = '笔';
+        const seg = (val, label, cur) => '<button type="button" class="tc-seg' + (cur === val ? ' active' : '')
+          + '" data-tc-preset="' + val + '">' + label + '</button>';
+        const pseg = (val, label, cur) => '<button type="button" class="tc-seg' + (cur === val ? ' active' : '')
+          + '" data-tc-pcurve="' + val + '">' + label + '</button>';
+        const nseg = (val, label, cur) => '<button type="button" class="tc-seg' + (cur === val ? ' active' : '')
+          + '" data-tc-nib="' + val + '">' + label + '°</button>';
+        body = '<div class="tc-row"><span>笔型</span><div class="tc-segs">'
+          + seg('pen', '钢笔', d.preset) + seg('marker', '马克笔', d.preset) + seg('highlighter', '荧光笔', d.preset)
+          + '</div></div>'
+          + colorRow
+          + '<label class="tc-row"><span>粗细</span><input type="range" data-tc="width" min="1" max="40" step="1" value="' + d.width + '"></label>'
+          + '<label class="tc-row"><span>不透明度</span><input type="range" data-tc="opacity" min="0.1" max="1" step="0.05" value="' + d.opacity + '"></label>'
+          + '<label class="tc-row"><span>稳定器</span><input type="range" data-tc="stabilizer" min="0" max="100" step="1" value="' + d.stabilizer + '"></label>'
+          + '<label class="tc-row"><span>顺滑度</span><input type="range" data-tc="smoothing" min="0" max="100" step="1" value="' + d.smoothing + '"></label>'
+          + '<label class="tc-row tc-check"><span>压感</span><input type="checkbox" data-tc="pressure"' + (d.pressure ? ' checked' : '') + '></label>'
+          + '<div class="tc-row"><span>压感曲线</span><div class="tc-segs">'
+          + pseg('soft', '软', d.pressureCurve) + pseg('normal', '正常', d.pressureCurve) + pseg('hard', '硬', d.pressureCurve)
+          + '</div></div>'
+          + '<label class="tc-row tc-check"><span>笔锋渐细</span><input type="checkbox" data-tc="taper"' + (d.taper ? ' checked' : '') + '></label>'
+          + '<label class="tc-row tc-check"><span>书法笔锋</span><input type="checkbox" data-tc="calligraphy"' + (d.calligraphy ? ' checked' : '') + '></label>'
+          + '<div class="tc-row"><span>笔尖角度</span><div class="tc-segs">'
+          + nseg(0, '0', d.nibAngle) + nseg(45, '45', d.nibAngle) + nseg(90, '90', d.nibAngle) + nseg(135, '135', d.nibAngle)
+          + '</div></div>';
+      } else if (tool === 'text') {
+        title = '文字';
+        body = '<label class="tc-row"><span>字号</span><input type="range" data-tc="fontSize" min="12" max="96" step="1" value="' + d.fontSize + '"></label>'
+          + colorRow
+          + '<label class="tc-row"><span>透明度</span><input type="range" data-tc="opacity" min="0.1" max="1" step="0.05" value="' + d.opacity + '"></label>';
+      } else if (tool === 'arrow' || tool === 'arrow-cw') {
+        title = tool === 'arrow' ? '逆时针箭头' : '顺时针箭头';
+        body = colorRow
+          + '<label class="tc-row"><span>粗细</span><input type="range" data-tc="width" min="1" max="10" step="0.5" value="' + d.width + '"></label>'
+          + '<label class="tc-row"><span>弯曲幅度</span><input type="range" data-tc="bend" min="0.02" max="0.45" step="0.01" value="' + d.bend + '"></label>';
+      } else {
+        title = '直线箭头';
+        const seg = (val, label) => '<button type="button" class="tc-seg' + (d.curve === val ? ' active' : '')
+          + '" data-tc-curve="' + val + '">' + label + '</button>';
+        body = '<div class="tc-row"><span>转折</span><div class="tc-segs">'
+          + seg('straight', '直线转折') + seg('smooth', '曲线转折') + '</div></div>'
+          + colorRow
+          + '<label class="tc-row"><span>粗细</span><input type="range" data-tc="width" min="1" max="10" step="0.5" value="' + d.width + '"></label>';
+      }
+      const preview = (tool === 'text')
+        ? '<div class="tc-preview tc-text-preview" aria-hidden="true"><span data-tc-sample>示例文字</span></div>'
+        : '<svg class="tc-preview" viewBox="0 0 180 40" aria-hidden="true"><path></path></svg>';
+      return '<div class="tc-title">' + title + '</div>' + body + preview;
+    }
+    function updateToolConfigPreview() {
+      if (!toolConfigPop) return;
+      const tool = toolConfigFor;
+      const d = readToolDefaults(tool);
+      if (tool === 'text') {
+        const sample = toolConfigPop.querySelector('[data-tc-sample]');
+        if (sample) {
+          sample.style.color = d.color;
+          sample.style.opacity = d.opacity;
+          sample.style.fontSize = Math.max(12, Math.min(40, d.fontSize)) + 'px';
+        }
+        return;
+      }
+      const svg = toolConfigPop.querySelector('.tc-preview');
+      // 只取曲线本体（svg 的直接子 path）；箭头 marker 的 path 嵌在 <defs> 里、
+      // 且被插到最前面，用裸 querySelector('path') 会错选到它，导致调样式不生效。
+      const path = svg && svg.querySelector(':scope > path');
+      if (!path) return;
+      path.style.fill = 'none';
+      path.style.opacity = 1;
+      path.style.mixBlendMode = '';
+      path.removeAttribute('marker-end');
+      if (tool === 'pen') {
+        path.setAttribute('d', 'M 14 28 C 50 6 70 34 100 18 S 150 8 166 22');
+        path.style.fill = 'none';
+        path.style.stroke = d.color;
+        path.style.strokeWidth = Math.min(16, d.width);
+        path.style.opacity = d.opacity;
+        if (d.hl) path.style.mixBlendMode = 'multiply';
+      } else if (tool === 'arrow' || tool === 'arrow-cw') {
+        const sign = tool === 'arrow' ? 1 : -1;
+        const cy = 20 - sign * (d.bend * 70);
+        path.setAttribute('d', previewArrowPath(
+          'M 16 20 Q 90 ' + cy + ' 162 20',
+          162, 20,
+          162 - 90, 20 - cy,
+          d.width
+        ));
+        path.style.stroke = d.color; path.style.strokeWidth = d.width;
+      } else {
+        const dd = d.curve === 'smooth'
+          ? previewArrowPath(
+              'M 16 27 C 56 27 72 10 102 12 C 126 13 141 24 160 17',
+              160, 17,
+              160 - 141, 17 - 24,
+              d.width,
+              1.16
+            )
+          : previewArrowPath(
+              'M 16 28 L 70 12 L 110 26 L 162 14',
+              162, 14,
+              162 - 110, 14 - 26,
+              d.width
+            );
+        path.setAttribute('d', dd);
+        path.style.stroke = d.color; path.style.strokeWidth = d.width;
+      }
+      path.style.strokeLinecap = 'round';
+      path.style.strokeLinejoin = 'round';
+    }
+    function previewArrowPath(shaftD, tipX, tipY, tangentX, tangentY, width, headScale) {
+      const length = Math.hypot(tangentX, tangentY) || 1;
+      const ux = tangentX / length;
+      const uy = tangentY / length;
+      const nx = -uy;
+      const ny = ux;
+      const scale = Number(headScale) || 1;
+      const headLength = (10 + Math.min(4, Math.max(0, Number(width) || 0) * 0.55)) * scale;
+      const headSpread = headLength * 0.56;
+      const baseX = tipX - ux * headLength;
+      const baseY = tipY - uy * headLength;
+      const wingAX = baseX + nx * headSpread;
+      const wingAY = baseY + ny * headSpread;
+      const wingBX = baseX - nx * headSpread;
+      const wingBY = baseY - ny * headSpread;
+      const point = (value) => Math.round(value * 100) / 100;
+      return shaftD
+        + ' M ' + point(wingAX) + ' ' + point(wingAY)
+        + ' L ' + point(tipX) + ' ' + point(tipY)
+        + ' L ' + point(wingBX) + ' ' + point(wingBY);
+    }
+    function wireToolConfig(pop, tool) {
+      pop.querySelectorAll('[data-tc]').forEach((input) => {
+        const field = input.dataset.tc;
+        const handler = () => {
+          const cur = readToolDefaults(tool);
+          if (field === 'taper' || field === 'pressure' || field === 'calligraphy') cur[field] = input.checked;
+          else if (field === 'color') cur.color = input.value;
+          else cur[field] = parseFloat(input.value);
+          // pen 存 preset 决定 hl，不存 hl 本身
+          writeToolDefaults(tool, cur);
+          updateToolConfigPreview();
+        };
+        input.addEventListener('input', handler);
+        input.addEventListener('change', handler);
+      });
+      pop.querySelectorAll('[data-tc-preset]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const preset = btn.dataset.tcPreset;
+          const base = PEN_PRESETS[preset] || PEN_PRESETS.pen;
+          const cur = readToolDefaults('pen');
+          writeToolDefaults('pen', {
+            preset: preset,
+            color: cur.color,
+            width: base.width,
+            opacity: base.opacity,
+            taper: cur.taper,
+            pressure: cur.pressure,
+            pressureCurve: cur.pressureCurve,
+            calligraphy: cur.calligraphy,
+            nibAngle: cur.nibAngle,
+            stabilizer: cur.stabilizer,
+            smoothing: cur.smoothing,
+          });
+          rebuildToolConfig(tool);
+        });
+      });
+      pop.querySelectorAll('[data-tc-curve]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const cur = readToolDefaults('arrow-line');
+          cur.curve = btn.dataset.tcCurve === 'smooth' ? 'smooth' : 'straight';
+          writeToolDefaults('arrow-line', cur);
+          rebuildToolConfig(tool);
+        });
+      });
+      pop.querySelectorAll('[data-tc-pcurve]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const cur = readToolDefaults('pen');
+          const v = btn.dataset.tcPcurve;
+          cur.pressureCurve = (v === 'soft' || v === 'hard') ? v : 'normal';
+          writeToolDefaults('pen', cur);
+          rebuildToolConfig(tool);
+        });
+      });
+      pop.querySelectorAll('[data-tc-nib]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const cur = readToolDefaults('pen');
+          cur.nibAngle = clampNum(btn.dataset.tcNib, 0, 179, 45);
+          writeToolDefaults('pen', cur);
+          rebuildToolConfig(tool);
+        });
+      });
+    }
+    function rebuildToolConfig(tool) {
+      if (!toolConfigPop) return;
+      toolConfigPop.innerHTML = toolConfigMarkup(tool);
+      wireToolConfig(toolConfigPop, tool);
+      updateToolConfigPreview();
+    }
+    function positionToolConfig(pop, btn) {
+      if (!btn) return;
+      const host = pop.offsetParent || viewport;
+      const hostRect = host.getBoundingClientRect();
+      const bRect = btn.getBoundingClientRect();
+      let left = bRect.right - hostRect.left + 10;
+      let top = bRect.top - hostRect.top;
+      const maxTop = host.clientHeight - pop.offsetHeight - 12;
+      if (top > maxTop) top = Math.max(12, maxTop);
+      pop.style.left = left + 'px';
+      pop.style.top = top + 'px';
+    }
+    function openToolConfig(tool, btn) {
+      closeToolConfig();
+      const pop = document.createElement('div');
+      pop.className = 'tool-config-pop';
+      pop.addEventListener('mousedown', (e) => e.stopPropagation());
+      pop.innerHTML = toolConfigMarkup(tool);
+      (viewport || document.body).appendChild(pop);
+      toolConfigPop = pop;
+      toolConfigFor = tool;
+      wireToolConfig(pop, tool);
+      updateToolConfigPreview();
+      positionToolConfig(pop, btn);
+    }
+
+    // 装饰对象的同层顺序是持久数据；历史首帧也必须包含归一化后的顺序。
+    normalizeDecorationZOrders();
+
+    // 历史栈：栈顶 = 当前状态
+    const history = [cloneState(data.nodes, data.edges, data.ink)];
+    const redoStack = [];
+
+    function pushHistory() {
+      history.push(cloneState(data.nodes, data.edges, data.ink));
+      if (history.length > HISTORY_LIMIT) history.shift();
+      redoStack.length = 0;
+      refreshHistoryButtons();
+    }
+
+    function refreshHistoryButtons() {
+      if (!drawToolbar) return;
+      const undoBtn = drawToolbar.querySelector('[data-canvas-history="undo"]');
+      const redoBtn = drawToolbar.querySelector('[data-canvas-history="redo"]');
+      if (undoBtn) undoBtn.disabled = history.length <= 1;
+      if (redoBtn) redoBtn.disabled = redoStack.length === 0;
+    }
+    refreshHistoryButtons();
+
+    function notify() {
+      updateEmptyHint();
+      refreshGroupContainers();
+      refreshMindmapFolding();
+      refreshAllIndexNodes();
+      // 阶段 4：搜索开着时，增删改后重算命中（不强制居中）
+      if (searchOpen) runSearch(searchInput ? searchInput.value : '', false);
+      redrawMinimap();   // 阶段 4：节点增删改后刷新小地图
+      onChange();
+    }
+
+    function updateEmptyHint() {
+      const ink = ensureInkData();
+      if (emptyHint) emptyHint.hidden = data.nodes.length > 0
+        || ink.strokes.length > 0
+        || ink.arrows.length > 0;
+    }
+
+    // ── 工具 ──────────────────────────────────
+    // 把节点 .node-text 切到"显示态"：渲染 markdown，记下 source 避免重复渲染
+    function hasMathSource(source) {
+      return /(?:\$|\\\(|\\\[|\\begin\{|\\ref\{|\\eqref\{)/.test(source || '');
+    }
+    function nextMathToken(textEl) {
+      const token = (parseInt(textEl.dataset.mathToken || '0', 10) || 0) + 1;
+      textEl.dataset.mathToken = String(token);
+      return token;
+    }
+    function clearMath(textEl) {
+      if (!textEl) return;
+      nextMathToken(textEl);
+      const mj = global.MathJax;
+      if (mj && typeof mj.typesetClear === 'function') {
+        try { mj.typesetClear([textEl]); } catch (e) {}
+      }
+      delete textEl.dataset.hasMath;
+    }
+    function scheduleElementMath(textEl, source) {
+      if (hasMathSource(source)) {
+        textEl.dataset.hasMath = '1';
+        ensureMathJaxForCanvas();
+        typesetMath(textEl);
+      } else {
+        delete textEl.dataset.hasMath;
+      }
+    }
+
+    function renderNodeText(textEl, raw, marks) {
+      const source = raw || '';
+      const renderSource = RichText ? RichText.serialize(source, marks || []) : source;
+      if (textEl.dataset.source === renderSource) return;
+      if (textEl.dataset.hasMath === '1') clearMath(textEl);
+      textEl.dataset.source = renderSource;
+      delete textEl.dataset.codeLanguage;
+      const md = global.MarkdownMini;
+      textEl.innerHTML = md ? md.render(renderSource) : (source ? source.replace(/[&<>"]/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+      }) : '');
+      // 仅含公式时触发 MathJax，避免大画布里普通文本也排队重排。
+      scheduleElementMath(textEl, source);
+      // Mermaid 图表（```mermaid 块）：交由 Mermaid 渲染为 SVG
+      renderMermaidDiagrams(textEl);
+    }
+
+    // 阅读浮层标题只需要行内 Markdown：复用完整渲染器，再剥掉单段落外壳。
+    function renderInlineMarkdown(textEl, raw, marks) {
+      const source = raw || '';
+      const renderSource = RichText ? RichText.serialize(source, marks || []) : source;
+      if (textEl.dataset.inlineSource === renderSource) return;
+      if (textEl.dataset.hasMath === '1') clearMath(textEl);
+      textEl.dataset.inlineSource = renderSource;
+      const md = global.MarkdownMini;
+      if (!md) {
+        textEl.textContent = source;
+        scheduleElementMath(textEl, source);
+        return;
+      }
+      const wrap = document.createElement('div');
+      wrap.innerHTML = md.render(renderSource);
+      if (wrap.children.length === 1 && wrap.firstElementChild && wrap.firstElementChild.tagName === 'P') {
+        textEl.innerHTML = wrap.firstElementChild.innerHTML;
+      } else {
+        textEl.innerHTML = wrap.innerHTML;
+      }
+      scheduleElementMath(textEl, source);
+      // Mermaid 图表（```mermaid 块）：交由 Mermaid 渲染为 SVG
+      renderMermaidDiagrams(textEl);
+    }
+
+    // 正文节点的主体内容渲染入口：代码=纯代码着色（不解析 Markdown）；
+    // 便签=正文 Markdown/公式（与卡片正文同一套渲染）；其余=标题 Markdown。
+    function renderBodyNodeContent(textEl, node) {
+      if (isCodeNode(node)) renderCodeNodeText(textEl, node.body || '', node.language);
+      else if (isStickyNode(node)) renderNodeText(textEl, node.body || '', richMarks(node, 'body'));
+      else renderNodeText(textEl, node.text || '', richMarks(node, 'text'));
+    }
+
+    const CODE_LANGUAGES = {
+      c: 'C',
+      python: 'Python',
+      matlab: 'MATLAB',
+    };
+    function normalizeCodeLanguage(value) {
+      return Object.prototype.hasOwnProperty.call(CODE_LANGUAGES, value) ? value : 'c';
+    }
+    function codeLanguageLabel(value) {
+      return CODE_LANGUAGES[normalizeCodeLanguage(value)];
+    }
+    function readDefaultCodeLanguage() {
+      try { return normalizeCodeLanguage(localStorage.getItem('canvas:codeDefaultLanguage')); }
+      catch (e) { return 'c'; }
+    }
+    // 代码节点绕开 MarkdownMini.render 与 MathJax：整块内容始终等价于一个围栏代码块。
+    function renderCodeNodeText(textEl, raw, language) {
+      const source = raw || '';
+      const lang = normalizeCodeLanguage(language);
+      if (textEl.dataset.source === source && textEl.dataset.codeLanguage === lang) return;
+      if (textEl.dataset.hasMath === '1') clearMath(textEl);
+      textEl.dataset.source = source;
+      textEl.dataset.codeLanguage = lang;
+      const md = global.MarkdownMini;
+      const escaped = md && typeof md.escapeHtml === 'function'
+        ? md.escapeHtml(source)
+        : source.replace(/[&<>"]/g, function (c) {
+          return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+        });
+      const inner = md && typeof md.highlightCode === 'function' ? md.highlightCode(source, lang) : escaped;
+      textEl.innerHTML = '<pre class="md-code code-node-pre" data-lang="' + lang + '"><code>' + inner + '</code></pre>';
+    }
+
+    // 让 MathJax 处理 textEl 里的 $...$；MathJax 没加载好就静默跳过
+    // 公式工作流②：用一条自有串行队列保证「清旧 typeset → 重置编号/标签 → 本次 typeset」作为一个不可分割单元、
+    // 按调用顺序依次执行。效果：每个节点的 equation/align 编号各自从 (1) 起、\label 只在本节点内有效
+    // （同一篇 label 在卡片正文与 F 阅读两处各自渲染也不会"multiply defined"）。
+    // 必须整体串行——若 reset 与 typeset 交错（如直接改 startup.promise），多节点会互相打乱计数 / 撞标签。
+    let mathTypesetQueue = Promise.resolve();
+    function typesetMath(textEl) {
+      if (!textEl || textEl.dataset.hasMath !== '1') return Promise.resolve();
+      const token = nextMathToken(textEl);
+      if (textEl && textEl.closest && (textEl.closest('.node[data-kind="code"]') || textEl.closest('.code-reader-mode'))) {
+        return Promise.resolve();
+      }
+      const mj = global.MathJax;
+      if (!mj || typeof mj.typesetPromise !== 'function') return Promise.resolve();
+      mathTypesetQueue = mathTypesetQueue.then(function () {
+        if (!textEl.isConnected || textEl.dataset.hasMath !== '1' || textEl.dataset.mathToken !== String(token)) return Promise.resolve();
+        try {
+          if (typeof mj.typesetClear === 'function') mj.typesetClear([textEl]);
+          if (typeof mj.texReset === 'function') mj.texReset();
+        } catch (e) {}
+        return mj.typesetPromise([textEl]);
+      }).catch(function (err) {
+        console.warn('[画布] MathJax 排版失败', err);
+      });
+      return mathTypesetQueue;
+    }
+    // MathJax 是空闲时异步加载的；MD 批注的字符偏移以"排版后 DOM"为基准，
+    // 必须等公式 typeset 完再量/落标，否则 $...$ 文本被换成 mjx-container 会让偏移漂移。
+    function whenMathReady(cb, textEl) {
+      // 无公式的 Markdown 不应等待（更不应为批注初始化强制拉起 MathJax）。
+      if (!textEl || textEl.dataset.hasMath !== '1') { cb(); return; }
+      ensureMathJaxForCanvas();
+      if (global.MathJax && typeof global.MathJax.typesetPromise === 'function') { cb(); return; }
+      let tries = 0;
+      const t = setInterval(function () {
+        if ((global.MathJax && typeof global.MathJax.typesetPromise === 'function') || tries++ > 40) {
+          clearInterval(t); cb();
+        }
+      }, 150);
+    }
+
+    // 公式引擎较大：先交付可交互画布，再在浏览器空闲时从本地包加载。
+    function scheduleMathJaxLoad() {
+      if (global.MathJax && typeof global.MathJax.typesetPromise === 'function') return;
+      if (document.querySelector('script[data-canvas-mathjax]')) return;
+      function load() {
+        if (document.querySelector('script[data-canvas-mathjax]')) return;
+        const script = document.createElement('script');
+        script.src = 'vendor/mathjax/tex-mml-chtml.js';
+        script.async = true;
+        script.dataset.canvasMathjax = '1';
+        script.addEventListener('error', function () {
+          console.warn('[画布] MathJax 加载失败');
+        });
+        document.head.appendChild(script);
+      }
+      if (typeof global.requestIdleCallback === 'function') {
+        global.requestIdleCallback(load, { timeout: 1200 });
+      } else {
+        setTimeout(load, 240);
+      }
+    }
+
+    // 所有 Mermaid 生命周期、排队、主题与失败展示统一由 mermaid-renderer.js 管理。
+    // 这里保留一个薄入口，是因为 MD 阅读浮层要等待图表完成后再捕获批注净快照。
+    function renderMermaidDiagrams(el) {
+      var renderer = global.MermaidRenderer;
+      return renderer && typeof renderer.renderAll === 'function'
+        ? renderer.renderAll(el)
+        : Promise.resolve();
+    }
+
+    // MathJax 是空闲时异步加载的；script ready 之前 global.MathJax 已存在
+    // （我们的 inline config 设了），但 typesetPromise 是本地脚本跑完才有。
+    // 等 startup.promise 出现并完成 → 一次性 typeset 所有现有节点。
+    function whenMathJaxReady(cb) {
+      if (global.MathJax && typeof global.MathJax.typesetPromise === 'function') { cb(); return; }
+      let tries = 0;
+      const max = 200; // 200 * 100ms = 20s 兜底
+      (function check() {
+        const mj = global.MathJax;
+        if (mj && mj.startup && mj.startup.promise) {
+          mj.startup.promise.then(cb).catch(function () {});
+        } else if (++tries < max) {
+          setTimeout(check, 100);
+        }
+      })();
+    }
+
+    // 只有首个真实公式源出现时才加载大体积引擎；ready 后统一补排当前画布，
+    // 后续新建/粘贴公式则由 scheduleElementMath 直接排版。
+    let mathJaxReadyWatcherStarted = false;
+    function ensureMathJaxForCanvas() {
+      scheduleMathJaxLoad();
+      if (mathJaxReadyWatcherStarted) return;
+      mathJaxReadyWatcherStarted = true;
+      whenMathJaxReady(function () {
+        nodeMap.forEach(function (el) {
+          el.querySelectorAll('.node-text[data-has-math="1"]').forEach(typesetMath);
+        });
+        // 公式排版后节点尺寸会变 → 顺手刷连线；只有未调整过视野的首次打开才重做适配。
+        data.edges.forEach(updateEdgePath);
+        if (!viewportHasUserPosition) fitToContent(true);
+      });
+    }
+    // AI 回复等同页消费者可复用同一份加载任务，并在引擎 ready 后补排自己的容器。
+    global.CanvasModule.ensureMathJax = function (callback) {
+      ensureMathJaxForCanvas();
+      if (typeof callback === 'function') whenMathJaxReady(callback);
+    };
+
+    function findNode(id) {
+      return nodeById.get(id) || null;
+    }
+    function isIndexNode(node) {
+      return !!node && (node.kind === 'index' || node.kind === 'text');
+    }
+    function isPreviewNode(node) {
+      return !!node && node.kind === 'preview';
+    }
+    function isCardNode(node) {
+      return !!node && node.kind === 'card';
+    }
+    function isCodeNode(node) {
+      return !!node && node.kind === 'code';
+    }
+    function isStickyNode(node) {
+      return !!node && node.kind === 'sticky';
+    }
+    function isTextBoxNode(node) {
+      return !!node && node.kind === 'textBox';
+    }
+    // 内联编辑时直接编 node.body（而非 text 标题）的节点：代码 + 便签。
+    // 二者都「无标题、整块即正文」，区别只在渲染（代码=纯着色，便签=完整 Markdown/公式）。
+    function editsBodyInline(node) {
+      return isCodeNode(node) || isStickyNode(node);
+    }
+    function isBodyNode(node) {
+      return isPreviewNode(node) || isCardNode(node) || isCodeNode(node) || isStickyNode(node);
+    }
+    function isBodyHeightResizable(node) {
+      return isPreviewNode(node) || isCardNode(node) || isCodeNode(node) || isStickyNode(node);
+    }
+    function isReadableNode(node) {
+      return isIndexNode(node) || isBodyNode(node);
+    }
+    function isShapeNode(node) {
+      return !!node && node.kind === 'shape';
+    }
+    function isImageNode(node) {
+      return !!node && node.kind === 'image';
+    }
+    function isPdfNode(node) {
+      return !!node && node.kind === 'pdf';
+    }
+    function isMdNode(node) {
+      return !!node && node.kind === 'md';
+    }
+    // 附件节点（PDF / Markdown 文档）：和图片同属装饰对象，可拖动 / 缩放 / 删除，
+    // 不参与连线与 Markdown 导出；正文区可滚动，拖动仅限标题栏把手。
+    function isAttachmentNode(node) {
+      return isPdfNode(node) || isMdNode(node);
+    }
+
+    function isGroupBoxNode(node) {
+      return isShapeNode(node) && node.shapeType === 'group-box';
+    }
+
+    function isColorBlockNode(node) {
+      return isShapeNode(node) && node.shapeType === 'color-block';
+    }
+    function isDecorationNode(node) {
+      return isShapeNode(node) || isImageNode(node) || isAttachmentNode(node) || isTextBoxNode(node);
+    }
+    // 可连线节点：正文节点 + 附件（PDF/MD）。图案/图片仍不参与连线。
+    // 附件虽是装饰对象，但允许连线、进图谱（仍不进 Markdown 导出，导出在后端按 kind 过滤）。
+    function isLinkable(node) {
+      return !!node && !isShapeNode(node) && !isImageNode(node) && !isTextBoxNode(node);
+    }
+    function findEdge(id) {
+      for (let i = 0; i < data.edges.length; i++) {
+        if (data.edges[i].id === id) return data.edges[i];
+      }
+      return null;
+    }
+
+    function ensureInkData() {
+      data.ink = cloneInk(data.ink);
+      return data.ink;
+    }
+
+    function strokePath(points) {
+      const pts = (points || []).map(clonePoint).filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
+      if (!pts.length) return '';
+      if (pts.length === 1) return 'M ' + pts[0].x + ' ' + pts[0].y + ' l 0.01 0.01';
+      let d = 'M ' + pts[0].x + ' ' + pts[0].y;
+      for (let i = 1; i < pts.length - 1; i++) {
+        const midX = (pts[i].x + pts[i + 1].x) / 2;
+        const midY = (pts[i].y + pts[i + 1].y) / 2;
+        d += ' Q ' + pts[i].x + ' ' + pts[i].y + ' ' + midX + ' ' + midY;
+      }
+      const last = pts[pts.length - 1];
+      return d + ' L ' + last.x + ' ' + last.y;
+    }
+
+    function lerpPoint(a, b, t) {
+      const out = {
+        x: a.x + (b.x - a.x) * t,
+        y: a.y + (b.y - a.y) * t,
+      };
+      if (a.p != null || b.p != null) {
+        const ap = a.p == null ? 0.5 : a.p;
+        const bp = b.p == null ? 0.5 : b.p;
+        out.p = ap + (bp - ap) * t;
+      }
+      // 书法笔锋：倾斜量也要随平滑插值，否则平滑后中间点丢 tilt
+      if (a.tilt != null || b.tilt != null) {
+        const at = a.tilt == null ? 0 : a.tilt;
+        const bt = b.tilt == null ? 0 : b.tilt;
+        out.tilt = at + (bt - at) * t;
+      }
+      return out;
+    }
+
+    function chaikinInkPoints(points, smoothing) {
+      const pts = (points || []).map(clonePoint).filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
+      if (pts.length < 3 || smoothing <= 0) return pts;
+      const iterations = smoothing >= 78 && pts.length > 10 ? 2 : 1;
+      const cut = 0.12 + (Math.min(100, Math.max(0, smoothing)) / 100) * 0.14;
+      let out = pts;
+      for (let n = 0; n < iterations; n++) {
+        const next = [out[0]];
+        for (let i = 0; i < out.length - 1; i++) {
+          const a = out[i], b = out[i + 1];
+          next.push(lerpPoint(a, b, cut));
+          next.push(lerpPoint(a, b, 1 - cut));
+        }
+        next.push(out[out.length - 1]);
+        out = next;
+      }
+      return out;
+    }
+
+    function strokeRenderPoints(stroke) {
+      const s = stroke || {};
+      const smoothing = clampNum(s.smoothing, 0, 100, 0);
+      return chaikinInkPoints(s.points || [], smoothing);
+    }
+
+    function outlinePathD(left, right) {
+      if (!left.length || !right.length) return '';
+      let d = 'M ' + left[0].x + ' ' + left[0].y;
+      for (let i = 1; i < left.length; i++) d += ' L ' + left[i].x + ' ' + left[i].y;
+      for (let i = right.length - 1; i >= 0; i--) d += ' L ' + right[i].x + ' ' + right[i].y;
+      return d + ' Z';
+    }
+
+    // 折线箭头的点序：起点 + 各拐点 + 终点
+    function polyArrowPoints(arrow) {
+      const wps = Array.isArray(arrow && arrow.waypoints) ? arrow.waypoints : [];
+      return [clonePoint(arrow && arrow.start)]
+        .concat(wps.map(clonePoint))
+        .concat([clonePoint(arrow && arrow.end)]);
+    }
+    // 确定性伪随机（-1..1）：同一箭头 + 段号永远得到同一抖动，重绘不抖动
+    function arrowSeedUnit(seed, i) {
+      const x = Math.sin(seed * 12.9898 + i * 78.233) * 43758.5453;
+      return (x - Math.floor(x)) * 2 - 1;
+    }
+    // 手绘风格：直线/折线每段中点沿法线轻微偏移，曲线穿过所有锚点（端点、拐点精确），单条线不做双层描边
+    function roughPolyArrowD(pts, seed) {
+      if (!pts.length) return '';
+      if (pts.length === 1) return 'M ' + pts[0].x + ' ' + pts[0].y + ' l 0.01 0.01';
+      let d = 'M ' + pts[0].x + ' ' + pts[0].y;
+      for (let i = 0; i < pts.length - 1; i++) {
+        const a = pts[i], b = pts[i + 1];
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const len = Math.max(1, Math.hypot(dx, dy));
+        const amp = Math.min(3.2, len * 0.05);
+        const off = arrowSeedUnit(seed, i) * amp;
+        const cx = (a.x + b.x) / 2 + (-dy / len) * off;
+        const cy = (a.y + b.y) / 2 + (dx / len) * off;
+        d += ' Q ' + cx + ' ' + cy + ' ' + b.x + ' ' + b.y;
+      }
+      return d;
+    }
+    function arrowPath(arrow) {
+      if (isPolyArrow(arrow)) {
+        const pts = polyArrowPoints(arrow);
+        // 曲线转折：Catmull-Rom 平滑穿过所有点（复用连线 smoothD）；直线转折：手绘直段
+        return arrow.curve === 'smooth' ? smoothD(pts) : roughPolyArrowD(pts, arrow.seed || 1);
+      }
+      const s = clonePoint(arrow && arrow.start);
+      const e = clonePoint(arrow && arrow.end);
+      const c = arrow && arrow.control ? clonePoint(arrow.control) : {
+        x: (s.x + e.x) / 2,
+        y: (s.y + e.y) / 2,
+      };
+      return 'M ' + s.x + ' ' + s.y + ' Q ' + c.x + ' ' + c.y + ' ' + e.x + ' ' + e.y;
+    }
+
+    function ensureInkDefs() {
+      if (!inkLayer) return null;
+      let defs = inkLayer.querySelector('defs');
+      if (!defs) {
+        defs = document.createElementNS(SVG_NS, 'defs');
+        inkLayer.appendChild(defs);
+      }
+      if (!defs.querySelector('#ink-arrow-marker')) {
+        const marker = document.createElementNS(SVG_NS, 'marker');
+        marker.setAttribute('id', 'ink-arrow-marker');
+        marker.setAttribute('viewBox', '0 0 10 10');
+        marker.setAttribute('refX', '8.5');
+        marker.setAttribute('refY', '5');
+        marker.setAttribute('markerWidth', '7');
+        marker.setAttribute('markerHeight', '7');
+        marker.setAttribute('orient', 'auto');
+        marker.setAttribute('markerUnits', 'strokeWidth');
+        const path = document.createElementNS(SVG_NS, 'path');
+        path.setAttribute('d', 'M 0 0 L 10 5 L 0 10');
+        path.setAttribute('fill', 'none');
+        path.setAttribute('stroke', 'context-stroke');
+        path.setAttribute('stroke-width', '1.8');
+        path.setAttribute('stroke-linecap', 'round');
+        path.setAttribute('stroke-linejoin', 'round');
+        marker.appendChild(path);
+        defs.appendChild(marker);
+      }
+      return defs;
+    }
+
+    // 笔锋渐细：把折线做成两端收尖的填充轮廓（无依赖，沿法线按宽度剖面偏移后回描）
+    function taperedStrokeD(points, maxW) {
+      const pts = (points || []).map(clonePoint).filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
+      if (pts.length < 2) {
+        const c = pts[0] || { x: 0, y: 0 };
+        const r = Math.max(0.6, maxW / 2);
+        return 'M ' + (c.x - r) + ' ' + c.y + ' a ' + r + ' ' + r + ' 0 1 0 ' + (2 * r) + ' 0'
+          + ' a ' + r + ' ' + r + ' 0 1 0 ' + (-2 * r) + ' 0 Z';
+      }
+      const n = pts.length;
+      const half = (i) => {
+        const t = n > 1 ? i / (n - 1) : 0.5;
+        const ramp = Math.min(t, 1 - t, 0.2) / 0.2;     // 两端 20% 内渐变，中段满宽
+        return (maxW / 2) * (0.12 + 0.88 * ramp);
+      };
+      const left = [], right = [];
+      for (let i = 0; i < n; i++) {
+        const a = pts[Math.max(0, i - 1)], b = pts[Math.min(n - 1, i + 1)];
+        let dx = b.x - a.x, dy = b.y - a.y;
+        const len = Math.hypot(dx, dy) || 1;
+        dx /= len; dy /= len;
+        const nx = -dy, ny = dx, w = half(i);
+        left.push({ x: pts[i].x + nx * w, y: pts[i].y + ny * w });
+        right.push({ x: pts[i].x - nx * w, y: pts[i].y - ny * w });
+      }
+      return outlinePathD(left, right);
+    }
+
+    // 压感曲线：把 0..1 的压力按 gamma 重映射。软(<1)=轻轻一碰就变粗，硬(>1)=要用力才变粗，正常=线性。
+    function pressureCurveGamma(curve) {
+      if (curve === 'soft') return 0.55;
+      if (curve === 'hard') return 1.8;
+      return 1;
+    }
+    // 手写笔压感：每点的半宽由该点压力 p（0..1）决定，做成填充轮廓（同 taperedStrokeD 的法线偏移法）。
+    // curve 可选（'soft'|'normal'|'hard'）；不传 = 线性，附件/正文批注调用沿用原行为不变。
+    function pressureStrokeD(points, maxW, curve) {
+      const pts = (points || []).map(clonePoint).filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
+      const gamma = pressureCurveGamma(curve);
+      const shape = (v) => gamma === 1 ? v : Math.pow(Math.max(0, Math.min(1, v)), gamma);
+      const prAt = (i) => (pts[i] && pts[i].p != null) ? Math.max(0, Math.min(1, pts[i].p)) : 0.5;
+      if (pts.length < 2) {
+        const c = pts[0] || { x: 0, y: 0 };
+        const r = Math.max(0.6, (maxW / 2) * (0.22 + 0.78 * shape(prAt(0))));
+        return 'M ' + (c.x - r) + ' ' + c.y + ' a ' + r + ' ' + r + ' 0 1 0 ' + (2 * r) + ' 0'
+          + ' a ' + r + ' ' + r + ' 0 1 0 ' + (-2 * r) + ' 0 Z';
+      }
+      const n = pts.length;
+      const half = (i) => {
+        // 三点平滑压力，避免抖动；端点 2 点内轻微收尖，笔触更自然
+        let pr = prAt(i);
+        pr = (prAt(Math.max(0, i - 1)) + 2 * pr + prAt(Math.min(n - 1, i + 1))) / 4;
+        pr = shape(pr);   // 压感曲线重映射（软/正常/硬）
+        const endRamp = Math.min(i, n - 1 - i, 2) / 2;
+        return (maxW / 2) * (0.22 + 0.78 * pr) * (0.55 + 0.45 * endRamp);
+      };
+      const left = [], right = [];
+      for (let i = 0; i < n; i++) {
+        const a = pts[Math.max(0, i - 1)], b = pts[Math.min(n - 1, i + 1)];
+        let dx = b.x - a.x, dy = b.y - a.y;
+        const len = Math.hypot(dx, dy) || 1;
+        dx /= len; dy /= len;
+        const nx = -dy, ny = dx, w = half(i);
+        left.push({ x: pts[i].x + nx * w, y: pts[i].y + ny * w });
+        right.push({ x: pts[i].x - nx * w, y: pts[i].y - ny * w });
+      }
+      return outlinePathD(left, right);
+    }
+
+    // 书法笔锋：扁笔尖（nibAngle）→ 笔画方向与笔尖垂直则粗、平行则细（横细竖粗的书法对比）。
+    // 可叠加压感（每点 p，控整体大小）与倾斜（每点 tilt，越躺越宽）；都缺省时纯靠方向。
+    const CALLIG_MIN_FACTOR = 0.16;   // 平行笔尖方向的最细比例（不归零，留一点边锋）
+    const CALLIG_TILT_GAIN = 0.85;    // 倾斜增宽强度（每点 tilt 0..1）
+    function calligraphyStrokeD(points, maxW, nibAngleDeg, curve) {
+      const pts = (points || []).map(clonePoint).filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
+      if (pts.length < 2) {
+        const c = pts[0] || { x: 0, y: 0 };
+        const r = Math.max(0.6, (maxW / 2) * (CALLIG_MIN_FACTOR + 0.3));
+        return 'M ' + (c.x - r) + ' ' + c.y + ' a ' + r + ' ' + r + ' 0 1 0 ' + (2 * r) + ' 0'
+          + ' a ' + r + ' ' + r + ' 0 1 0 ' + (-2 * r) + ' 0 Z';
+      }
+      const n = pts.length;
+      const gamma = pressureCurveGamma(curve);
+      const nib = (nibAngleDeg || 0) * Math.PI / 180;
+      const dirs = [];
+      for (let i = 0; i < n; i++) {
+        const a = pts[Math.max(0, i - 1)], b = pts[Math.min(n - 1, i + 1)];
+        let dx = b.x - a.x, dy = b.y - a.y;
+        const len = Math.hypot(dx, dy) || 1;
+        dirs.push({ x: dx / len, y: dy / len });
+      }
+      const half = (i) => {
+        const ang = Math.atan2(dirs[i].y, dirs[i].x);
+        let f = CALLIG_MIN_FACTOR + (1 - CALLIG_MIN_FACTOR) * Math.abs(Math.sin(ang - nib));   // 方向→粗细
+        let pr = pts[i].p;
+        if (pr != null) { pr = Math.max(0, Math.min(1, pr)); if (gamma !== 1) pr = Math.pow(pr, gamma); f *= (0.4 + 0.6 * pr); }
+        const t = pts[i].tilt;
+        if (t != null) f *= (1 + CALLIG_TILT_GAIN * Math.max(0, Math.min(1, t)));
+        const endRamp = Math.min(i, n - 1 - i, 2) / 2;
+        return (maxW / 2) * f * (0.55 + 0.45 * endRamp);
+      };
+      const left = [], right = [];
+      for (let i = 0; i < n; i++) {
+        const nx = -dirs[i].y, ny = dirs[i].x, w = half(i);
+        left.push({ x: pts[i].x + nx * w, y: pts[i].y + ny * w });
+        right.push({ x: pts[i].x - nx * w, y: pts[i].y - ny * w });
+      }
+      return outlinePathD(left, right);
+    }
+    // 每点倾斜量 0..1：优先 tiltX/tiltY（度，~60°≈满）；否则 altitudeAngle（弧度，π/2 直立=0、越平躺越大）
+    function inkPointTilt(e) {
+      if (!e) return 0;
+      const tx = typeof e.tiltX === 'number' ? e.tiltX : 0;
+      const ty = typeof e.tiltY === 'number' ? e.tiltY : 0;
+      if (tx || ty) return Math.max(0, Math.min(1, Math.hypot(tx, ty) / 60));
+      if (typeof e.altitudeAngle === 'number' && e.altitudeAngle > 0 && e.altitudeAngle < Math.PI / 2) {
+        return Math.max(0, Math.min(1, 1 - e.altitudeAngle / (Math.PI / 2)));
+      }
+      return 0;
+    }
+
+    // 笔画是否走「填充轮廓」渲染（压感 / 笔锋 / 书法）；普通笔画走描边
+    function inkStrokeFilled(stroke) {
+      return !!(stroke && !stroke.hl && (stroke.calligraphy || (stroke.pressure && stroke.pressureVersion === 2) || stroke.taper));
+    }
+    function inkStrokeD(stroke) {
+      const w = stroke.width || 3;
+      const pts = strokeRenderPoints(stroke);
+      if (stroke.calligraphy && !stroke.hl) return calligraphyStrokeD(pts, w, stroke.nibAngle, stroke.pressureCurve);
+      if (stroke.pressure && stroke.pressureVersion === 2 && !stroke.hl) return pressureStrokeD(pts, w, stroke.pressureCurve);
+      if (stroke.taper) return taperedStrokeD(pts, w);
+      return strokePath(pts);
+    }
+
+    // 全局压感开关（齿轮里勾选，存 canvas:penPressure；默认开。'0'=关）
+    function penPressureOn() {
+      try { return localStorage.getItem('canvas:penPressure') !== '0'; } catch (e) { return true; }
+    }
+    // 指针压力归一：pen 给真实 0..1；鼠标/不报压感的设备给中性 0.5
+    function pointerPressure(e) {
+      let pr = (e && typeof e.pressure === 'number') ? e.pressure : 0.5;
+      if (!(pr > 0)) pr = 0.5;   // 0 多半是设备不报压感或已抬笔，给中性值
+      return Math.max(0.05, Math.min(1, pr));
+    }
+
+    function inkPointerType(e, fallback) {
+      return (e && e.pointerType) || (fallback && fallback.pointerType) || 'mouse';
+    }
+
+    function inkPointPressure(e, p, dragState, fallback) {
+      const type = inkPointerType(e, fallback);
+      const raw = (e && typeof e.pressure === 'number') ? e.pressure : 0;
+      if ((type === 'pen' || type === 'touch') && raw > 0) return pointerPressure(e);
+      return dragState.lastInkPressure || 0.5;
+    }
+
+    function stabilizedInkPoint(raw, last, stabilizer) {
+      if (!last || !(stabilizer > 0)) return raw;
+      const dist = Math.hypot(raw.x - last.x, raw.y - last.y);
+      if (dist < 0.01) return raw;
+      let alpha = Math.max(0.18, Math.min(0.96, 1 - stabilizer / 130));
+      if (dist > 48 / Math.max(0.25, curScale)) alpha = Math.max(alpha, 0.72);
+      const p = {
+        x: last.x + (raw.x - last.x) * alpha,
+        y: last.y + (raw.y - last.y) * alpha,
+      };
+      if (raw.p != null) p.p = raw.p;
+      return p;
+    }
+
+    function coalescedPointerEvents(e) {
+      if (e && typeof e.getCoalescedEvents === 'function') {
+        const events = e.getCoalescedEvents();
+        if (events && events.length) return events;
+      }
+      return [e];
+    }
+
+    // 指针预测：浏览器按最近运动给出的「未来落点」。只把实时墨迹往笔尖方向延伸一小截以降低视觉延迟，
+    // 绝不写进 stroke.points——抬笔后 renderInk 只画已确认点，预测尾段自然消失。
+    // 仅笔/触摸启用；尾段限长 + 限点数，防急转弯甩出长毛刺。鼠标不预测（延迟本就小）。
+    function predictedTailPoints(e, dragState) {
+      if (!dragState || !dragState.stroke || !dragState.lastInkPoint) return null;
+      if (!e || typeof e.getPredictedEvents !== 'function') return null;
+      const type = inkPointerType(e);
+      if (type !== 'pen' && type !== 'touch') return null;
+      let evs;
+      try { evs = e.getPredictedEvents(); } catch (_) { return null; }
+      if (!evs || !evs.length) return null;
+      const maxAhead = 26 / Math.max(0.25, curScale);   // 预测尾段最长（画布坐标）
+      const pr = dragState.stroke.pressure ? (dragState.lastInkPressure != null ? dragState.lastInkPressure : 0.5) : null;
+      const out = [];
+      let prev = dragState.lastInkPoint, acc = 0;
+      for (let i = 0; i < evs.length && out.length < 6; i++) {
+        const sp = clientToSurface(evs[i].clientX, evs[i].clientY);
+        if (!Number.isFinite(sp.x) || !Number.isFinite(sp.y)) continue;
+        acc += Math.hypot(sp.x - prev.x, sp.y - prev.y);
+        if (acc > maxAhead) break;
+        if (pr != null) sp.p = pr;
+        out.push(sp); prev = sp;
+      }
+      return out.length ? out : null;
+    }
+
+    function appendInkPointFromEvent(e, fallback) {
+      if (!drag || drag.mode !== 'ink-stroke') return false;
+      const stroke = drag.stroke;
+      const raw = clientToSurface(e.clientX, e.clientY);
+      let p = stabilizedInkPoint(raw, drag.lastInkPoint, drag.stabilizer || 0);
+      const ts = (e && Number.isFinite(e.timeStamp)) ? e.timeStamp : performance.now();
+      if (stroke.pressure) {
+        p.p = inkPointPressure(e, p, drag, fallback);
+        drag.lastInkPressure = p.p;
+      }
+      if (stroke.calligraphy) {
+        const t = inkPointTilt(e);
+        if (t > 0) p.tilt = t;
+      }
+      const pts = stroke.points;
+      const last = pts[pts.length - 1];
+      const minDist = Math.max(0.45, 1.35 - (clampNum(stroke.smoothing, 0, 100, 0) * 0.008));
+      if (!last || Math.hypot(p.x - last.x, p.y - last.y) >= minDist) {
+        pts.push(p);
+        drag.lastInkPoint = p;
+        drag.lastInkTime = ts;
+        return true;
+      }
+      drag.lastInkPoint = p;
+      drag.lastInkTime = ts;
+      return false;
+    }
+
+    function appendInkPointsFromPointerEvent(e) {
+      let changed = false;
+      coalescedPointerEvents(e).forEach(function (ev) {
+        changed = appendInkPointFromEvent(ev, e) || changed;
+      });
+      if (drag && drag.path) {
+        const tail = predictedTailPoints(e, drag);   // 预测尾段：只渲染、不入库
+        if (tail) {
+          const tmp = Object.assign({}, drag.stroke, { points: drag.stroke.points.concat(tail) });
+          drag.path.setAttribute('d', inkStrokeD(tmp));
+        } else if (changed) {
+          drag.path.setAttribute('d', inkStrokeD(drag.stroke));
+        }
+      }
+      return changed;
+    }
+
+    function appendInkStroke(stroke) {
+      if (!inkLayer) return null;
+      const path = document.createElementNS(SVG_NS, 'path');
+      const w = stroke.width || 3;
+      path.dataset.id = stroke.id || '';
+      if (inkStrokeFilled(stroke)) {
+        path.setAttribute('class', 'canvas-ink-stroke canvas-ink-taper');
+        path.setAttribute('d', inkStrokeD(stroke));
+        path.style.fill = stroke.color || '#1a1a1a';
+      } else {
+        path.setAttribute('class', 'canvas-ink-stroke');
+        path.setAttribute('d', inkStrokeD(stroke));
+        path.style.stroke = stroke.color || '#1a1a1a';
+        path.style.strokeWidth = w;
+      }
+      path.style.opacity = stroke.opacity == null ? 1 : stroke.opacity;
+      if (stroke.hl) path.style.mixBlendMode = 'multiply';   // 荧光笔：正片叠底，盖在字上仍可读
+      inkLayer.appendChild(path);
+      return path;
+    }
+
+    function appendFreeArrow(arrow) {
+      if (!inkLayer) return null;
+      ensureInkDefs();
+      const path = document.createElementNS(SVG_NS, 'path');
+      path.setAttribute('class', 'canvas-free-arrow' + (isPolyArrow(arrow) ? ' canvas-free-arrow-poly' : ''));
+      path.dataset.id = arrow.id || '';
+      path.setAttribute('d', arrowPath(arrow));
+      path.setAttribute('marker-end', 'url(#ink-arrow-marker)');
+      path.style.stroke = arrow.color || '#1a1a1a';
+      path.style.strokeWidth = arrow.width || 2.2;
+      path.style.opacity = arrow.opacity == null ? 1 : arrow.opacity;
+      if (selectedArrowId === arrow.id) path.classList.add('selected');
+      inkLayer.appendChild(path);
+      // 折线箭头：加一条透明粗命中条（仅编辑模式可点，CSS 控制），用于选中 / 拖线身插拐点
+      if (isPolyArrow(arrow)) {
+        const hit = document.createElementNS(SVG_NS, 'path');
+        hit.setAttribute('class', 'canvas-free-arrow-hit');
+        hit.dataset.id = arrow.id || '';
+        hit.setAttribute('d', arrowPath(arrow));
+        hit.addEventListener('mousedown', (e) => onPolyArrowMouseDown(arrow.id, e));
+        inkLayer.appendChild(hit);
+      }
+      return path;
+    }
+
+    function renderInk() {
+      if (!inkLayer) return;
+      inkLayer.innerHTML = '';
+      arrowHandleEls = [];   // innerHTML 清空后手柄引用失效，避免悬空
+      ensureInkDefs();
+      const ink = ensureInkData();
+      ink.strokes.forEach(appendInkStroke);
+      ink.arrows.forEach(appendFreeArrow);
+      applyArrowSelection();   // 重建后恢复选中高光与手柄
+    }
+
+    function pointDistance(a, b) {
+      return Math.hypot(a.x - b.x, a.y - b.y);
+    }
+
+    function strokeHit(stroke, p, threshold) {
+      const pts = stroke.points || [];
+      if (pts.length === 1) return pointDistance(pts[0], p) <= threshold;
+      for (let i = 0; i < pts.length - 1; i++) {
+        if (distToSeg(p.x, p.y, pts[i], pts[i + 1]) <= threshold) return true;
+      }
+      return false;
+    }
+
+    function arrowHit(arrow, p, threshold) {
+      if (isPolyArrow(arrow)) {
+        const pts = polyArrowPoints(arrow);
+        for (let i = 0; i < pts.length - 1; i++) {
+          if (distToSeg(p.x, p.y, pts[i], pts[i + 1]) <= threshold) return true;
+        }
+        return false;
+      }
+      const s = clonePoint(arrow.start);
+      const e = clonePoint(arrow.end);
+      const c = clonePoint(arrow.control);
+      let prev = s;
+      for (let i = 1; i <= 24; i++) {
+        const t = i / 24;
+        const mt = 1 - t;
+        const cur = {
+          x: mt * mt * s.x + 2 * mt * t * c.x + t * t * e.x,
+          y: mt * mt * s.y + 2 * mt * t * c.y + t * t * e.y,
+        };
+        if (distToSeg(p.x, p.y, prev, cur) <= threshold) return true;
+        prev = cur;
+      }
+      return false;
+    }
+
+    function inkBounds() {
+      const ink = ensureInkData();
+      const pts = [];
+      ink.strokes.forEach((stroke) => {
+        (stroke.points || []).forEach((p) => pts.push(clonePoint(p)));
+      });
+      ink.arrows.forEach((arrow) => {
+        pts.push(clonePoint(arrow.start), clonePoint(arrow.end));
+        if (isPolyArrow(arrow)) {
+          (arrow.waypoints || []).forEach((w) => pts.push(clonePoint(w)));
+        } else {
+          pts.push(clonePoint(arrow.control));
+        }
+      });
+      if (!pts.length) return null;
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      pts.forEach((p) => {
+        minX = Math.min(minX, p.x);
+        minY = Math.min(minY, p.y);
+        maxX = Math.max(maxX, p.x);
+        maxY = Math.max(maxY, p.y);
+      });
+      return { minX: minX, minY: minY, maxX: maxX, maxY: maxY };
+    }
+
+    function applyTransform(el, x, y) {
+      el.style.setProperty('--node-x', x + 'px');
+      el.style.setProperty('--node-y', y + 'px');
+      el.style.transform = 'translate(var(--node-x), var(--node-y)) rotate(var(--decor-rotation, 0deg)) scale(var(--fold-scale, 1))';
+    }
+
+    function prefersReducedMotion() {
+      try { return window.matchMedia('(prefers-reduced-motion: reduce)').matches; }
+      catch (e) { return false; }
+    }
+    function canWAAPI(el) { return el && typeof el.animate === 'function'; }
+
+    // 新建节点入场：轻微放大 + 淡入。只用在「用户显式新建/粘贴」路径，
+    // 绝不用在 reconcileNodes（开文件/撤销重做的批量渲染）——否则满屏节点一起动。
+    // scale 用 composite:'add' 叠加在 applyTransform 的 translate 之上，不破坏定位。
+    function spawnNodeEl(el) {
+      if (!canWAAPI(el) || prefersReducedMotion()) return;
+      el.animate([{ transform: 'scale(0.9)' }, { transform: 'scale(1)' }],
+        { duration: 260, easing: 'cubic-bezier(0.22, 1, 0.36, 1)', composite: 'add' });
+      el.animate([{ opacity: 0 }, { opacity: 1 }],
+        { duration: 190, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' });
+    }
+
+    // 新建连线入场：路径淡入。同样只用在用户显式连线/粘贴，不用在 reconcileEdges。
+    function spawnEdgeEls(refs) {
+      if (!refs || prefersReducedMotion()) return;
+      [refs.path, refs.labelEl].forEach(function (el) {
+        if (canWAAPI(el)) {
+          el.animate([{ opacity: 0 }, { opacity: 1 }],
+            { duration: 220, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' });
+        }
+      });
+    }
+
+    // 删除离场：克隆一个「幽灵」叠在原处淡出缩小，原元素由调用方同步移除。
+    // 用克隆是为了不干扰 nodeMap/data（数据已同步删，幽灵只负责视觉收尾）。
+    function ghostRemove(el, withScale) {
+      if (!canWAAPI(el) || prefersReducedMotion()) return;
+      const ghost = el.cloneNode(true);
+      ghost.style.pointerEvents = 'none';
+      ghost.classList.remove('selected');
+      (el.parentNode || surface).appendChild(ghost);
+      if (withScale) {
+        ghost.animate([{ transform: 'scale(1)' }, { transform: 'scale(0.86)' }],
+          { duration: 190, easing: 'cubic-bezier(0.4, 0, 1, 1)', composite: 'add' });
+      }
+      const fade = ghost.animate([{ opacity: 1 }, { opacity: 0 }],
+        { duration: 190, easing: 'cubic-bezier(0.4, 0, 1, 1)' });
+      const done = function () { ghost.remove(); };
+      fade.onfinish = done;
+      fade.oncancel = done;
+    }
+
+    // 阅读浮层退场：遮罩淡出 + 卡片轻微缩小，动画结束再真正隐藏。
+    // hideFn 自带"仍处关闭态才隐藏"的守卫，避免 160ms 内被重新打开时误隐藏。
+    function dismissReaderOverlay(overlay, cardSel, hideFn) {
+      if (!overlay || prefersReducedMotion() || !canWAAPI(overlay)) { hideFn(); return; }
+      const card = cardSel ? overlay.querySelector(cardSel) : null;
+      if (card) {
+        card.animate([{ transform: 'scale(1)' }, { transform: 'scale(0.97)' }],
+          { duration: 160, easing: 'cubic-bezier(0.4, 0, 1, 1)', composite: 'add' });
+      }
+      const fade = overlay.animate([{ opacity: 1 }, { opacity: 0 }],
+        { duration: 160, easing: 'cubic-bezier(0.4, 0, 1, 1)' });
+      fade.onfinish = hideFn;
+      fade.oncancel = hideFn;
+    }
+
+    // 查尺寸缓存；未命中（节点刚建、ResizeObserver 还没回调）才退回读一次 offset 兜底并补缓存。
+    function cachedNodeSize(el, id) {
+      const c = nodeSizeCache.get(id);
+      if (c) return c;
+      const w = el ? el.offsetWidth : 160;
+      const h = el ? el.offsetHeight : 36;
+      if (el) nodeSizeCache.set(id, { w: w, h: h });
+      return { w: w, h: h };
+    }
+    function nodeRect(node) {
+      const s = cachedNodeSize(nodeMap.get(node.id), node.id);
+      const r = Number(node.radius) >= 0 ? Number(node.radius) : 10;
+      return { x: node.x, y: node.y, w: s.w, h: s.h, r: r };
+    }
+
+    // ── 文本框与内容节点的“显式跟随”关系 ─────────────────────
+    // 软吸附只改本次落点；用户点磁铁确认后才写这三个扁平字段，便于快照浅拷贝。
+    function textBindingTarget(textBox) {
+      if (!isTextBoxNode(textBox) || !textBox.textBindTarget) return null;
+      const target = findNode(textBox.textBindTarget);
+      return target && !isDecorationNode(target) ? target : null;
+    }
+    function clearTextBinding(textBox) {
+      if (!isTextBoxNode(textBox)) return;
+      delete textBox.textBindTarget;
+      delete textBox.textBindDx;
+      delete textBox.textBindDy;
+    }
+    function setTextBinding(textBox, target) {
+      if (!isTextBoxNode(textBox) || !target || isDecorationNode(target)) return false;
+      textBox.textBindTarget = target.id;
+      textBox.textBindDx = (Number(textBox.x) || 0) - (Number(target.x) || 0);
+      textBox.textBindDy = (Number(textBox.y) || 0) - (Number(target.y) || 0);
+      return true;
+    }
+    function refreshTextBindingOffset(textBox) {
+      const target = textBindingTarget(textBox);
+      if (!target) return false;
+      textBox.textBindDx = (Number(textBox.x) || 0) - (Number(target.x) || 0);
+      textBox.textBindDy = (Number(textBox.y) || 0) - (Number(target.y) || 0);
+      return true;
+    }
+    function normalizeTextBindings() {
+      data.nodes.forEach(function (node) {
+        if (!isTextBoxNode(node) || !node.textBindTarget) return;
+        const target = findNode(node.textBindTarget);
+        if (!target || isDecorationNode(target)) {
+          clearTextBinding(node);       // 目标不存在时原地脱离，不连带删除文本框
+          return;
+        }
+        if (!Number.isFinite(Number(node.textBindDx))) node.textBindDx = (Number(node.x) || 0) - (Number(target.x) || 0);
+        if (!Number.isFinite(Number(node.textBindDy))) node.textBindDy = (Number(node.y) || 0) - (Number(target.y) || 0);
+        node.x = (Number(target.x) || 0) + Number(node.textBindDx);
+        node.y = (Number(target.y) || 0) + Number(node.textBindDy);
+      });
+    }
+    function syncBoundTextBoxes(targetIds, liveCoords) {
+      const ids = targetIds instanceof Set ? targetIds : null;
+      data.nodes.forEach(function (box) {
+        if (!isTextBoxNode(box)) return;
+        const target = textBindingTarget(box);
+        if (!target || (ids && !ids.has(target.id))) return;
+        const liveTarget = liveCoords && liveCoords.get(target.id);
+        const tx = liveTarget ? liveTarget.x : Number(target.x) || 0;
+        const ty = liveTarget ? liveTarget.y : Number(target.y) || 0;
+        const x = tx + (Number(box.textBindDx) || 0);
+        const y = ty + (Number(box.textBindDy) || 0);
+        if (liveCoords) liveCoords.set(box.id, { x: x, y: y });
+        else {
+          box.x = x;
+          box.y = y;
+          const el = nodeMap.get(box.id);
+          if (el) applyTransform(el, x, y);
+        }
+      });
+    }
+    function appendBoundTextBoxMoves(targetIds, moves, movingIds) {
+      data.nodes.forEach(function (box) {
+        if (!isTextBoxNode(box)) return;
+        const target = textBindingTarget(box);
+        if (!target || !targetIds.has(target.id)) return;
+        const fromX = Number(box.x) || 0;
+        const fromY = Number(box.y) || 0;
+        const toX = (Number(target.x) || 0) + (Number(box.textBindDx) || 0);
+        const toY = (Number(target.y) || 0) + (Number(box.textBindDy) || 0);
+        box.x = toX;
+        box.y = toY;
+        const el = nodeMap.get(box.id);
+        if (!el) return;
+        if (Math.abs(toX - fromX) > 0.5 || Math.abs(toY - fromY) > 0.5) {
+          moves.push({ el: el, id: box.id, fromX: fromX, fromY: fromY, toX: toX, toY: toY });
+          movingIds.add(box.id);
+        } else {
+          applyTransform(el, toX, toY);
+        }
+      });
+    }
+
+    function ensureTextSnapGuides() {
+      if (!textSnapGuideX) {
+        textSnapGuideX = document.createElement('div');
+        textSnapGuideX.className = 'text-snap-guide vertical';
+        textSnapGuideX.hidden = true;
+        surface.appendChild(textSnapGuideX);
+      }
+      if (!textSnapGuideY) {
+        textSnapGuideY = document.createElement('div');
+        textSnapGuideY.className = 'text-snap-guide horizontal';
+        textSnapGuideY.hidden = true;
+        surface.appendChild(textSnapGuideY);
+      }
+    }
+    function hideTextSnapGuides() {
+      if (textSnapGuideX) textSnapGuideX.hidden = true;
+      if (textSnapGuideY) textSnapGuideY.hidden = true;
+    }
+    function renderTextSnapGuides(boxRect, targetRect, matchX, matchY) {
+      ensureTextSnapGuides();
+      if (matchX) {
+        const x = matchX.value;
+        const top = Math.min(boxRect.y, targetRect.y) - 12;
+        const bottom = Math.max(boxRect.y + boxRect.h, targetRect.y + targetRect.h) + 12;
+        textSnapGuideX.style.left = x + 'px';
+        textSnapGuideX.style.top = top + 'px';
+        textSnapGuideX.style.height = Math.max(1, bottom - top) + 'px';
+        textSnapGuideX.hidden = false;
+      } else textSnapGuideX.hidden = true;
+      if (matchY) {
+        const y = matchY.value;
+        const left = Math.min(boxRect.x, targetRect.x) - 12;
+        const right = Math.max(boxRect.x + boxRect.w, targetRect.x + targetRect.w) + 12;
+        textSnapGuideY.style.left = left + 'px';
+        textSnapGuideY.style.top = y + 'px';
+        textSnapGuideY.style.width = Math.max(1, right - left) + 'px';
+        textSnapGuideY.hidden = false;
+      } else textSnapGuideY.hidden = true;
+    }
+    function nearestAxisMatch(moving, target, axis) {
+      const movingValues = axis === 'x'
+        ? [moving.x, moving.x + moving.w / 2, moving.x + moving.w]
+        : [moving.y, moving.y + moving.h / 2, moving.y + moving.h];
+      const targetValues = axis === 'x'
+        ? [target.x, target.x + target.w / 2, target.x + target.w]
+        : [target.y, target.y + target.h / 2, target.y + target.h];
+      let best = null;
+      movingValues.forEach(function (mv, mi) {
+        targetValues.forEach(function (tv) {
+          const distance = Math.abs(tv - mv);
+          if (!best || distance < best.distance) best = { distance: distance, delta: tv - mv, value: tv, movingIndex: mi };
+        });
+      });
+      return best;
+    }
+    function applyTextBoxSoftSnap(state, liveCoords) {
+      if (!textSnapEnabled) {
+        state.textSnapResult = null;
+        hideTextSnapGuides();
+        return;
+      }
+      const box = findNode(state.anchorId);
+      if (!isTextBoxNode(box) || state.starts.size !== 1 || !liveCoords.has(box.id)) {
+        state.textSnapResult = null;
+        hideTextSnapGuides();
+        return;
+      }
+      const pos = liveCoords.get(box.id);
+      const boxRect = rectFromXY(box, pos.x, pos.y);
+      const threshold = 9 / Math.max(0.25, state.startScale || curScale);
+      let best = null;
+      data.nodes.forEach(function (candidate) {
+        if (!candidate || candidate.id === box.id || isDecorationNode(candidate)) return;
+        const targetRect = nodeRect(candidate);
+        const mx = nearestAxisMatch(boxRect, targetRect, 'x');
+        const my = nearestAxisMatch(boxRect, targetRect, 'y');
+        const hitX = mx.distance <= threshold;
+        const hitY = my.distance <= threshold;
+        if (!hitX && !hitY) return;
+        const axes = (hitX ? 1 : 0) + (hitY ? 1 : 0);
+        const score = (hitX ? mx.distance : threshold) + (hitY ? my.distance : threshold);
+        if (!best || axes > best.axes || (axes === best.axes && score < best.score)) {
+          best = { target: candidate, rect: targetRect, x: hitX ? mx : null, y: hitY ? my : null, axes: axes, score: score };
+        }
+      });
+      if (!best) {
+        state.textSnapResult = null;
+        hideTextSnapGuides();
+        return;
+      }
+      const snapped = {
+        x: pos.x + (best.x ? best.x.delta : 0),
+        y: pos.y + (best.y ? best.y.delta : 0),
+      };
+      liveCoords.set(box.id, snapped);
+      const snappedRect = rectFromXY(box, snapped.x, snapped.y);
+      state.textSnapResult = { nodeId: box.id, targetId: best.target.id, x: snapped.x, y: snapped.y };
+      renderTextSnapGuides(snappedRect, best.rect, best.x, best.y);
+    }
+    function rectFromXY(node, x, y) {
+      const s = cachedNodeSize(nodeMap.get(node.id), node.id);
+      const r = Number(node.radius) >= 0 ? Number(node.radius) : 10;
+      return { x: x, y: y, w: s.w, h: s.h, r: r };
+    }
+    function edgesIncidentTo(idSet) {
+      const out = [];
+      for (let i = 0; i < data.edges.length; i++) {
+        const e = data.edges[i];
+        if (idSet.has(e.from) || idSet.has(e.to)) out.push(e);
+      }
+      return out;
+    }
+    function indexNodeTitle(node) {
+      const text = String(node && (node.text || node.name) || '').trim();
+      if (text) return text;
+      if (isCodeNode(node)) return codeTitleFromBody(node.body, node.language);
+      const body = String(node && node.body || '').trim();
+      if (body) return titleFromBody(body);
+      if (isPdfNode(node) || isMdNode(node)) return String(node.name || '').trim() || '未命名附件';
+      return '未命名';
+    }
+    function isIndexableNode(node) {
+      return !!node && !isShapeNode(node) && !isImageNode(node);
+    }
+    function edgeNeighborsFrom(nodeId) {
+      const out = [];
+      data.edges.forEach(function (edge) {
+        const arrow = edge.arrow || 'none';
+        let next = null;
+        if (edge.from === nodeId && (arrow === 'none' || arrow === 'end' || arrow === 'both')) next = edge.to;
+        else if (edge.to === nodeId && (arrow === 'none' || arrow === 'start' || arrow === 'both')) next = edge.from;
+        if (!next || next === nodeId) return;
+        const node = findNode(next);
+        if (!isIndexableNode(node)) return;
+        out.push(node);
+      });
+      out.sort(function (a, b) {
+        const ay = Number(a.y) || 0, by = Number(b.y) || 0;
+        if (Math.abs(ay - by) > 24) return ay - by;
+        return (Number(a.x) || 0) - (Number(b.x) || 0);
+      });
+      return out;
+    }
+    function buildIndexTree(root, maxDepth) {
+      const limit = Math.max(1, Math.min(6, Math.round(Number(root.indexDepth) || maxDepth || 4)));
+      const seen = new Set([root.id]);
+      let count = 0;
+      let deepest = 0;
+      function walk(nodeId, depth) {
+        if (depth > limit) return [];
+        const children = [];
+        edgeNeighborsFrom(nodeId).forEach(function (child) {
+          if (seen.has(child.id)) return;
+          seen.add(child.id);
+          count += 1;
+          deepest = Math.max(deepest, depth);
+          children.push({
+            id: child.id,
+            depth: depth,
+            title: indexNodeTitle(child),
+            kind: child.kind || 'normal',
+            summary: indexNodeSummary(child),
+            children: walk(child.id, depth + 1),
+          });
+        });
+        return children;
+      }
+      return { children: walk(root.id, 1), count: count, depth: deepest };
+    }
+    function indexNodeSummary(node) {
+      if (isCodeNode(node)) return codeLanguageLabel(node.language) + ' 代码';
+      if (isStickyNode(node)) return '便签';
+      if (isCardNode(node)) return '卡片';
+      if (isPreviewNode(node)) return '预览';
+      if (isIndexNode(node)) return '索引';
+      if (isPdfNode(node)) return 'PDF';
+      if (isMdNode(node)) return 'Markdown';
+      return '节点';
+    }
+    function refreshAllIndexNodes() {
+      data.nodes.forEach(function (node) {
+        if (!isIndexNode(node)) return;
+        const el = nodeMap.get(node.id);
+        if (el) renderTextNodeMeta(el, node);
+      });
+      if (textReaderOpen && readingNodeId) {
+        const node = findNode(readingNodeId);
+        if (isIndexNode(node)) renderTextReader(node);
+      }
+    }
+    function clearIndexReaderTarget() {
+      nodeMap.forEach(function (el) { el.classList.remove('index-reader-target'); });
+      edgeMap.forEach(function (refs) { if (refs && refs.path) refs.path.classList.remove('edge-path-lit'); });
+    }
+    function setIndexReaderTarget(nodeId) {
+      clearIndexReaderTarget();
+      const el = nodeMap.get(nodeId);
+      if (el) el.classList.add('index-reader-target');
+    }
+    // 悬停目录项：高亮从索引根到该条目沿途的所有节点 + 点亮中间的连线（整条路径）
+    function setIndexReaderPath(pathStr) {
+      clearIndexReaderTarget();
+      const ids = String(pathStr || '').split(',').filter(Boolean);
+      ids.forEach(function (id) { const el = nodeMap.get(id); if (el) el.classList.add('index-reader-target'); });
+      for (let i = 0; i < ids.length - 1; i++) {
+        const a = ids[i], b = ids[i + 1];
+        data.edges.forEach(function (edge) {
+          if ((edge.from === a && edge.to === b) || (edge.from === b && edge.to === a)) {
+            const refs = edgeMap.get(edge.id);
+            if (refs && refs.path) refs.path.classList.add('edge-path-lit');
+          }
+        });
+      }
+    }
+    // Extra B：悬停画布上的索引节点，目录条目不多时，在其左侧渐显一份只读目录预览（不打扰）
+    function setupIndexHoverPreview() {
+      if (!viewport) return;
+      // 偏好：是否启用 + 出现延迟。齿轮里可调，与 editor.js 同名键 / 自定义事件联动。
+      try { indexHoverEnabled = localStorage.getItem('canvas:indexHoverEnabled') !== '0'; } catch (e) {}
+      try {
+        const d = parseInt(localStorage.getItem('canvas:indexHoverDelay'), 10);
+        if (Number.isFinite(d) && d >= 0 && d <= 2000) indexHoverDelay = d;
+      } catch (e) {}
+      document.addEventListener('canvas:index-hover-enabled', function (e) {
+        indexHoverEnabled = !!e.detail;
+        if (!indexHoverEnabled) hideIndexHoverPreview();   // 关掉时连同排队中的弹出一并取消
+      });
+      document.addEventListener('canvas:index-hover-delay', function (e) {
+        const ms = parseInt(e.detail, 10);
+        if (Number.isFinite(ms) && ms >= 0 && ms <= 2000) indexHoverDelay = ms;
+      });
+      viewport.addEventListener('mouseover', function (e) {
+        const nodeEl = e.target.closest ? e.target.closest('.node[data-kind="index"]') : null;
+        if (!nodeEl) return;
+        scheduleIndexHoverPreview(nodeEl);   // 延迟与去重都在 schedule 里处理
+      });
+      viewport.addEventListener('mouseout', function (e) {
+        const nodeEl = e.target.closest ? e.target.closest('.node[data-kind="index"]') : null;
+        if (!nodeEl) return;
+        const next = e.relatedTarget && e.relatedTarget.closest ? e.relatedTarget.closest('.node[data-kind="index"]') : null;
+        if (next === nodeEl) return;   // 仍在同一节点内移动
+        hideIndexHoverPreview();
+      });
+      // 拖拽 / 缩放 / 平移会让定位失真：发生时即时收起（带淡出动画）。
+      // 用「捕获阶段 + document」，确保即使拖动索引节点自身、其 mousedown 阻断冒泡也能收到；
+      // 拖动途中鼠标仍在节点上会触发 mouseover，但 showIndexHoverPreview 顶部的 drag 守卫会拦住重新弹出。
+      document.addEventListener('mousedown', hideIndexHoverPreview, true);
+      document.addEventListener('pointerdown', hideIndexHoverPreview, true);
+      viewport.addEventListener('wheel', hideIndexHoverPreview, { passive: true });
+    }
+    // 悬停索引节点后延迟 indexHoverDelay 毫秒再弹目录；同节点内移动不重排队，关掉则不弹。
+    function scheduleIndexHoverPreview(nodeEl) {
+      if (!indexHoverEnabled) return;
+      const id = nodeEl.dataset.id;
+      if (indexHoverNodeId === id) return;                          // 已在显示这个节点
+      if (indexHoverOpenTimer && indexHoverPendingId === id) return; // 已在为这个节点排队
+      if (indexHoverOpenTimer) { clearTimeout(indexHoverOpenTimer); indexHoverOpenTimer = null; }
+      if (indexHoverDelay <= 0) { indexHoverPendingId = null; showIndexHoverPreview(nodeEl); return; }
+      indexHoverPendingId = id;
+      indexHoverOpenTimer = setTimeout(function () {
+        indexHoverOpenTimer = null;
+        indexHoverPendingId = null;
+        // 延迟到点后再确认：节点还在、鼠标仍悬在其上（快速划过不弹）。
+        if (!nodeEl.isConnected || !nodeEl.matches(':hover')) return;
+        showIndexHoverPreview(nodeEl);
+      }, indexHoverDelay);
+    }
+    function hideIndexHoverPreview() {
+      indexHoverNodeId = null;
+      if (indexHoverOpenTimer) { clearTimeout(indexHoverOpenTimer); indexHoverOpenTimer = null; }
+      indexHoverPendingId = null;
+      if (!indexHoverEl) return;
+      indexHoverEl.classList.remove('show');
+      if (indexHoverHideTimer) clearTimeout(indexHoverHideTimer);
+      indexHoverHideTimer = setTimeout(function () {
+        if (indexHoverEl) { indexHoverEl.remove(); indexHoverEl = null; }
+        indexHoverHideTimer = null;
+      }, 240);
+    }
+    function showIndexHoverPreview(nodeEl) {
+      const node = findNode(nodeEl.dataset.id);
+      if (!node || !isIndexNode(node)) return;
+      if (textReaderOpen || pdfReaderOpen || drag || editingNodeId) { hideIndexHoverPreview(); return; }
+      const info = buildIndexTree(node, 6);
+      const THRESHOLD = 16;                // 目录条目不太多才展示，避免遮挡画布（超过则用 F 看完整目录）
+      if (!info.count || info.count > THRESHOLD) { hideIndexHoverPreview(); return; }
+      indexHoverNodeId = nodeEl.dataset.id;
+      if (indexHoverHideTimer) { clearTimeout(indexHoverHideTimer); indexHoverHideTimer = null; }
+      if (!indexHoverEl) {
+        indexHoverEl = document.createElement('div');
+        indexHoverEl.className = 'index-hover-preview';
+        document.body.appendChild(indexHoverEl);
+      }
+      const list = document.createElement('div');
+      list.className = 'index-hover-list';
+      let order = 0;
+      (function walk(items) {
+        items.forEach(function (it) {
+          const row = document.createElement('div');
+          row.className = 'index-hover-item';
+          row.style.setProperty('--index-level', String(it.depth - 1));
+          row.style.setProperty('--i', String(order++));
+          const t = document.createElement('span');
+          t.className = 'index-hover-title';
+          t.textContent = it.title;
+          row.appendChild(t);
+          list.appendChild(row);
+          if (it.children && it.children.length) walk(it.children);
+        });
+      })(info.children);
+      indexHoverEl.innerHTML = '';
+      indexHoverEl.appendChild(list);
+      positionIndexHoverPreview(nodeEl);
+      // 逐条渐显：下一帧加 show，触发带 stagger 的过渡
+      requestAnimationFrame(function () { if (indexHoverEl) indexHoverEl.classList.add('show'); });
+    }
+    function positionIndexHoverPreview(nodeEl) {
+      if (!indexHoverEl) return;
+      const r = nodeEl.getBoundingClientRect();
+      const gap = 14;
+      // 右缘锚在节点左侧 gap 处，垂直居中对齐节点（CSS 用 translateY(-50%) 居中）
+      indexHoverEl.style.left = 'auto';
+      indexHoverEl.style.right = Math.max(8, window.innerWidth - r.left + gap) + 'px';
+      indexHoverEl.style.top = (r.top + r.height / 2) + 'px';
+    }
+    // 视口中央点对应的 surface 坐标（X 轮：N 键建节点用，鼠标不在 viewport 时兜底）
+    function viewportCenterInSurface() {
+      const vRect = viewport.getBoundingClientRect();
+      return clientToSurface(vRect.left + vRect.width / 2, vRect.top + vRect.height / 2);
+    }
+    // N 键建节点的默认位置：优先用鼠标悬停的位置；鼠标不在 viewport 里 → 视口中央
+    function defaultNewNodePosition() {
+      freezeViewportForInteraction();
+      const vRect = viewport.getBoundingClientRect();
+      const inside = lastMouseClientX >= vRect.left && lastMouseClientX <= vRect.right
+        && lastMouseClientY >= vRect.top && lastMouseClientY <= vRect.bottom;
+      if (inside) {
+        const p = clientToSurface(lastMouseClientX, lastMouseClientY);
+        return { x: p.x - NODE_DEFAULT_HALF_W, y: p.y - NODE_DEFAULT_HALF_H };
+      }
+      const c = viewportCenterInSurface();
+      return { x: c.x - NODE_DEFAULT_HALF_W, y: c.y - NODE_DEFAULT_HALF_H };
+    }
+
+    // ── Z 轮：坐标转换 + 缓动循环 ───────────
+    // 把 client 坐标（鼠标事件的 e.clientX/Y）转换到 surface 坐标（节点 x/y 用的那个）
+    function clientToSurface(clientX, clientY) {
+      const vRect = viewport.getBoundingClientRect();
+      return {
+        x: (clientX - vRect.left - curPanX) / curScale,
+        y: (clientY - vRect.top - curPanY) / curScale,
+      };
+    }
+
+    function surfaceToClient(x, y) {
+      const vRect = viewport.getBoundingClientRect();
+      return {
+        x: vRect.left + curPanX + x * curScale,
+        y: vRect.top + curPanY + y * curScale,
+      };
+    }
+
+    function applyViewport() {
+      surface.style.transform =
+        'translate(' + curPanX + 'px, ' + curPanY + 'px) scale(' + curScale + ')';
+      // 连线透明命中条宽度按缩放反向缩放，使其在屏幕上恒定（~22px）→ 缩小画布也好点中
+      if (edgesLayer) {
+        edgesLayer.style.setProperty('--edge-hit-w', Math.max(14, 22 / curScale).toFixed(2));
+      }
+      if (zoomIndicator) {
+        zoomIndicator.textContent = Math.round(curScale * 100) + '%';
+      }
+      updateMinimapViewport();   // 阶段 4：视口变化每帧只挪取景框（映射变了才完整重画）
+      maybeUpdateCulling();      // 阶段 2：节点多时按视口移动阈值重算屏外裁剪集
+      renderEdgesCanvas();       // 阶段①：连线 canvas 层按新相机重描（开关关时是空操作）
+      if (selToolbar && !selToolbar.hidden) scheduleSelToolbar();  // 缩放/平移时工具栏跟随选区
+    }
+
+    function setViewportImmediate(s, px, py) {
+      cancelPanInertia();   // 程序化跳转视口前停掉惯性
+      curScale = targetScale = s;
+      curPanX = targetPanX = px;
+      curPanY = targetPanY = py;
+      if (animRaf != null) { cancelAnimationFrame(animRaf); animRaf = null; }
+      viewportTickTs = 0;
+      applyViewport();
+    }
+
+    function freezeViewportForInteraction() {
+      const hadRaf = animRaf != null;
+      const drifting = Math.abs(targetScale - curScale) > 0.0008
+        || Math.abs(targetPanX - curPanX) > 0.4
+        || Math.abs(targetPanY - curPanY) > 0.4;
+      if (!hadRaf && !drifting) return;
+      if (animRaf != null) { cancelAnimationFrame(animRaf); animRaf = null; }
+      viewportTickTs = 0;
+      targetScale = curScale;
+      targetPanX = curPanX;
+      targetPanY = curPanY;
+      applyViewport();
+      rememberViewport();
+    }
+
+    function rememberViewport() {
+      viewportHasUserPosition = true;
+      const vRect = viewport.getBoundingClientRect();
+      rememberedViewportCenter = {
+        x: (vRect.width / 2 - targetPanX) / targetScale,
+        y: (vRect.height / 2 - targetPanY) / targetScale,
+      };
+      onViewportChange({
+        scale: targetScale,
+        centerX: rememberedViewportCenter.x,
+        centerY: rememberedViewportCenter.y,
+      });
+    }
+
+    function restoreViewport() {
+      if (!initialViewport || typeof initialViewport !== 'object') return false;
+      const s = Number(initialViewport.scale);
+      const centerX = Number(initialViewport.centerX);
+      const centerY = Number(initialViewport.centerY);
+      if (!Number.isFinite(s) || !Number.isFinite(centerX) || !Number.isFinite(centerY)
+          || s < MIN_SCALE || s > MAX_SCALE) return false;
+      const vRect = viewport.getBoundingClientRect();
+      const px = vRect.width / 2 - centerX * s;
+      const py = vRect.height / 2 - centerY * s;
+      viewportHasUserPosition = true;
+      rememberedViewportCenter = { x: centerX, y: centerY };
+      setViewportImmediate(s, px, py);
+      return true;
+    }
+
+    function keepRememberedViewportCentered() {
+      if (!viewportHasUserPosition || !rememberedViewportCenter) return;
+      const vRect = viewport.getBoundingClientRect();
+      const px = vRect.width / 2 - rememberedViewportCenter.x * targetScale;
+      const py = vRect.height / 2 - rememberedViewportCenter.y * targetScale;
+      setViewportImmediate(targetScale, px, py);
+    }
+
+    function requestTick() {
+      cancelPanInertia();   // 任何缓动类视口操作（缩放/复位/居中/定位）开始即停掉平移惯性，避免互相打架
+      if (animRaf == null) animRaf = requestAnimationFrame(tickViewport);
+    }
+
+    function tickViewport(ts) {
+      animRaf = null;
+      const ds = targetScale - curScale;
+      const dx = targetPanX - curPanX;
+      const dy = targetPanY - curPanY;
+      // 阈值收敛后吸附到 target
+      if (Math.abs(ds) < 0.0008 && Math.abs(dx) < 0.4 && Math.abs(dy) < 0.4) {
+        curScale = targetScale;
+        curPanX = targetPanX;
+        curPanY = targetPanY;
+        viewportTickTs = 0;            // 本段缓动结束，下次从新帧起算
+        applyViewport();
+        return;
+      }
+      // dt 归一化：高刷屏每帧逼近更少、帧更多，整体收敛速度与 60Hz 一致
+      if (typeof ts !== 'number') ts = performance.now();
+      const k = frameRatio(EASE, tickFrames(ts, viewportTickTs));
+      viewportTickTs = ts;
+      curScale += ds * k;
+      curPanX += dx * k;
+      curPanY += dy * k;
+      applyViewport();
+      animRaf = requestAnimationFrame(tickViewport);
+    }
+
+    function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+    // 以 (anchorClientX, anchorClientY) 为锚点把目标缩放设为 newScale——
+    // 锚点保持：缩放前后这个屏幕点对应同一个 surface 点
+    function zoomTo(newScale, anchorClientX, anchorClientY) {
+      newScale = clamp(newScale, MIN_SCALE, MAX_SCALE);
+      if (newScale === targetScale) return;
+      const vRect = viewport.getBoundingClientRect();
+      // 锚点用 target 状态当基准——这样连续滚轮事件不会"漂移"
+      const pointX = (anchorClientX - vRect.left - targetPanX) / targetScale;
+      const pointY = (anchorClientY - vRect.top - targetPanY) / targetScale;
+      targetPanX = anchorClientX - vRect.left - pointX * newScale;
+      targetPanY = anchorClientY - vRect.top - pointY * newScale;
+      targetScale = newScale;
+      rememberViewport();
+      requestTick();
+    }
+
+    function resetViewport() {
+      targetScale = 1;
+      targetPanX = 0;
+      targetPanY = 0;
+      rememberViewport();
+      requestTick();
+    }
+
+    // Ctrl+1 / 初始打开：缩放并平移到刚好容纳所有节点
+    function fitToContent(immediate) {
+      const inkBox = inkBounds();
+      if (data.nodes.length === 0 && !inkBox) {
+        if (immediate) setViewportImmediate(1, 0, 0);
+        else resetViewport();
+        return;
+      }
+      let minX = inkBox ? inkBox.minX : Infinity;
+      let minY = inkBox ? inkBox.minY : Infinity;
+      let maxX = inkBox ? inkBox.maxX : -Infinity;
+      let maxY = inkBox ? inkBox.maxY : -Infinity;
+      data.nodes.forEach(function (n) {
+        const el = nodeMap.get(n.id);
+        const w = el ? el.offsetWidth : 160;
+        const h = el ? el.offsetHeight : 36;
+        if (n.x < minX) minX = n.x;
+        if (n.y < minY) minY = n.y;
+        if (n.x + w > maxX) maxX = n.x + w;
+        if (n.y + h > maxY) maxY = n.y + h;
+      });
+      const padding = 80;
+      const contentW = (maxX - minX) + padding * 2;
+      const contentH = (maxY - minY) + padding * 2;
+      const vRect = viewport.getBoundingClientRect();
+      let s = Math.min(vRect.width / contentW, vRect.height / contentH, 1);
+      s = clamp(s, MIN_SCALE, MAX_SCALE);
+      const cx = (minX + maxX) / 2;
+      const cy = (minY + maxY) / 2;
+      const px = vRect.width / 2 - cx * s;
+      const py = vRect.height / 2 - cy * s;
+      if (immediate) setViewportImmediate(s, px, py);
+      else {
+        targetScale = s;
+        targetPanX = px;
+        targetPanY = py;
+        rememberViewport();
+        requestTick();
+      }
+    }
+
+    // ── W 轮：方向键平移 + 定位 + 偏好缩放 ───
+
+    // 居中某节点到视口（保持当前 scale），带缓动
+    function centerOnNode(id) {
+      const n = findNode(id);
+      if (!n) return false;
+      const el = nodeMap.get(id);
+      const w = el ? el.offsetWidth : 160;
+      const h = el ? el.offsetHeight : 36;
+      const cx = n.x + w / 2;
+      const cy = n.y + h / 2;
+      const vRect = viewport.getBoundingClientRect();
+      targetPanX = vRect.width / 2 - cx * targetScale;
+      targetPanY = vRect.height / 2 - cy * targetScale;
+      rememberViewport();
+      requestTick();
+      return true;
+    }
+
+    // 按钮 A：定位最近新建的节点（无最近 → 兜底用最后一个；空画布 → 什么也不做）
+    function locateRecent() {
+      if (lastCreatedNodeId && centerOnNode(lastCreatedNodeId)) return;
+      if (data.nodes.length === 0) return;
+      centerOnNode(data.nodes[data.nodes.length - 1].id);
+    }
+
+    // ── 双链 [[名字]]：画布内解析 + 跳转（方案 A，自包含、不扫盘、不建 vault）──
+    // 名字归一：去首尾空格、忽略大小写、去掉 .md/.markdown/.pdf 后缀（双链可写可不写后缀）。
+    function normWikiName(s) {
+      return String(s || '').trim().toLowerCase().replace(/\.(md|markdown|pdf)$/i, '');
+    }
+    // 在当前画布里按名字找跳转目标：附件（按文件名）优先于正文节点（按标题），都不命中返回 null。
+    function resolveWikiTarget(name) {
+      const target = normWikiName(name);
+      if (!target) return null;
+      let bodyMatch = null;
+      for (const n of data.nodes) {
+        if (isAttachmentNode(n)) {
+          if (normWikiName(n.name) === target) return n;
+        } else if (isBodyNode(n)) {
+          if (!bodyMatch && normWikiName(n.text) === target) bodyMatch = n;
+        }
+      }
+      return bodyMatch;
+    }
+    function jumpToWikiTarget(name) {
+      const node = resolveWikiTarget(name);
+      if (!node) { showCanvasToast('未找到《' + name + '》'); return; }
+      if (pdfReaderOpen) closePdfReader();
+      if (textReaderOpen) closeTextReader();
+      selectNodes([node.id], false);
+      centerOnNode(node.id);
+      flashNode(node.id);
+    }
+    // 跳转落点短暂高亮（让用户看清飞到了哪）
+    function flashNode(id) {
+      const el = nodeMap.get(id);
+      if (!el) return;
+      el.classList.remove('wikilink-flash');
+      void el.offsetWidth;            // 强制回流以重启动画
+      el.classList.add('wikilink-flash');
+      setTimeout(() => { if (el) el.classList.remove('wikilink-flash'); }, 1100);
+    }
+    // 轻量瞬时提示（双链未找到等），1.8s 自动淡出
+    let canvasToastTimer = null;
+    function canvasUiText(value) {
+      return global.RelatumI18n ? global.RelatumI18n.t(value) : value;
+    }
+    function showCanvasToast(msg) {
+      let t = document.querySelector('.canvas-toast');
+      if (!t) { t = document.createElement('div'); t.className = 'canvas-toast'; document.body.appendChild(t); }
+      t.textContent = canvasUiText(msg);
+      t.classList.add('show');
+      if (canvasToastTimer) clearTimeout(canvasToastTimer);
+      canvasToastTimer = setTimeout(() => t.classList.remove('show'), 1800);
+    }
+
+    // 按钮 B：切到偏好缩放，以当前视口中心为锚点（不改变看的位置）
+    function applyZoomPref() {
+      const vRect = viewport.getBoundingClientRect();
+      // 当前视口中心对应的 surface 坐标
+      const cx = (vRect.width / 2 - targetPanX) / targetScale;
+      const cy = (vRect.height / 2 - targetPanY) / targetScale;
+      const newScale = clamp(zoomPref, MIN_SCALE, MAX_SCALE);
+      targetPanX = vRect.width / 2 - cx * newScale;
+      targetPanY = vRect.height / 2 - cy * newScale;
+      targetScale = newScale;
+      rememberViewport();
+      requestTick();
+    }
+
+    // 方向键平移循环：每帧把 target/cur 同步推 N 像素（不缓动、跟手）
+    function arrowTick(ts) {
+      let dx = 0, dy = 0;
+      if (arrowKeys.ArrowLeft) dx += panSpeed;
+      if (arrowKeys.ArrowRight) dx -= panSpeed;
+      if (arrowKeys.ArrowUp) dy += panSpeed;
+      if (arrowKeys.ArrowDown) dy -= panSpeed;
+      if (dx === 0 && dy === 0) {
+        arrowPanRaf = null;
+        arrowTickTs = 0;
+        return;
+      }
+      // dt 归一化：panSpeed 是"@60fps 的像素/帧"，乘真实帧数 → 高刷屏不会变快
+      if (typeof ts !== 'number') ts = performance.now();
+      const f = tickFrames(ts, arrowTickTs);
+      arrowTickTs = ts;
+      targetPanX += dx * f;
+      targetPanY += dy * f;
+      curPanX = targetPanX;
+      curPanY = targetPanY;
+      // 打断缓动循环——方向键想要立即响应
+      if (animRaf != null) { cancelAnimationFrame(animRaf); animRaf = null; viewportTickTs = 0; }
+      applyViewport();
+      rememberViewport();
+      arrowPanRaf = requestAnimationFrame(arrowTick);
+    }
+
+    // ── W 轮：平移松手惯性 ── 松手时延续拖拽速度，带时间无关摩擦优雅滑停。
+    function cancelPanInertia() {
+      if (panInertiaRaf != null) { cancelAnimationFrame(panInertiaRaf); panInertiaRaf = null; }
+      panVel = null;
+    }
+    function startPanInertia(d) {
+      cancelPanInertia();
+      if (!d || d.velX == null) return;
+      if (!(panInertia > 0)) return;
+      const now = performance.now();
+      // 松手前已停顿（最后一次移动距今 > 60ms）→ 视为"放下"而非"甩出"，不触发惯性
+      if (d.lastMoveT == null || now - d.lastMoveT > 60) return;
+      let vx = d.velX * panInertia, vy = d.velY * panInertia; // px/ms，与 panX 同单位（屏幕像素）
+      let speed = Math.hypot(vx, vy);
+      if (speed < 0.06) return;                       // 太慢不甩，避免轻触也滑
+      const MAX_V = 5;                                // 限速，避免猛甩飞出
+      if (speed > MAX_V) { const k = MAX_V / speed; vx *= k; vy *= k; }
+      panVel = { x: vx, y: vy };
+      let last = now;
+      function step(ts) {
+        panInertiaRaf = null;
+        let dt = ts - last; last = ts;
+        if (!(dt > 0)) dt = 16.7;
+        if (dt > 40) dt = 40;                         // 掉帧/切后台不暴冲
+        const f = Math.exp(-0.0045 * dt);             // 时间无关摩擦，约 0.7s 滑停
+        targetPanX += panVel.x * dt;
+        targetPanY += panVel.y * dt;
+        curPanX = targetPanX; curPanY = targetPanY;
+        panVel.x *= f; panVel.y *= f;
+        applyViewport();
+        rememberViewport();
+        if (Math.hypot(panVel.x, panVel.y) > 0.015) panInertiaRaf = requestAnimationFrame(step);
+        else panVel = null;
+      }
+      panInertiaRaf = requestAnimationFrame(step);
+    }
+
+    // 偏好框：提交输入 → 解析、夹紧、保存
+    function commitZoomPref() {
+      if (!zoomPrefInput) return;
+      let raw = String(zoomPrefInput.value).replace(/[%\s]/g, '');
+      let v = parseInt(raw, 10);
+      if (!Number.isFinite(v)) v = Math.round(zoomPref * 100);
+      v = Math.max(25, Math.min(400, v));
+      zoomPref = v / 100;
+      try { localStorage.setItem('canvas:zoomPref', String(zoomPref)); } catch (e) {}
+      zoomPrefInput.value = v + '%';
+    }
+
+    function horizontalWheelDelta(e) {
+      let delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+      if (e.deltaMode === 1) delta *= 18;       // DOM_DELTA_LINE
+      else if (e.deltaMode === 2) delta *= 240; // DOM_DELTA_PAGE
+      return Math.max(-240, Math.min(240, delta));
+    }
+
+    function smoothHorizontalScroll(el, delta) {
+      const max = Math.max(0, el.scrollWidth - el.clientWidth);
+      if (max <= 1 || !delta) return false;
+      let st = horizontalScrollState.get(el);
+      if (!st) {
+        st = { target: el.scrollLeft, raf: null };
+        horizontalScrollState.set(el, st);
+      }
+      st.target = Math.max(0, Math.min(max, st.target + delta));
+      if (st.raf !== null) return true;
+      st.ts = 0;                       // 本段惯性滚动起始：下次从新帧起算
+      const tick = function (ts) {
+        const nextMax = Math.max(0, el.scrollWidth - el.clientWidth);
+        st.target = Math.max(0, Math.min(nextMax, st.target));
+        const distance = st.target - el.scrollLeft;
+        if (Math.abs(distance) < 0.6) {
+          el.scrollLeft = st.target;
+          st.raf = null;
+          st.ts = 0;
+          return;
+        }
+        // dt 归一化：高刷屏不会因每帧逼近更多次而变快
+        if (typeof ts !== 'number') ts = performance.now();
+        el.scrollLeft += distance * frameRatio(0.34, tickFrames(ts, st.ts));
+        st.ts = ts;
+        st.raf = requestAnimationFrame(tick);
+      };
+      st.raf = requestAnimationFrame(tick);
+      return true;
+    }
+
+    function nodeContentScrollHost(target) {
+      if (!target || !target.closest) return null;
+      const attachBody = target.closest('.attach-body');
+      if (attachBody) return attachBody;
+      const previewBody = target.closest('.preview-node-body');
+      if (previewBody && previewBody.closest('.node[data-kind="preview"], .node[data-kind="card"]')) return previewBody;
+      // 超长文本兜底：标题/便签/代码正文被 max-height 夹出内滚后，滚轮优先滚内容。
+      // 只认"确实溢出"的，普通节点（不溢出）滚轮照旧缩放，行为零变化。
+      const nodeText = target.closest('.node .node-text');
+      if (nodeText && nodeText.scrollHeight > nodeText.clientHeight + 1) return nodeText;
+      return null;
+    }
+
+    function localHorizontalScrollHost(target, fallback) {
+      if (!target || !target.closest) return fallback;
+      const local = target.closest('.md-scroll-x, pre.md-code, .md-math-block');
+      return local && local.scrollWidth > local.clientWidth + 1 ? local : fallback;
+    }
+
+    // 滚轮：以鼠标位置为锚点缩放（每滚一格 scale 乘 ~1.1）
+    function onWheel(e) {
+      // 鼠标悬停在 PDF/MD 附件正文内、且正文可滚动 → 放行原生滚动（滚文档上下页），不缩放画布。
+      // 内容未超出（不可滚）时仍落到缩放分支，避免"滚轮没反应"。
+      const scrollHost = nodeContentScrollHost(e.target);
+      if (scrollHost) {
+        if (e.shiftKey) {
+          e.preventDefault();
+          e.stopPropagation();
+          const host = localHorizontalScrollHost(e.target, scrollHost);
+          smoothHorizontalScroll(host, horizontalWheelDelta(e));
+          return;
+        }
+        if (scrollHost.scrollHeight > scrollHost.clientHeight + 1) return;
+      }
+      // 在编辑中也允许（不然用户没法看公式细节）；但要阻止页面默认滚动
+      e.preventDefault();
+      hideNodeMenu();   // C1：缩放会让菜单位置错位，先关
+      hideEdgeMenu();
+      // 不同输入设备的 deltaY 量级差异很大——做归一化
+      // 普通鼠标滚轮：~100 一格；触控板：~10 一帧
+      const step = Math.abs(e.deltaY);
+      const dir = e.deltaY > 0 ? -1 : 1; // 向上滚 = 放大
+      // 因子 ~1.1^（dir * 0.5）当滚一格；乘上用户设的 zoomSpeed 倍率；触控板细滑动会自动平滑
+      const factor = Math.exp(dir * Math.min(step, 200) / 200 * Math.log(1.1) * zoomSpeed);
+      zoomTo(targetScale * factor, e.clientX, e.clientY);
+    }
+
+    // ── 节点 DOM ──────────────────────────────
+    // ── 5-1：节点自定义样式（专业模式默认 / 后续编辑模式精修）──
+    // 形状用 data-shape（CSS 控）；颜色/透明度用 CSS 变量喂给 .node，保留
+    // hover/选中覆盖边框色的能力。透明度只作用于背景填充——文字与边框始终
+    // 不透明，保证"文字始终覆盖在节点上方"。
+    function hexToRgba(hex, alpha) {
+      hex = String(hex || '').replace('#', '');
+      if (hex.length === 3) hex = hex.split('').map(function (c) { return c + c; }).join('');
+      if (hex.length !== 6) return null;
+      const r = parseInt(hex.slice(0, 2), 16);
+      const g = parseInt(hex.slice(2, 4), 16);
+      const b = parseInt(hex.slice(4, 6), 16);
+      if (isNaN(r) || isNaN(g) || isNaN(b)) return null;
+      return 'rgba(' + r + ',' + g + ',' + b + ',' + alpha + ')';
+    }
+
+    function applyNodeStyle(el, node) {
+      if (isDecorationNode(node)) {
+        el.dataset.kind = node.kind;
+        el.dataset.decoration = 'true';
+        if (node.shapeType) el.dataset.shapeType = node.shapeType;
+        else el.removeAttribute('data-shape-type');
+        el.dataset.layer = node.layer === 'front' ? 'front' : 'back';
+        el.classList.add('decor-object');
+        el.classList.remove('node-chrome-hidden');
+        el.style.width = Math.max(20, Number(node.width) || 240) + 'px';
+        el.style.height = Math.max(8, Number(node.height) || 120) + 'px';
+        el.style.setProperty('--decor-rotation', (Number(node.rotation) || 0) + 'deg');
+        el.style.setProperty('--decor-opacity', node.opacity == null ? 1 : node.opacity);
+        if (isTextBoxNode(node)) {
+          if (node.boxStyle) el.dataset.boxStyle = node.boxStyle;
+          else el.removeAttribute('data-box-style');
+          el.style.setProperty('--textbox-color', node.color || '#1a1a1a');
+          el.style.setProperty('--textbox-font-size', Math.max(8, Number(node.fontSize) || 28) + 'px');
+          el.style.setProperty('--textbox-font-weight', Math.max(400, Math.min(800, Number(node.fontWeight) || 400)));
+          el.style.setProperty('--textbox-text-align', node.textAlign === 'left' || node.textAlign === 'right'
+            ? node.textAlign : (node.boxStyle ? 'left' : 'center'));
+          if (node.boxStyle) {
+            const textBase = decorTextPresetBase(node.boxStyle);
+            el.style.setProperty('--decor-border', node.borderColor || textBase.borderColor);
+            el.style.setProperty('--decor-fill', node.fillColor || textBase.fillColor);
+            el.style.setProperty('--decor-border-width', cleanDecorNumber(node.borderWidth, textBase.borderWidth, 1, 6, false) + 'px');
+            el.style.setProperty('--decor-border-style', cleanDecorTextBorderStyle(node.borderStyle, textBase.borderStyle));
+          } else {
+            el.style.removeProperty('--decor-border');
+            el.style.removeProperty('--decor-fill');
+            el.style.removeProperty('--decor-border-width');
+            el.style.removeProperty('--decor-border-style');
+          }
+        } else {
+          el.removeAttribute('data-box-style');
+          el.style.removeProperty('--textbox-color');
+          el.style.removeProperty('--textbox-font-size');
+          el.style.removeProperty('--textbox-font-weight');
+          el.style.removeProperty('--textbox-text-align');
+        }
+        if (isShapeNode(node)) {
+          el.style.setProperty('--decor-border', node.borderColor || '#b8b3aa');
+          el.style.setProperty('--decor-fill', node.fillColor || '#ffffff');
+          el.dataset.fillMode = decorFillMode(node);
+          if (isGroupBoxNode(node)) {
+            const borderStyle = cleanDecorGroupBorderStyle(node.borderStyle, 'solid');
+            el.style.setProperty('--decor-border-width', cleanDecorNumber(node.borderWidth, 2.4, 1, 6, false) + 'px');
+            el.style.setProperty('--decor-border-style', borderStyle);
+            el.style.setProperty('--decor-border-dash', borderStyle === 'dashed'
+              ? '10 7' : (borderStyle === 'dotted' ? '2 7' : 'none'));
+          } else {
+            el.style.removeProperty('--decor-border-width');
+            el.style.removeProperty('--decor-border-style');
+            el.style.removeProperty('--decor-border-dash');
+          }
+        } else {
+          if (!isTextBoxNode(node) || !node.boxStyle) {
+            el.style.removeProperty('--decor-border');
+            el.style.removeProperty('--decor-fill');
+            el.style.removeProperty('--decor-border-width');
+            el.style.removeProperty('--decor-border-style');
+            el.style.removeProperty('--decor-border-dash');
+          }
+          el.removeAttribute('data-fill-mode');
+        }
+        return;
+      }
+      el.classList.remove('decor-object');
+      el.classList.toggle('hand-text-node', !!node.handText);
+      el.removeAttribute('data-decoration');
+      el.removeAttribute('data-shape-type');
+      el.removeAttribute('data-box-style');
+      el.removeAttribute('data-layer');
+      el.style.removeProperty('--decor-rotation');
+      el.style.removeProperty('--decor-opacity');
+      el.style.removeProperty('--decor-border');
+      el.style.removeProperty('--decor-fill');
+      el.style.removeProperty('--decor-border-width');
+      el.style.removeProperty('--decor-border-style');
+      el.style.removeProperty('--decor-border-dash');
+      el.style.removeProperty('--textbox-color');
+      el.style.removeProperty('--textbox-font-size');
+      el.style.removeProperty('--textbox-font-weight');
+      el.style.removeProperty('--textbox-text-align');
+      el.style.removeProperty('height');
+      if (node.mindmapStyleRole) {
+        el.dataset.mindmapRole = node.mindmapStyleRole;
+        el.dataset.mindmapSizeMode = node.mindmapSizeMode === 'custom' ? 'custom' : 'auto';
+        const mindmapTitle = String(node.text || node.name || '').trim();
+        if (mindmapTitle && mindmapTitle.length <= 6 && !/[\s\r\n]/.test(mindmapTitle)) el.dataset.mindmapShortTitle = '1';
+        else el.removeAttribute('data-mindmap-short-title');
+        if (Number(node.mindmapMinWidth) > 0) el.style.setProperty('--mindmap-min-width', Number(node.mindmapMinWidth) + 'px');
+        else el.style.removeProperty('--mindmap-min-width');
+        if (Number(node.mindmapMaxWidth) > 0) el.style.setProperty('--mindmap-max-width', Number(node.mindmapMaxWidth) + 'px');
+        else el.style.removeProperty('--mindmap-max-width');
+        if (Number(node.mindmapRadius) >= 0) el.style.setProperty('--mindmap-radius', Number(node.mindmapRadius) + 'px');
+        else el.style.removeProperty('--mindmap-radius');
+        if (Number(node.mindmapFontWeight) > 0) el.style.setProperty('--mindmap-font-weight', Number(node.mindmapFontWeight));
+        else el.style.removeProperty('--mindmap-font-weight');
+        if (node.mindmapTextAlign) el.style.setProperty('--mindmap-text-align', node.mindmapTextAlign);
+        else el.style.removeProperty('--mindmap-text-align');
+        if (Number(node.mindmapMinHeight) > 0) el.style.minHeight = Math.max(28, Math.min(600, Number(node.mindmapMinHeight))) + 'px';
+        else el.style.removeProperty('min-height');
+      } else {
+        el.removeAttribute('data-mindmap-role');
+        el.removeAttribute('data-mindmap-size-mode');
+        el.removeAttribute('data-mindmap-short-title');
+        el.style.removeProperty('--mindmap-min-width');
+        el.style.removeProperty('--mindmap-max-width');
+        el.style.removeProperty('--mindmap-radius');
+        el.style.removeProperty('--mindmap-font-weight');
+        el.style.removeProperty('--mindmap-text-align');
+        el.style.removeProperty('min-height');
+      }
+      const resizeHandles = el.querySelector('.decor-resize-handles');
+      if (resizeHandles) resizeHandles.remove();
+      // 正文节点支持手动尺寸：width 钉住外框宽度；bodyHeight 控制正文可见高度。
+      const staleBodyHandles = el.querySelector('.body-resize-handles');
+      if (staleBodyHandles && !isWidthResizableNode(node)) staleBodyHandles.remove();
+      if ((isBodyNode(node) || isIndexNode(node) || isMindmapWidthNode(node)) && Number(node.width) > 0) {
+        const w = Math.max(bodyMinWidth(node), Math.min(BODY_MAX_W, Math.round(Number(node.width))));
+        el.style.width = w + 'px';
+        el.style.minWidth = w + 'px';
+        el.style.maxWidth = w + 'px';
+      } else {
+        el.style.removeProperty('width');
+        el.style.removeProperty('min-width');
+        el.style.removeProperty('max-width');
+      }
+      if (isBodyHeightResizable(node) && Number(node.bodyHeight) > 0) {
+        const h = Math.max(BODY_MIN_H, Math.min(BODY_MAX_H, Math.round(Number(node.bodyHeight))));
+        el.style.setProperty('--node-body-height', h + 'px');
+      } else {
+        el.style.removeProperty('--node-body-height');
+      }
+      el.classList.toggle('node-chrome-hidden', !!node.hideChrome);
+      if (isIndexNode(node)) el.dataset.kind = 'index';
+      else if (isPreviewNode(node)) el.dataset.kind = 'preview';
+      else if (isCardNode(node)) el.dataset.kind = 'card';
+      else if (isCodeNode(node)) el.dataset.kind = 'code';
+      else if (isStickyNode(node)) el.dataset.kind = 'sticky';
+      else el.removeAttribute('data-kind');
+      if (node.shape && node.shape !== 'rect') el.dataset.shape = node.shape;
+      else el.removeAttribute('data-shape');
+      if (node.bgColor || node.opacity != null) {
+        const op = (node.opacity == null) ? 1 : node.opacity;
+        const rgba = hexToRgba(node.bgColor || '#ffffff', op);
+        if (rgba) el.style.setProperty('--node-bg', rgba);
+        else el.style.removeProperty('--node-bg');
+      } else {
+        el.style.removeProperty('--node-bg');
+      }
+      if (node.borderColor) el.style.setProperty('--node-border', node.borderColor);
+      else el.style.removeProperty('--node-border');
+      // 5-4 扩展：图案大小（编辑模式调；缺省 1 不写变量，保持原尺寸）
+      if (node.scale != null && node.scale !== 1) el.style.setProperty('--node-scale', node.scale);
+      else el.style.removeProperty('--node-scale');
+      if (Number(node.radius) >= 0) el.style.setProperty('--node-radius', Number(node.radius) + 'px');
+      else el.style.removeProperty('--node-radius');
+      if (Number(node.fontWeight) > 0) el.style.setProperty('--node-font-weight', Number(node.fontWeight));
+      else el.style.removeProperty('--node-font-weight');
+      if (node.textAlign) el.style.setProperty('--node-text-align', node.textAlign);
+      else el.style.removeProperty('--node-text-align');
+      if (Number(node.fontScale) > 0 && Number(node.fontScale) !== 1) el.style.setProperty('--node-font-scale', Number(node.fontScale));
+      else el.style.removeProperty('--node-font-scale');
+      // 长按删除线：持久态由 node.strike 决定（加载/重渲不带动画，仅长按切换时才带）
+      if (!el.classList.contains('strike-anim-out')) {
+        el.classList.toggle('node-struck', !!node.strike);
+      }
+    }
+
+    function decorationAssetUrl(node) {
+      return '/api/canvas-asset?path=' + encodeURIComponent(filePath)
+        + '&asset=' + encodeURIComponent(node.assetPath || '');
+    }
+
+    // ── 附件渲染：PDF（本地化 PDF.js）/ Markdown（MarkdownMini + MathJax）─────
+    // PDF.js、cmaps、字体均离线打包在 assets/vendor/pdfjs/，封进 EXE 也照常工作。
+    const PDFJS_BASE = 'vendor/pdfjs/';
+    let pdfjsLibPromise = null;
+    const attachPdfState = new Map();   // node.id -> { doc, src, ratio, observer, token }
+    // ── MD 附件高光批注（伴生文件 <md>.annot.json，不改 .md 源码、不破坏哈希去重）──
+    // node.id -> { marks:[{start,end,hl,color,size}], loaded, base(净渲染HTML快照), saveTimer, srcFp, staleCleared }
+    // marks 的 start/end = "排版后、剔除公式" 的正文字符偏移。
+    // 注意：「外部打开」功能让 .md 正文可被外部编辑器改动，偏移不再永久稳定 → 用内容指纹 srcFp
+    //       兜底：标注存盘时记下当时正文指纹，加载时正文若已变（指纹不符）就整批丢弃失效标注。
+    const mdAnnotStore = new Map();
+    // 正文内容指纹：长度 + 轻量 32 位哈希。同内容必同指纹，改一个字就变 → 用来判断标注是否失效。
+    function mdContentFp(text) {
+      const s = String(text == null ? '' : text);
+      let h = 5381;
+      for (let i = 0; i < s.length; i++) { h = ((h << 5) + h + s.charCodeAt(i)) | 0; }
+      return s.length + ':' + (h >>> 0).toString(36);
+    }
+
+    function loadPdfjs() {
+      if (global.pdfjsLib) return Promise.resolve(global.pdfjsLib);
+      if (pdfjsLibPromise) return pdfjsLibPromise;
+      pdfjsLibPromise = new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = PDFJS_BASE + 'pdf.min.js';
+        s.onload = () => {
+          const lib = global.pdfjsLib;
+          if (!lib) { reject(new Error('PDF.js 未就绪')); return; }
+          lib.GlobalWorkerOptions.workerSrc = PDFJS_BASE + 'pdf.worker.min.js';
+          resolve(lib);
+        };
+        s.onerror = () => { pdfjsLibPromise = null; reject(new Error('PDF.js 加载失败')); };
+        document.head.appendChild(s);
+      });
+      return pdfjsLibPromise;
+    }
+
+    function cancelPdfRenderTask(holder) {
+      const task = holder && holder.__pdfRenderTask;
+      if (!task) return;
+      holder.__pdfRenderTask = null;
+      try { if (typeof task.cancel === 'function') task.cancel(); } catch (e) {}
+    }
+    function cancelPdfTextRenderTask(holder) {
+      const task = holder && holder.__pdfTextRenderTask;
+      if (!task) return;
+      holder.__pdfTextRenderTask = null;
+      try { if (typeof task.cancel === 'function') task.cancel(); } catch (e) {}
+    }
+    function destroyPdfLoadingTask(task) {
+      if (!task || typeof task.destroy !== 'function') return;
+      try {
+        const pending = task.destroy();
+        if (pending && typeof pending.catch === 'function') pending.catch(function () {});
+      } catch (e) {}
+    }
+    function destroyPdfDocument(doc) {
+      if (!doc || typeof doc.destroy !== 'function') return;
+      try {
+        const pending = doc.destroy();
+        if (pending && typeof pending.catch === 'function') pending.catch(function () {});
+      } catch (e) {}
+    }
+    function isPdfRenderCancelled(err) {
+      return !!(err && (err.name === 'RenderingCancelledException' || /cancel/i.test(String(err.message || ''))));
+    }
+
+    function disposePdfAttachment(id) {
+      const st = attachPdfState.get(id);
+      if (!st) return;
+      if (st.observer) { try { st.observer.disconnect(); } catch (e) {} }
+      destroyPdfLoadingTask(st.loadingTask);
+      st.loadingTask = null;
+      const host = nodeMap.get(id);
+      if (host) host.querySelectorAll('.attach-page').forEach((pageEl) => {
+        cancelPdfRenderTask(pageEl);
+        pageEl.querySelectorAll('canvas').forEach((canvas) => { canvas.width = 0; canvas.height = 0; });
+      });
+      destroyPdfDocument(st.doc);
+      attachPdfState.delete(id);
+    }
+    function disposeAttachment(id) {
+      disposeMdAnnot(id);   // MD 附件：清掉高光批注的内存状态与待存定时器
+      disposePdfAttachment(id);
+    }
+
+    function isCurrentAttachmentBody(id, body) {
+      const host = nodeMap.get(id);
+      return !!(host && body && body.isConnected && host.contains(body));
+    }
+
+    function renderAttachment(content, el, node) {
+      el.dataset.attachKind = node.kind;
+      const src = decorationAssetUrl(node);
+      if (content.dataset.attachSrc === src) return;   // 幂等：缩放/重渲不重建内容
+      disposeAttachment(node.id);       // 资源已更换：先释放旧文档/监听，避免新资源载入失败时旧状态悬空
+      content.dataset.attachSrc = src;
+      content.innerHTML = '';
+      const head = document.createElement('div');
+      head.className = 'attach-head';
+      head.title = node.name || '';
+      head.innerHTML = '<span class="attach-badge">' + (isPdfNode(node) ? 'PDF' : 'MD') + '</span>'
+        + '<span class="attach-name"></span>';
+      head.querySelector('.attach-name').textContent = node.name
+        || (isPdfNode(node) ? 'PDF 文档' : 'Markdown 文档');
+      const body = document.createElement('div');
+      body.className = 'attach-body';
+      content.appendChild(head);
+      content.appendChild(body);
+      if (isPdfNode(node)) renderPdfInto(body, node, src);
+      else renderMdInto(body, node, src);
+    }
+
+    function renderMdInto(body, node, src) {
+      body.classList.add('attach-md');
+      body.innerHTML = '<div class="attach-status">正在载入…</div>';
+      fetch(src).then((r) => r.ok ? r.text() : Promise.reject(new Error('读取失败'))).then((text) => {
+        // 快照重建/资源更换可能让旧 fetch 比新 fetch 更晚返回。旧 body 已脱离当前节点时
+        // 立即丢弃结果，不让它回写 mdAnnotStore 或继续排队 MathJax/Mermaid。
+        if (!isCurrentAttachmentBody(node.id, body)) return;
+        const fp = mdContentFp(text);            // 当前正文指纹，用于校验/失效旧标注
+        const md = global.MarkdownMini;
+        const html = md ? md.render(text)
+          : ('<pre>' + text.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])) + '</pre>');
+        body.innerHTML = '<div class="attach-md-body node-text">' + html + '</div>';
+        const mathBody = body.querySelector('.attach-md-body');
+        if (mathBody && hasMathSource(text)) mathBody.dataset.hasMath = '1';
+        // Mermaid 与公式都完成后再捕获净快照；否则无公式附件会先保存
+        // loading/source 占位，后续套批注时把已经画好的 SVG 洗回占位。
+        const mermaidDone = renderMermaidDiagrams(mathBody);
+        whenMathReady(() => {
+          if (!isCurrentAttachmentBody(node.id, body)) return;
+          Promise.all([
+            Promise.resolve(typesetMath(mathBody)),
+            mermaidDone || Promise.resolve(),
+          ]).then(() => {
+            if (!isCurrentAttachmentBody(node.id, body)) return;
+            const inner = body.querySelector('.attach-md-body');
+            if (!inner) return;
+            mdAnnotBase(node.id, inner.innerHTML);   // 净快照（无批注）→ 改批注时还原再重套，避免嵌套脏化
+            loadMdAnnot(node, fp).then(() => {
+              const st = mdAnnotState(node.id);
+              if (st.staleCleared) { st.staleCleared = false; flushMdAnnotSave(node.id); }  // 正文已变 → 写回空标注
+              renderMdMarks(node.id);
+            });
+          });
+        }, mathBody);
+      }).catch((err) => {
+        if (!isCurrentAttachmentBody(node.id, body)) return;
+        body.innerHTML = '<div class="attach-status attach-error">Markdown 载入失败</div>';
+        console.warn('[画布] Markdown 载入失败', err);
+      });
+    }
+
+    // ── MD 高光批注：偏移工具 / 存取 / 渲染 / 工具栏 ──────────────────────
+    function mdAnnotState(id) {
+      let st = mdAnnotStore.get(id);
+      if (!st) { st = { marks: [], strokes: [], boxes: [], loaded: false, base: null, saveTimer: null, srcFp: null, staleCleared: false }; mdAnnotStore.set(id, st); }
+      if (!Array.isArray(st.strokes)) st.strokes = [];   // 旧状态向后兼容
+      if (!Array.isArray(st.boxes)) st.boxes = [];
+      return st;
+    }
+    function mdAnnotBase(id, html) { mdAnnotState(id).base = html; }
+    function disposeMdAnnot(id) {
+      const st = mdAnnotStore.get(id);
+      if (st && st.saveTimer) clearTimeout(st.saveTimer);
+      mdAnnotStore.delete(id);
+    }
+    // 正文内可计入偏移的文本节点（排除公式和 Mermaid 图表子树，保证偏移与渲染一致）。
+    function mdTextNodes(root) {
+      const out = [];
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+        acceptNode(n) {
+          if (!n.nodeValue) return NodeFilter.FILTER_REJECT;
+          let p = n.parentNode;
+          while (p && p !== root) {
+            const tag = p.nodeName && p.nodeName.toLowerCase();
+            if (tag === 'mjx-container') return NodeFilter.FILTER_REJECT;
+            if (p.classList && p.classList.contains('mermaid-diagram')) return NodeFilter.FILTER_REJECT;
+            p = p.parentNode;
+          }
+          return NodeFilter.FILTER_ACCEPT;
+        },
+      });
+      let n; while ((n = walker.nextNode())) out.push(n);
+      return out;
+    }
+    // 选区端点 → 排除公式后的字符偏移（克隆边界前内容、剔除公式、数文本长度）。
+    function mdCharOffset(root, container, offset) {
+      const r = document.createRange();
+      r.setStart(root, 0);
+      r.setEnd(container, offset);
+      const frag = r.cloneContents();
+      if (frag.querySelectorAll) frag.querySelectorAll('mjx-container, .mermaid-diagram').forEach((el) => el.remove());
+      return (frag.textContent || '').length;
+    }
+    function mdSelOffsets(root) {
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
+      const range = sel.getRangeAt(0);
+      if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) return null;
+      const start = mdCharOffset(root, range.startContainer, range.startOffset);
+      const end = mdCharOffset(root, range.endContainer, range.endOffset);
+      if (end <= start) return null;
+      return { start, end };
+    }
+    function setMdSelection(root, start, end) {
+      const nodes = mdTextNodes(root);
+      const r = document.createRange();
+      let base = 0, okS = false, okE = false;
+      for (let i = 0; i < nodes.length; i++) {
+        const len = nodes[i].nodeValue.length;
+        if (!okS && start >= base && start <= base + len) { r.setStart(nodes[i], start - base); okS = true; }
+        if (okS && end >= base && end <= base + len) { r.setEnd(nodes[i], end - base); okE = true; break; }
+        base += len;
+      }
+      if (okS && okE) { const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r); }
+    }
+    // 当前选区落在哪个 MD 附件正文里（用于工具栏路由）。
+    function currentMdAnnotContext() {
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
+      const range = sel.getRangeAt(0);
+      let el = range.commonAncestorContainer;
+      if (el.nodeType === 3) el = el.parentNode;
+      const body = el && el.closest ? el.closest('.attach-md-body') : null;
+      if (!body) return null;
+      const host = body.closest('.decor-object');
+      // 小框：从 .decor-object 取 nodeId；放大浮层：浮层正文不在 .decor-object 里，归到当前阅读的附件。
+      const nodeId = host && host.dataset ? host.dataset.id
+        : (mdReaderOpen && mdReader && mdReader.contains(body) ? mdReaderNodeId : null);
+      if (!nodeId) return null;
+      return { nodeId, body };
+    }
+    // currentFp：当前正文的内容指纹。加载到的标注若是针对旧版正文做的（存的指纹与当前不符），
+    // 说明正文已被外部编辑器改过 → 偏移已失效 → 整批丢弃，并打 staleCleared 让上层把空标注写回。
+    function loadMdAnnot(node, currentFp) {
+      const st = mdAnnotState(node.id);
+      if (typeof currentFp === 'string') st.srcFp = currentFp;   // 记下当前指纹，保存时写回伴生文件
+      if (st.loaded) return Promise.resolve();
+      return fetch('/api/canvas-annotation?path=' + encodeURIComponent(filePath)
+        + '&asset=' + encodeURIComponent(node.assetPath || ''))
+        .then((r) => r.json()).then((res) => {
+          const ann = res && res.annotation;
+          let marks = (ann && Array.isArray(ann.marks)) ? ann.marks.filter((m) => m && m.end > m.start) : [];
+          // 手绘笔迹按内容框归一化坐标存，与正文字符偏移无关 → 不随正文改动失效。
+          const strokes = (ann && Array.isArray(ann.strokes)) ? ann.strokes.filter((s) => s && Array.isArray(s.pts) && s.pts.length) : [];
+          const boxes = (ann && Array.isArray(ann.boxes)) ? ann.boxes.filter((b) => b && b.w > 0 && b.h > 0) : [];
+          const savedFp = ann && ann.src;
+          if (savedFp != null && typeof currentFp === 'string' && savedFp !== currentFp && marks.length) {
+            marks = [];                 // 正文已变，旧（依赖字符偏移的）文字标注全部失效
+            st.staleCleared = true;     // 通知上层：把空标注写回，清掉失效伴生数据
+          }
+          st.marks = marks;
+          st.strokes = strokes;
+          st.boxes = boxes;
+          st.loaded = true;
+        }).catch(() => { st.loaded = true; });
+    }
+    function scheduleMdAnnotSave(nodeId) {
+      const st = mdAnnotState(nodeId);
+      if (st.saveTimer) clearTimeout(st.saveTimer);
+      st.saveTimer = setTimeout(() => flushMdAnnotSave(nodeId), 600);
+    }
+    function flushMdAnnotSave(nodeId) {
+      const st = mdAnnotStore.get(nodeId);
+      if (st && st.saveTimer) { clearTimeout(st.saveTimer); st.saveTimer = null; }
+      const node = findNode(nodeId);
+      if (!node || !st) return;
+      fetch('/api/save-canvas-annotation', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: filePath, asset: node.assetPath, data: { version: 1, src: st.srcFp || null, marks: st.marks, strokes: st.strokes || [], boxes: st.boxes || [] } }),
+      }).then((r) => r.json()).then((res) => {
+        if (!res || !res.ok) console.warn('[画布] MD 批注保存失败', res && res.error);
+      }).catch((err) => { console.warn('[画布] MD 批注保存失败', err); });
+    }
+    function mdStyleAt(marks, pos) {
+      for (let i = 0; i < marks.length; i++) {
+        const m = marks[i];
+        if (pos >= m.start && pos < m.end) return { hl: m.hl || null, color: m.color || null, size: m.size || null };
+      }
+      return { hl: null, color: null, size: null };
+    }
+    // 给 [s,e] 设/清某个样式字段，保持 marks 非重叠（按断点重切 + 合并相邻同样式）。
+    function applyMdField(marks, s, e, field, value) {
+      if (e <= s) return marks;
+      const pts = new Set([s, e]);
+      marks.forEach((m) => { pts.add(m.start); pts.add(m.end); });
+      const sorted = [...pts].sort((a, b) => a - b);
+      const segs = [];
+      for (let i = 0; i < sorted.length - 1; i++) {
+        const a = sorted[i], b = sorted[i + 1];
+        if (b <= a) continue;
+        const sty = mdStyleAt(marks, a);
+        if (a >= s && b <= e) sty[field] = value;
+        if (sty.hl || sty.color || sty.size) segs.push({ start: a, end: b, hl: sty.hl, color: sty.color, size: sty.size });
+      }
+      const merged = [];
+      segs.forEach((sg) => {
+        const last = merged[merged.length - 1];
+        if (last && last.end === sg.start && last.hl === sg.hl && last.color === sg.color && last.size === sg.size) last.end = sg.end;
+        else merged.push(sg);
+      });
+      return merged;
+    }
+    // 字母色码 → CSS 用的全名（与 markdown.js 渲染保持完全一致）。
+    const MD_HL_NAME = { y: 'yellow', b: 'blue', g: 'green', r: 'red', p: 'purple' };
+    const MD_TC_NAME = { r: 'red', b: 'blue', g: 'green', o: 'orange', p: 'purple' };
+    function buildMdStyledSpan(text, m) {
+      let cur = document.createTextNode(text);
+      if (m.size) { const sp = document.createElement('span'); sp.className = 'md-size'; sp.dataset.fs = m.size; sp.appendChild(cur); cur = sp; }
+      if (m.color) { const sp = document.createElement('span'); sp.className = 'md-color'; sp.dataset.tc = MD_TC_NAME[m.color] || 'red'; sp.appendChild(cur); cur = sp; }
+      if (m.hl) { const mk = document.createElement('mark'); mk.dataset.hl = MD_HL_NAME[m.hl] || 'yellow'; mk.appendChild(cur); cur = mk; }
+      const holder = document.createElement('span');
+      holder.className = 'md-annot-span';
+      holder.appendChild(cur);
+      return holder;
+    }
+    // 还原净快照 → 把所有 marks 套回正文（先量好所有 node 偏移，再统一改写，避免改一处错乱后续偏移）。
+    // 抽成「对任意正文容器渲染」：小框与放大浮层共用——marks 按内容字符偏移存，容器无关。
+    function applyMarksToBody(inner, baseHtml, marks) {
+      if (!inner) return;
+      if (baseHtml != null) inner.innerHTML = baseHtml;   // 回到无批注的净 DOM
+      if (!marks || !marks.length) return;
+      const nodes = mdTextNodes(inner);
+      let base = 0;
+      const plan = nodes.map((n) => { const r = { node: n, start: base, end: base + n.nodeValue.length }; base += n.nodeValue.length; return r; });
+      plan.forEach((p) => {
+        const overlaps = marks.filter((m) => m.start < p.end && m.end > p.start);
+        if (!overlaps.length) return;
+        const full = p.node.nodeValue;
+        const frag = document.createDocumentFragment();
+        let cursor = 0;
+        overlaps.map((m) => ({ from: Math.max(0, m.start - p.start), to: Math.min(full.length, m.end - p.start), m }))
+          .sort((a, b) => a.from - b.from)
+          .forEach((lm) => {
+            if (lm.from > cursor) frag.appendChild(document.createTextNode(full.slice(cursor, lm.from)));
+            frag.appendChild(buildMdStyledSpan(full.slice(lm.from, lm.to), lm.m));
+            cursor = lm.to;
+          });
+        if (cursor < full.length) frag.appendChild(document.createTextNode(full.slice(cursor)));
+        if (p.node.parentNode) p.node.parentNode.replaceChild(frag, p.node);
+      });
+    }
+    // 渲染小框正文里的高光（基准 = 小框净快照 st.base）。
+    function renderMdMarks(nodeId) {
+      const el = nodeMap.get(nodeId);
+      const st = mdAnnotStore.get(nodeId);
+      if (!el || !st) return;
+      applyMarksToBody(el.querySelector('.attach-md-body'), st.base, st.marks);
+    }
+    // 渲染放大浮层正文里的高光（基准 = 浮层自己的净快照 mdReaderBase）。
+    function renderMdReaderMarks() {
+      if (!mdReaderOpen || !mdReader) return;
+      const st = mdAnnotStore.get(mdReaderNodeId);
+      if (!st) return;
+      const content = mdReader.querySelector('[data-role="md-reader-content"]');
+      applyMarksToBody(mdReader.querySelector('.attach-md-body'), mdReaderBase, st.marks);
+      buildReaderToc(mdReader.querySelector('[data-role="md-reader-toc"]'), content,
+        mdReader.querySelector('[data-role="md-reader-scroll"]'), true);
+    }
+    // 工具栏点击 → 给当前 MD 选区设/清一个样式字段，落标 + 渲染 + 防抖保存 + 恢复选区。
+    function applyMdAnnot(ctx, field, value) {
+      const off = mdSelOffsets(ctx.body);
+      if (!off) return;
+      if (mdReaderOpen && mdReaderNodeId === ctx.nodeId) pushMdHistory();   // 浮层内：可 Ctrl+Z 撤销选区高光
+      const st = mdAnnotState(ctx.nodeId);
+      st.marks = applyMdField(st.marks, off.start, off.end, field, value);
+      renderMdMarks(ctx.nodeId);                       // 同步小框（浮层背后那张）
+      if (mdReaderOpen && mdReaderNodeId === ctx.nodeId) renderMdReaderMarks();   // 再刷浮层
+      scheduleMdAnnotSave(ctx.nodeId);
+      setMdSelection(ctx.body, off.start, off.end);   // 保住选区，可连续叠样式（在 ctx.body 重渲后的新 DOM 上）
+      scheduleSelToolbar();
+    }
+
+    function renderPdfInto(body, node, src) {
+      body.innerHTML = '<div class="attach-status">正在载入 PDF…</div>';
+      const id = node.id;
+      let state = null;
+      loadPdfjs().then((lib) => {
+        // PDF.js 脚本本身可能比节点生命周期更慢；已换资源时不再启动文档任务。
+        if (!isCurrentAttachmentBody(id, body)) return null;
+        const loadingTask = lib.getDocument({
+          url: src,
+          cMapUrl: PDFJS_BASE + 'cmaps/',
+          cMapPacked: true,
+          standardFontDataUrl: PDFJS_BASE + 'standard_fonts/',
+        });
+        state = { loadingTask: loadingTask, doc: null, src: src, ratio: 1.414, token: 0, observer: null };
+        attachPdfState.set(id, state);
+        return loadingTask.promise;
+      }).then((doc) => {
+        if (!doc) return;
+        // 节点可能已被快照重建，甚至同 id 的新 PDF 已开始加载。仅当前 state
+        // 仍占据该 id 时才接管文档；旧请求只销毁自己，绝不反向拆掉新文档。
+        if (attachPdfState.get(id) !== state) {
+          destroyPdfDocument(doc);
+          return;
+        }
+        if (!isCurrentAttachmentBody(id, body)) {
+          state.loadingTask = null;
+          state.doc = doc;
+          disposePdfAttachment(id);
+          return;
+        }
+        state.loadingTask = null;
+        state.doc = doc;
+        return doc.getPage(1).then((page) => {
+          if (attachPdfState.get(id) !== state) {
+            destroyPdfDocument(doc);
+            return;
+          }
+          if (!isCurrentAttachmentBody(id, body)) { disposePdfAttachment(id); return; }
+          const vp = page.getViewport({ scale: 1 });
+          state.ratio = vp.height / vp.width;
+          buildPdfPages(body, node);
+        });
+      }).catch((err) => {
+        if (state && attachPdfState.get(id) === state) disposePdfAttachment(id);
+        if (!isCurrentAttachmentBody(id, body)) return;
+        body.innerHTML = '<div class="attach-status attach-error">PDF 载入失败</div>';
+        console.warn('[画布] PDF 载入失败', err);
+      });
+    }
+
+    // 懒渲染：每页先占位（按首页比例估高），滚动进视野才栅格化，省内存、开页快。
+    function buildPdfPages(body, node) {
+      const st = attachPdfState.get(node.id);
+      if (!st || !st.doc) return;
+      body.innerHTML = '';
+      if (st.observer) { try { st.observer.disconnect(); } catch (e) {} }
+      const token = (st.token || 0) + 1;
+      st.token = token;
+      const observer = new IntersectionObserver((items) => {
+        items.forEach((it) => {
+          it.target.dataset.pdfVisible = it.isIntersecting ? '1' : '0';
+          if (it.isIntersecting) renderPdfPage(it.target, node);
+          else unloadPdfPage(it.target);   // 滚出缓冲带的页卸载位图、封顶内存；滚回会重渲
+        });
+      }, { root: body, rootMargin: '900px 0px' });   // 上下各留 ~900px 缓冲：邻近页常驻保证滚动顺滑，远处页才卸
+      st.observer = observer;
+      const guessW = Math.max(40, (Number(node.width) || 420) - 4);
+      for (let p = 1; p <= st.doc.numPages; p++) {
+        const pageEl = document.createElement('div');
+        pageEl.className = 'attach-page';
+        pageEl.dataset.page = String(p);
+        pageEl.style.height = Math.round(guessW * (st.ratio || 1.414)) + 'px';
+        body.appendChild(pageEl);
+        observer.observe(pageEl);
+      }
+    }
+
+    function renderPdfPage(pageEl, node) {
+      if (pageEl.dataset.rendered === '1' || pageEl.dataset.rendering === '1') return;
+      const st = attachPdfState.get(node.id);
+      if (!st || !st.doc) return;
+      const token = st.token;
+      const p = parseInt(pageEl.dataset.page, 10);
+      pageEl.dataset.rendering = '1';
+      st.doc.getPage(p).then((page) => {
+        if (attachPdfState.get(node.id) !== st || st.token !== token || !pageEl.isConnected
+          || pageEl.dataset.pdfVisible === '0') {
+          pageEl.dataset.rendering = '';
+          return;
+        }
+        const cssW = pageEl.clientWidth || Math.max(40, (Number(node.width) || 420) - 4);
+        const base = page.getViewport({ scale: 1 });
+        const dpr = Math.min(2, global.devicePixelRatio || 1);
+        const vp = page.getViewport({ scale: (cssW / base.width) * dpr });
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.round(vp.width);
+        canvas.height = Math.round(vp.height);
+        canvas.className = 'attach-page-canvas';
+        const ctx = canvas.getContext('2d');
+        const renderTask = page.render({ canvasContext: ctx, viewport: vp });
+        pageEl.__pdfRenderTask = renderTask;
+        return renderTask.promise.then(() => {
+          if (attachPdfState.get(node.id) !== st || st.token !== token || !pageEl.isConnected) {
+            canvas.width = 0; canvas.height = 0;
+            return;
+          }
+          pageEl.style.height = '';
+          pageEl.innerHTML = '';
+          pageEl.appendChild(canvas);
+          pageEl.dataset.rendered = '1';
+          pageEl.dataset.rendering = '';
+          // 快速滚动时，页面可在离开缓冲区后才完成栅格化。IO 不会再为“仍在区外”
+          // 补发一次回调，所以完成时再核对可见标志，防止脱屏 canvas 永久驻留。
+          if (pageEl.dataset.pdfVisible === '0') unloadPdfPage(pageEl);
+        }).finally(() => {
+          if (pageEl.__pdfRenderTask === renderTask) pageEl.__pdfRenderTask = null;
+        });
+      }).catch((err) => {
+        pageEl.dataset.rendering = '';
+        if (!isPdfRenderCancelled(err) && attachPdfState.get(node.id) === st
+          && st.token === token && pageEl.isConnected) {
+          console.warn('[画布] PDF 页渲染失败', err);
+        }
+      });
+    }
+
+    // 滚出视野缓冲带的 PDF 页：清掉 canvas 位图释放内存，但保留占位高度（不塌、不跳）；
+    // 滚回时由 IntersectionObserver 再触发 renderPdfPage 重新栅格化。
+    function unloadPdfPage(pageEl) {
+      if (!pageEl) return;
+      cancelPdfRenderTask(pageEl);
+      if (pageEl.dataset.rendered !== '1') {
+        pageEl.dataset.rendering = '';
+        return;
+      }
+      const h = pageEl.clientHeight;
+      if (h > 0) pageEl.style.height = h + 'px';   // 先把当前高度固定成占位，清空内容也不引起滚动跳动
+      pageEl.querySelectorAll('canvas').forEach((canvas) => { canvas.width = 0; canvas.height = 0; });
+      pageEl.innerHTML = '';
+      pageEl.dataset.rendered = '';
+      pageEl.dataset.rendering = '';
+    }
+
+    // 缩放结束后，对当前可见且已渲染的 PDF 页按新宽度重新栅格化，恢复清晰度。
+    function recrispPdfNode(node) {
+      const st = attachPdfState.get(node.id);
+      const el = nodeMap.get(node.id);
+      if (!st || !el) return;
+      const body = el.querySelector('.attach-body');
+      if (!body) return;
+      const bodyRect = body.getBoundingClientRect();
+      body.querySelectorAll('.attach-page').forEach((pageEl) => {
+        if (pageEl.dataset.rendered !== '1') return;
+        const r = pageEl.getBoundingClientRect();
+        if (r.bottom > bodyRect.top - 400 && r.top < bodyRect.bottom + 400) {
+          pageEl.dataset.rendered = '';
+          renderPdfPage(pageEl, node);
+        }
+      });
+    }
+
+    function shapeMarkup(node) {
+      const type = node.shapeType || 'rounded-rect';
+      const fixedSvgInset = (px, size) => {
+        const basis = Math.max(1, Number(size) || 1);
+        return Math.max(0, Math.min(18, (px / basis) * 100));
+      };
+      const svgNum = (value) => Number(value).toFixed(3).replace(/\.?0+$/, '');
+      if (type === 'rect') return '<rect class="decor-fill" x="2" y="2" width="96" height="96"/>';
+      if (type === 'ellipse') return '<ellipse class="decor-fill" cx="50" cy="50" rx="47" ry="38"/>';
+      if (type === 'circle') return '<circle class="decor-fill" cx="50" cy="50" r="47"/>';
+      if (type === 'triangle') return '<polygon class="decor-fill" points="50,3 97,96 3,96"/>';
+      if (type === 'diamond') return '<polygon class="decor-fill" points="50,3 97,50 50,97 3,50"/>';
+      if (type === 'sketch-rounded-rect') return '<path class="decor-sketch-fill" d="M18.5 7.5 C35 5.4 67.5 5.2 81.8 7.6 C91.7 9.2 95.2 15.2 94.3 28.7 C93.6 43.4 94.9 58.7 93.3 73.4 C91.6 87.4 84.1 93.5 70.7 93.2 C53.5 92.9 36.2 95.2 20.1 92.4 C10.8 90.7 6.5 83.6 6.7 70.4 C7.1 56.8 5.9 41.8 6.7 28.4 C7.5 15.7 10.5 8.7 18.5 7.5 Z"/>'
+        + '<path class="decor-sketch-line" d="M18.5 7.5 C35 5.4 67.5 5.2 81.8 7.6 C91.7 9.2 95.2 15.2 94.3 28.7 C93.6 43.4 94.9 58.7 93.3 73.4 C91.6 87.4 84.1 93.5 70.7 93.2 C53.5 92.9 36.2 95.2 20.1 92.4 C10.8 90.7 6.5 83.6 6.7 70.4 C7.1 56.8 5.9 41.8 6.7 28.4 C7.5 15.7 10.5 8.7 18.5 7.5 Z"/>';
+      if (type === 'sketch-diamond') return '<path class="decor-sketch-fill" d="M50.8 4.8 C61.9 17.8 77.3 35.6 95.3 49.4 C78.2 64.5 63.8 80.9 49.9 95.6 C36.6 79.8 20.7 65.7 4.9 50.1 C20.8 35.1 35.5 18.5 50.8 4.8 Z"/>'
+        + '<path class="decor-sketch-line" d="M50.8 4.8 C61.9 17.8 77.3 35.6 95.3 49.4 C78.2 64.5 63.8 80.9 49.9 95.6 C36.6 79.8 20.7 65.7 4.9 50.1 C20.8 35.1 35.5 18.5 50.8 4.8 Z"/>';
+      if (type === 'sketch-ellipse') return '<path class="decor-sketch-fill" d="M5.3 51.8 C4.6 24.5 24.3 8.2 50.8 8 C77.2 7.8 96.5 24.2 95.6 49.2 C94.8 75.3 75 91.2 48.7 91.9 C23.1 92.5 6.1 76.7 5.3 51.8 Z"/>'
+        + '<path class="decor-sketch-line" d="M5.3 51.8 C4.6 24.5 24.3 8.2 50.8 8 C77.2 7.8 96.5 24.2 95.6 49.2 C94.8 75.3 75 91.2 48.7 91.9 C23.1 92.5 6.1 76.7 5.3 51.8 Z"/>';
+      if (type === 'arrow') return '<path class="decor-fill" d="M3 37 H61 V17 L97 50 L61 83 V63 H3 Z"/>';
+      if (type === 'divider') return '<path class="decor-stroke" d="M3 50 H97"/>';
+      if (type === 'dashed-box') return '<rect class="decor-dashed-box" x="4" y="7" width="92" height="86" rx="10"/>';
+      if (type === 'group-box') {
+        const x = fixedSvgInset(8, node.width || 340);
+        const y = fixedSvgInset(8, node.height || 230);
+        return '<rect class="decor-group-box" x="' + svgNum(x) + '" y="' + svgNum(y)
+          + '" width="' + svgNum(100 - x * 2) + '" height="' + svgNum(100 - y * 2) + '" rx="2"/>';
+      }
+      if (type === 'color-block') return '<rect class="decor-color-block" x="2" y="2" width="96" height="96" rx="8"/>';
+      if (type === 'pill') return '<rect class="decor-pill" x="5" y="22" width="90" height="56" rx="28"/>'
+        + '<circle class="decor-pill-dot" cx="26" cy="50" r="6"/>';
+      if (type === 'corner-frame') return '<path class="decor-corner-frame" d="M7 34 V7 H34 M66 7 H93 V34 M93 66 V93 H66 M34 93 H7 V66"/>';
+      if (type === 'bracket') return '<path class="decor-bracket" d="M30 7 H10 V93 H30 M70 7 H90 V93 H70"/>';
+      if (type === 'question') return '<circle class="decor-question-bg" cx="50" cy="50" r="43"/>'
+        + '<text class="decor-question-mark" x="50" y="57" text-anchor="middle">?</text>';
+      if (type === 'slider') {
+        const progress = Math.max(0, Math.min(100, node.progress == null ? 50 : Number(node.progress)));
+        const fillHeight = progress * 0.92;
+        const y = 96 - fillHeight;
+        return '<rect class="decor-slider-track" x="38" y="4" width="24" height="92" rx="12"/>'
+          + '<rect class="decor-slider-progress" x="38" y="' + y + '" width="24" height="' + fillHeight + '" rx="12"/>';
+      }
+      return '<rect class="decor-fill" x="2" y="2" width="96" height="96" rx="14"/>';
+    }
+
+    function syncSemanticGroupControl(el, node) {
+      let button = el.querySelector('.group-collapse-btn');
+      const members = Array.isArray(node.groupMemberIds) ? node.groupMemberIds : [];
+      if (!isGroupBoxNode(node) || !members.length) {
+        if (button) button.remove();
+        el.classList.remove('semantic-group', 'group-collapsed');
+        return;
+      }
+      if (!button) {
+        button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'group-collapse-btn';
+        button.addEventListener('mousedown', (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+        });
+        el.appendChild(button);
+      }
+      el.classList.add('semantic-group');
+      el.classList.toggle('group-collapsed', !!node.groupCollapsed);
+      button.textContent = (node.groupCollapsed ? '+' : '−') + ' ' + members.length;
+      button.title = node.groupCollapsed ? '展开分组' : '折叠分组';
+      button.setAttribute('aria-label', button.title + '，共 ' + members.length + ' 个节点');
+    }
+
+    function renderDecoration(el, node) {
+      let content = el.querySelector('.decor-content');
+      if (!content) {
+        content = document.createElement('div');
+        content.className = 'decor-content';
+        el.appendChild(content);
+      }
+      if (isTextBoxNode(node)) {
+        renderTextBox(content, node);
+      } else if (isImageNode(node)) {
+        let img = content.querySelector('.decor-image');
+        if (!img) {
+          content.innerHTML = '';
+          img = document.createElement('img');
+          img.className = 'decor-image';
+          img.alt = '';
+          img.draggable = false;
+          content.appendChild(img);
+        }
+        const src = decorationAssetUrl(node);
+        if (img.dataset.source !== src) {
+          img.dataset.source = src;
+          img.src = src;
+        }
+      } else if (isAttachmentNode(node)) {
+        renderAttachment(content, el, node);
+      } else {
+        const markup = '<svg class="decor-svg" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">'
+          + shapeMarkup(node) + '</svg>';
+        if (content.dataset.source !== markup) {
+          content.dataset.source = markup;
+          content.innerHTML = markup;
+        }
+      }
+      let title = el.querySelector('.decor-box-title');
+      if (isGroupBoxNode(node)) {
+        if (!title) {
+          title = document.createElement('div');
+          title.className = 'decor-box-title';
+          title.setAttribute('role', 'button');
+          title.tabIndex = 0;
+          title.addEventListener('mousedown', (e) => {
+            if (e.button !== 0 || editingDecorTitleId === node.id) return;
+            e.preventDefault();
+            e.stopPropagation();
+            if (isSelectionToggleEvent(e)) suppressNextSelectionToggleClick(title);
+            stopDecorTitleLongPressTimer();
+            decorTitleLongPressTriggered = false;
+            decorTitleLongPressNodeId = node.id;
+            startNodeDrag(node, e);
+            if (drag && drag.mode === 'node') drag.fromDecorTitle = true;
+            prepareDecorTitleToolbar(node.id);
+            decorTitleLongPressTimer = setTimeout(() => {
+              if (!drag || drag.mode !== 'node' || !drag.fromDecorTitle || drag.moved) return;
+              if (editingDecorTitleId === node.id) return;
+              decorTitleLongPressTriggered = true;
+              selectNodes([node.id], false);
+              showDecorTitleToolbar(node.id);
+            }, 520);
+          });
+          title.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            stopDecorTitleLongPressTimer();
+            if (consumeSelectionToggleClick(title, e)) {
+              decorTitleLongPressTriggered = false;
+              return;
+            }
+            if (suppressDecorTitleClick) {
+              suppressDecorTitleClick = false;
+              decorTitleLongPressTriggered = false;
+              return;
+            }
+            if (decorTitleLongPressTriggered) {
+              decorTitleLongPressTriggered = false;
+              return;
+            }
+            enterDecorTitleEdit(node);
+          });
+          title.addEventListener('dblclick', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (consumeSelectionToggleClick(title, e)) return;
+            enterDecorTitleEdit(node);
+          });
+          el.appendChild(title);
+        }
+        if (editingDecorTitleId !== node.id) title.textContent = node.title || 'Untitled';
+        title.style.backgroundColor = node.borderColor || '#d6b96a';
+        title.style.color = node.titleColor || '#ffffff';
+      } else if (title) {
+        title.remove();
+      }
+      syncSemanticGroupControl(el, node);
+    }
+
+    function renderTextBox(content, node) {
+      if (content.dataset.textBoxReady !== '1') {
+        content.innerHTML = '';
+        const text = document.createElement('div');
+        text.className = 'text-box-content';
+        text.setAttribute('spellcheck', 'false');
+        content.appendChild(text);
+        content.dataset.textBoxReady = '1';
+      }
+      const text = content.querySelector('.text-box-content');
+      if (!text || editingTextBoxId === node.id) return;
+      const formatted = richSource(node, 'text');
+      if (node.boxStyle) text.innerHTML = renderDecorTextBoxHtml(formatted);
+      else {
+        const md = global.MarkdownMini;
+        const lines = formatted.replace(/\r\n?/g, '\n').split('\n');
+        if (md && typeof md.renderInline === 'function') {
+          text.innerHTML = lines.map(function (line) { return md.renderInline(line); }).join('<br>');
+        } else {
+          text.textContent = node.text || '';
+        }
+      }
+    }
+
+    function escapeDecorText(value) {
+      const md = global.MarkdownMini;
+      const source = String(value == null ? '' : value);
+      if (md && typeof md.escapeHtml === 'function') return md.escapeHtml(source);
+      return source.replace(/[&<>"]/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+      });
+    }
+
+    function renderDecorInlineText(value) {
+      const md = global.MarkdownMini;
+      if (md && typeof md.renderInline === 'function') return md.renderInline(value);
+      return escapeDecorText(value)
+        .replace(/`([^`]+)`/g, '<code>$1</code>')
+        .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    }
+
+    function renderDecorTextBoxHtml(raw) {
+      const lines = String(raw || '').replace(/\r\n?/g, '\n').split('\n');
+      if (!lines.length) return '';
+      return lines.map(function (line) {
+        const text = line.trim();
+        if (!text) return '<div class="decor-note-line decor-note-blank"><br></div>';
+        if (/^-{3,}$/.test(text)) return '<hr class="decor-note-rule">';
+        let m = text.match(/^##\s+(.+)$/);
+        if (m) return '<div class="decor-note-heading decor-note-heading-small">' + renderDecorInlineText(m[1]) + '</div>';
+        m = text.match(/^#\s+(.+)$/);
+        if (m) return '<div class="decor-note-heading">' + renderDecorInlineText(m[1]) + '</div>';
+        m = text.match(/^(?:[-*•]\s+)(.*)$/);
+        if (m) {
+          return '<div class="decor-note-line decor-note-bullet"><span class="decor-note-dot"></span><span>'
+            + renderDecorInlineText(m[1]) + '</span></div>';
+        }
+        return '<div class="decor-note-line">' + renderDecorInlineText(line) + '</div>';
+      }).join('');
+    }
+
+    function textBoxContentEl(nodeId) {
+      const el = nodeMap.get(nodeId);
+      return el && el.querySelector('.text-box-content');
+    }
+
+    function toggleTextBoxBulletLine(textEl, remove) {
+      if (!textEl || !textEl.isContentEditable) return false;
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0) return false;
+      const range = sel.getRangeAt(0);
+      if (!textEl.contains(range.startContainer)) return false;
+      const text = textEl.textContent || '';
+      const pos = ceCharOffset(textEl, range.startContainer, range.startOffset);
+      const lineStart = text.lastIndexOf('\n', Math.max(0, pos - 1)) + 1;
+      const nextBreak = text.indexOf('\n', pos);
+      const lineEnd = nextBreak < 0 ? text.length : nextBreak;
+      const line = text.slice(lineStart, lineEnd);
+      const bullet = line.match(/^(\s*)(?:[•*-]\s+)/);
+      let nextText = text;
+      let nextPos = pos;
+      if (remove) {
+        if (!bullet) return true;
+        const cutStart = lineStart + bullet[1].length;
+        const cutEnd = lineStart + bullet[0].length;
+        nextText = text.slice(0, cutStart) + text.slice(cutEnd);
+        nextPos = Math.max(cutStart, pos - (cutEnd - cutStart));
+      } else if (!bullet) {
+        nextText = text.slice(0, lineStart) + '• ' + text.slice(lineStart);
+        nextPos = pos + 2;
+      }
+      textEl.textContent = nextText;
+      setNodeSelection(textEl, nextPos, nextPos);
+      return true;
+    }
+
+    function decorTitleEl(nodeId) {
+      const el = nodeMap.get(nodeId);
+      return el && el.querySelector('.decor-box-title');
+    }
+
+    function stopDecorTitleLongPressTimer() {
+      if (decorTitleLongPressTimer) {
+        clearTimeout(decorTitleLongPressTimer);
+        decorTitleLongPressTimer = null;
+      }
+      decorTitleLongPressNodeId = null;
+    }
+
+    function stopNodeStrikeLongPressTimer() {
+      if (nodeStrikeLongPressTimer) {
+        clearTimeout(nodeStrikeLongPressTimer);
+        nodeStrikeLongPressTimer = null;
+      }
+    }
+
+    // 长按节点切换“删除线”：node.strike 持久存进 .canvas；带从左到右画出 / 收回的过渡动画。
+    function toggleNodeStrike(node) {
+      if (!node || isDecorationNode(node)) return;
+      pushHistory();
+      const el = nodeMap.get(node.id);
+      if (node.strike) {
+        delete node.strike;
+        if (el) {
+          el.classList.remove('strike-anim-in');
+          el.classList.add('strike-anim-out');
+          const ref = el;
+          setTimeout(() => {
+            ref.classList.remove('strike-anim-out');
+            const cur = findNode(node.id);
+            if (!cur || !cur.strike) ref.classList.remove('node-struck');
+          }, 280);
+        }
+      } else {
+        node.strike = true;
+        if (el) {
+          el.classList.remove('strike-anim-out');
+          el.classList.add('node-struck', 'strike-anim-in');
+          const ref = el;
+          setTimeout(() => ref.classList.remove('strike-anim-in'), 380);
+        }
+      }
+      notify();
+    }
+
+    function enterDecorTitleEdit(node) {
+      if (!isGroupBoxNode(node)) return;
+      const title = decorTitleEl(node.id);
+      if (!title) return;
+      if (editingDecorTitleId && editingDecorTitleId !== node.id) commitDecorTitleEdit();
+      activeDecorTitleNodeId = null;
+      hideSelToolbar();
+      editingDecorTitleId = node.id;
+      editingDecorTitleOriginal = node.title || 'Untitled';
+      selectNodes([node.id], false);
+      title.classList.add('editing');
+      title.contentEditable = 'plaintext-only';
+      title.textContent = editingDecorTitleOriginal;
+      title.focus();
+      const range = document.createRange();
+      range.selectNodeContents(title);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+
+    function commitDecorTitleEdit() {
+      if (!editingDecorTitleId) return;
+      const node = findNode(editingDecorTitleId);
+      const title = decorTitleEl(editingDecorTitleId);
+      if (node && title) {
+        const next = (title.textContent || '').trim() || 'Untitled';
+        node.title = next;
+        title.textContent = next;
+        title.contentEditable = 'false';
+        title.classList.remove('editing');
+        if (next !== editingDecorTitleOriginal) {
+          pushHistory();
+          notify();
+        }
+      }
+      editingDecorTitleId = null;
+      editingDecorTitleOriginal = '';
+    }
+
+    function cancelDecorTitleEdit() {
+      if (!editingDecorTitleId) return;
+      const title = decorTitleEl(editingDecorTitleId);
+      if (title) {
+        title.textContent = editingDecorTitleOriginal || 'Untitled';
+        title.contentEditable = 'false';
+        title.classList.remove('editing');
+      }
+      editingDecorTitleId = null;
+      editingDecorTitleOriginal = '';
+    }
+
+    function placeEditableCaretFromPoint(text, clientX, clientY) {
+      if (!text || !Number.isFinite(clientX) || !Number.isFinite(clientY)) return false;
+      let range = null;
+      if (typeof document.caretPositionFromPoint === 'function') {
+        const position = document.caretPositionFromPoint(clientX, clientY);
+        if (position) {
+          range = document.createRange();
+          range.setStart(position.offsetNode, position.offset);
+          range.collapse(true);
+        }
+      } else if (typeof document.caretRangeFromPoint === 'function') {
+        range = document.caretRangeFromPoint(clientX, clientY);
+      }
+      if (range && (range.startContainer === text || text.contains(range.startContainer))) {
+        const selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+        return true;
+      }
+      // 极旧 WebView 没有坐标命中 API 时，至少让文字左侧落到开头、右侧落到末尾。
+      const rect = text.getBoundingClientRect();
+      range = document.createRange();
+      range.selectNodeContents(text);
+      range.collapse(clientX <= rect.left + rect.width / 2);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      return true;
+    }
+
+    function prepareRichEditable(el) {
+      if (!el || el.dataset.richEditorReady === '1') return;
+      el.dataset.richEditorReady = '1';
+      el.addEventListener('beforeinput', function (event) {
+        if (event.inputType !== 'insertParagraph' && event.inputType !== 'insertLineBreak') return;
+        event.preventDefault();
+        document.execCommand('insertText', false, '\n');
+      });
+      el.addEventListener('paste', function (event) {
+        const text = event.clipboardData && event.clipboardData.getData('text/plain');
+        if (text == null) return;
+        event.preventDefault();
+        document.execCommand('insertText', false, text.replace(/\r\n?/g, '\n'));
+      });
+      el.addEventListener('drop', function (event) {
+        const text = event.dataTransfer && event.dataTransfer.getData('text/plain');
+        if (!text) return;
+        event.preventDefault();
+        document.execCommand('insertText', false, text.replace(/\r\n?/g, '\n'));
+      });
+    }
+
+    function setRichEditable(el, text, marks) {
+      if (!el) return;
+      prepareRichEditable(el);
+      if (RichText) RichText.renderEditable(el, String(text || ''), marks || []);
+      else el.textContent = String(text || '');
+    }
+
+    function readRichEditable(el) {
+      if (!el) return { text: '', marks: [] };
+      if (RichText) return RichText.extractEditable(el);
+      return { text: el.textContent || '', marks: [] };
+    }
+
+    function canonicalRichDraft(draft) {
+      const text = String(draft && draft.text || '');
+      const marks = draft && Array.isArray(draft.marks) ? draft.marks : [];
+      if (!RichText) return { text: text, marks: [] };
+      // 用户或 AI 仍可输入旧增强语法；退出编辑时统一转成纯文字 + 区间格式。
+      // 先序列化已有 DOM 格式再整体解析，能同时保住“已有格式”和“新输入语法”。
+      const parsed = RichText.parseLegacy(RichText.serialize(text, marks));
+      return { text: parsed.text, marks: parsed.marks };
+    }
+
+    function enterTextBoxEdit(node, isNew, caretPoint) {
+      if (!isTextBoxNode(node)) return;
+      if (editingNodeId !== null) commitNodeEdit();
+      if (editingEdgeId !== null) commitEdgeEdit();
+      if (editingDecorTitleId !== null) commitDecorTitleEdit();
+      if (editingTextBoxId && editingTextBoxId !== node.id) commitTextBoxEdit();
+      editingTextBoxId = node.id;
+      editingTextBoxOriginal = node.text || '';
+      editingTextBoxOriginalMarks = richMarks(node, 'text').map(function (mark) { return Object.assign({}, mark); });
+      editingTextBoxIsNew = !!isNew;
+      const el = nodeMap.get(node.id);
+      const text = textBoxContentEl(node.id);
+      if (!el || !text) return;
+      selectNodes([node.id], false);
+      el.classList.add('editing');
+      setRichEditable(text, editingTextBoxOriginal, editingTextBoxOriginalMarks);
+      text.contentEditable = 'true';
+      text.focus();
+      if (caretPoint && placeEditableCaretFromPoint(text, caretPoint.x, caretPoint.y)) return;
+      const range = document.createRange();
+      range.selectNodeContents(text);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+
+    function commitTextBoxEdit() {
+      if (!editingTextBoxId) return;
+      const id = editingTextBoxId;
+      const oldText = editingTextBoxOriginal;
+      const oldMarks = editingTextBoxOriginalMarks;
+      const wasNew = editingTextBoxIsNew;
+      editingTextBoxId = null;
+      editingTextBoxOriginal = '';
+      editingTextBoxOriginalMarks = [];
+      editingTextBoxIsNew = false;
+      const node = findNode(id);
+      const el = nodeMap.get(id);
+      const text = textBoxContentEl(id);
+      if (!node || !el || !text) return;
+      const draft = canonicalRichDraft(readRichEditable(text));
+      const leading = (draft.text.match(/^\s*/) || [''])[0].length;
+      const trailing = (draft.text.match(/\s*$/) || [''])[0].length;
+      const next = draft.text.slice(leading, Math.max(leading, draft.text.length - trailing)) || '文字';
+      const nextMarks = RichText ? RichText.slice(draft.text, draft.marks, leading, draft.text.length - trailing) : [];
+      node.text = next;
+      storeRichMarks(node, 'text', nextMarks);
+      text.contentEditable = 'false';
+      el.classList.remove('editing');
+      renderDecoration(el, node);
+      if (next !== oldText || JSON.stringify(nextMarks) !== JSON.stringify(oldMarks) || wasNew) {
+        pushHistory();
+        notify();
+      }
+      redrawMinimap();
+      scheduleTextDock();
+    }
+
+    function cancelTextBoxEdit() {
+      if (!editingTextBoxId) return;
+      const id = editingTextBoxId;
+      const wasNew = editingTextBoxIsNew;
+      const oldText = editingTextBoxOriginal;
+      const oldMarks = editingTextBoxOriginalMarks;
+      editingTextBoxId = null;
+      editingTextBoxOriginal = '';
+      editingTextBoxOriginalMarks = [];
+      editingTextBoxIsNew = false;
+      if (wasNew) {
+        removeNodeAndIncidentEdges(id);
+        notify();
+        return;
+      }
+      const node = findNode(id);
+      const el = nodeMap.get(id);
+      const text = textBoxContentEl(id);
+      if (node && text) {
+        node.text = oldText;
+        storeRichMarks(node, 'text', oldMarks);
+        text.contentEditable = 'false';
+        if (el) renderDecoration(el, node);
+      }
+      if (el) el.classList.remove('editing');
+      scheduleTextDock();
+    }
+
+    function adjustTextBoxFontSize(node, delta) {
+      if (!isTextBoxNode(node)) return;
+      const current = Math.max(8, Number(node.fontSize) || 28);
+      node.fontSize = Math.max(8, Math.min(120, current + delta));
+      const el = nodeMap.get(node.id);
+      if (el) applyNodeStyle(el, node);
+      pushHistory();
+      notify();
+    }
+
+    function resetTextBoxFontSize(node) {
+      if (!isTextBoxNode(node)) return;
+      node.fontSize = 34;
+      const el = nodeMap.get(node.id);
+      if (el) applyNodeStyle(el, node);
+      pushHistory();
+      notify();
+    }
+
+    // 新建默认：普通模式新建节点时套用 localStorage 里的样式（只对"新建"生效，
+    // 与普通模式共用同一套创建逻辑/快捷键）。实时读 localStorage → 与
+    // editor.js 的模式开关/默认样式面板解耦，无需互相通知。
+    function ensureDecorResizeHandles(el, node) {
+      if (!isDecorationNode(node)) return;
+      let wrap = el.querySelector('.decor-resize-handles');
+      if (!wrap) {
+        wrap = document.createElement('div');
+        wrap.className = 'decor-resize-handles';
+        ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw'].forEach((dir) => {
+          const handle = document.createElement('span');
+          handle.className = 'decor-resize-handle decor-resize-' + dir;
+          handle.dataset.resizeDir = dir;
+          handle.addEventListener('mousedown', (e) => startDecorResize(node, dir, e));
+          wrap.appendChild(handle);
+        });
+        el.appendChild(wrap);
+      }
+    }
+
+    // 正文节点：左右拖宽；卡片/代码/便签还可上下调整正文可见高度。
+    const BODY_MIN_W = 120;
+    const BODY_MAX_W = 1180;
+    const BODY_MIN_H = 72;
+    const BODY_MAX_H = 2400;
+    const BODY_DEFAULT_H = 560;
+    const PREVIEW_BODY_DEFAULT_H = 360;
+    const BODY_RESET_MS = 240;
+    const bodyResetJobs = new Map();
+    function isMindmapWidthNode(node) {
+      return !!node && !isDecorationNode(node)
+        && (!!node.mindmapStylePreset || !!node.mindmapRoot || currentMode() === 'mindmap');
+    }
+    function isWidthResizableNode(node) {
+      return isBodyNode(node) || isMindmapWidthNode(node);
+    }
+    function bodyMinWidth(node) {
+      return isMindmapWidthNode(node) ? 72 : BODY_MIN_W;
+    }
+    function defaultBodyHeight(node) {
+      return isPreviewNode(node) ? PREVIEW_BODY_DEFAULT_H : BODY_DEFAULT_H;
+    }
+    function ensureBodyResizeHandles(el, node) {
+      if (!isWidthResizableNode(node)) return;
+      let wrap = el.querySelector('.body-resize-handles');
+      let dirs = isBodyHeightResizable(node) ? ['n', 's', 'e', 'w'] : ['e', 'w'];
+      if (isMindmapWidthNode(node)) dirs = dirs.concat(['ne', 'nw', 'se', 'sw']);
+      const signature = dirs.join('');
+      if (!wrap || wrap.dataset.dirs !== signature) {
+        if (wrap) wrap.remove();
+        wrap = document.createElement('div');
+        wrap.className = 'body-resize-handles';
+        wrap.dataset.dirs = signature;
+        dirs.forEach((dir) => {
+          const handle = document.createElement('span');
+          handle.className = 'body-resize-handle body-resize-' + dir;
+          handle.dataset.resizeDir = dir;
+          handle.addEventListener('mousedown', (e) => startBodyResize(node, dir, e));
+          handle.addEventListener('dblclick', (e) => {
+            if (dir.length === 2 && isMindmapWidthNode(node)) resetMindmapCornerSize(node, e);
+            else resetBodySize(node, dir, e);
+          });
+          wrap.appendChild(handle);
+        });
+        el.appendChild(wrap);
+      }
+    }
+
+    function bodyResizeContentEl(el, node) {
+      if (!el || !isBodyHeightResizable(node)) return null;
+      if (isPreviewNode(node)) return el.querySelector('.preview-node-body');
+      if (isCardNode(node)) {
+        return el.querySelector('.preview-node-body') || el.querySelector(':scope > .node-text:first-child');
+      }
+      return el.querySelector(':scope > .node-text:first-child');
+    }
+
+    function startBodyResize(node, dir, e) {
+      if (e.button !== 0 || !isWidthResizableNode(node)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (bodyResetJobs.has(node.id)) return;
+      if (!selectedNodeIds.has(node.id) || selectedNodeIds.size !== 1 || selectedEdgeIds.size) {
+        selectNodes([node.id], false);
+      }
+      const el = nodeMap.get(node.id);
+      // 首次拖动以当前自撑宽度起步，避免从默认值跳变
+      const startW = Number(node.width) > 0
+        ? Math.max(bodyMinWidth(node), Number(node.width))
+        : (el ? el.offsetWidth : 240);
+      const corner = dir.length === 2 && isMindmapWidthNode(node);
+      const vertical = dir === 'n' || dir === 's';
+      if (el) {
+        if (vertical) el.classList.add('body-height-active');
+        if (corner) el.classList.add('resizing-x', 'resizing-y');
+        else el.classList.add(vertical ? 'resizing-y' : 'resizing-x');
+      }
+      const content = bodyResizeContentEl(el, node);
+      if (vertical && !content) {
+        if (el) el.classList.remove('resizing-y', 'body-height-active');
+        return;
+      }
+      const nodeScale = Math.max(0.1, Number(node.scale) || 1);
+      const startBodyH = Number(node.bodyHeight) > 0
+        ? Math.max(BODY_MIN_H, Number(node.bodyHeight))
+        : (isPreviewNode(node)
+          ? defaultBodyHeight(node)
+          : Math.max(BODY_MIN_H, content ? content.clientHeight / nodeScale : defaultBodyHeight(node)));
+      drag = {
+        mode: 'body-resize',
+        nodeId: node.id,
+        dir: dir,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        latestClientX: e.clientX,
+        latestClientY: e.clientY,
+        startScale: curScale,
+        startX: Number(node.x) || 0,
+        startY: Number(node.y) || 0,
+        startW: startW,
+        startStoredW: node.width,
+        startBodyH: startBodyH,
+        bodyScrollH: content ? content.scrollHeight : startBodyH * nodeScale,
+        startVisibleBodyH: Math.min(startBodyH * nodeScale,
+          content ? content.scrollHeight : startBodyH * nodeScale),
+        startStoredBodyH: node.bodyHeight,
+        startOuterH: el ? el.offsetHeight : 40,
+        startStoredMindmapMinHeight: node.mindmapMinHeight,
+        startMindmapSizeMode: node.mindmapSizeMode,
+        nodeScale: nodeScale,
+        moved: false,
+      };
+    }
+
+    function applyBodyResizeDrag(clientX, clientY) {
+      if (!drag || drag.mode !== 'body-resize') return;
+      const node = findNode(drag.nodeId);
+      if (!isWidthResizableNode(node)) return;
+      const scale = drag.startScale || curScale;
+      const dx = (clientX - drag.startClientX) / scale;
+      const dy = (clientY - drag.startClientY) / scale;
+      const east = drag.dir === 'e';
+      const el = nodeMap.get(node.id);
+      const corner = drag.dir.length === 2 && isMindmapWidthNode(node);
+      if (corner) {
+        const eastCorner = drag.dir.indexOf('e') >= 0;
+        const northCorner = drag.dir.indexOf('n') >= 0;
+        let nextW = eastCorner ? drag.startW + dx : drag.startW - dx;
+        let nextH = northCorner ? drag.startOuterH - dy : drag.startOuterH + dy;
+        nextW = Math.max(bodyMinWidth(node), Math.min(BODY_MAX_W, Math.round(nextW)));
+        nextH = Math.max(28, Math.min(600, Math.round(nextH)));
+        node.width = nextW;
+        node.mindmapMinHeight = nextH;
+        if (!eastCorner) node.x = Math.round(drag.startX + (drag.startW - nextW));
+        if (northCorner) node.y = Math.round(drag.startY + (drag.startOuterH - nextH));
+        if (!el) return;
+        el.style.width = nextW + 'px';
+        el.style.minWidth = nextW + 'px';
+        el.style.maxWidth = nextW + 'px';
+        el.style.minHeight = nextH + 'px';
+        applyTransform(el, node.x, node.y);
+      } else if (drag.dir === 'e' || drag.dir === 'w') {
+        let nextW = east ? drag.startW + dx : drag.startW - dx;
+        nextW = Math.max(bodyMinWidth(node), Math.min(BODY_MAX_W, Math.round(nextW)));
+        node.width = nextW;
+        if (!east) node.x = Math.round(drag.startX + (drag.startW - nextW));
+        if (!el) return;
+        el.style.width = nextW + 'px';
+        el.style.minWidth = nextW + 'px';
+        el.style.maxWidth = nextW + 'px';
+        applyTransform(el, node.x, node.y);
+      } else {
+        const north = drag.dir === 'n';
+        let nextH = north ? drag.startBodyH - dy / drag.nodeScale : drag.startBodyH + dy / drag.nodeScale;
+        nextH = Math.max(BODY_MIN_H, Math.min(BODY_MAX_H, Math.round(nextH)));
+        node.bodyHeight = nextH;
+        if (!el) return;
+        el.style.setProperty('--node-body-height', nextH + 'px');
+        if (north) {
+          const nextVisibleBodyH = Math.min(nextH * drag.nodeScale, drag.bodyScrollH);
+          node.y = Math.round(drag.startY + drag.startVisibleBodyH - nextVisibleBodyH);
+          applyTransform(el, node.x, node.y);
+        }
+      }
+      edgesIncidentTo(new Set([node.id])).forEach(updateEdgePath);
+      redrawMinimap();
+    }
+
+    function resetBodySize(node, dir, e) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!isWidthResizableNode(node) || bodyResetJobs.has(node.id)) return;
+      const horizontal = dir === 'e' || dir === 'w';
+      if (horizontal ? !(Number(node.width) > 0) : !(Number(node.bodyHeight) > 0)) return;
+      const el = nodeMap.get(node.id);
+      if (!el) return;
+      selectNodes([node.id], false);
+      if (!horizontal) el.classList.add('body-height-active', 'body-resize-resetting');
+      const startX = Number(node.x) || 0;
+      const startY = Number(node.y) || 0;
+      const content = horizontal ? null : bodyResizeContentEl(el, node);
+      const startValue = horizontal ? el.offsetWidth : Number(node.bodyHeight);
+      const nodeScale = Math.max(0.1, Number(node.scale) || 1);
+      const bodyScrollH = content ? content.scrollHeight : startValue * nodeScale;
+      const startVisibleBodyH = horizontal ? 0 : Math.min(startValue * nodeScale, bodyScrollH);
+      let targetValue = defaultBodyHeight(node);
+
+      if (horizontal) {
+        const storedWidth = node.width;
+        delete node.width;
+        applyNodeStyle(el, node);
+        targetValue = el.offsetWidth;
+        node.width = storedWidth;
+        applyNodeStyle(el, node);
+      }
+
+      el.classList.add('body-resize-resetting');
+      const started = performance.now();
+      const duration = prefersReducedMotion() ? 0 : BODY_RESET_MS;
+      function finishReset() {
+        bodyResetJobs.delete(node.id);
+        if (horizontal) {
+          delete node.width;
+          if (isMindmapWidthNode(node)) node.mindmapSizeMode = Number(node.mindmapMinHeight) > 0 ? 'custom' : 'auto';
+          if (dir === 'w') node.x = Math.round(startX + startValue - targetValue);
+        } else {
+          delete node.bodyHeight;
+        }
+        applyNodeStyle(el, node);
+        if (!horizontal && dir === 'n') {
+          const targetVisibleBodyH = Math.min(targetValue * nodeScale, bodyScrollH);
+          node.y = Math.round(startY + startVisibleBodyH - targetVisibleBodyH);
+        }
+        applyTransform(el, node.x, node.y);
+        el.classList.remove('body-resize-resetting', 'body-height-active');
+        edgesIncidentTo(new Set([node.id])).forEach(updateEdgePath);
+        redrawMinimap();
+        if (isPreviewNode(node)) animatePreviewNodeGeometry(node.id);
+        if (isMindmapWidthNode(node)) repairMindmapNodeSpacing(node, { history: false, notify: false });
+        dispatchMindmapSizeState();
+        pushHistory();
+        notify();
+      }
+      function tick(now) {
+        const raw = duration ? Math.min(1, (now - started) / duration) : 1;
+        const eased = 1 - Math.pow(1 - raw, 3);
+        const value = startValue + (targetValue - startValue) * eased;
+        if (horizontal) {
+          node.width = Math.round(value);
+          if (dir === 'w') node.x = Math.round(startX + startValue - value);
+          el.style.width = value + 'px';
+          el.style.minWidth = value + 'px';
+          el.style.maxWidth = value + 'px';
+          applyTransform(el, node.x, node.y);
+        } else {
+          node.bodyHeight = Math.round(value);
+          el.style.setProperty('--node-body-height', value + 'px');
+          if (dir === 'n') {
+            const visibleBodyH = Math.min(value * nodeScale, bodyScrollH);
+            node.y = Math.round(startY + startVisibleBodyH - visibleBodyH);
+            applyTransform(el, node.x, node.y);
+          }
+        }
+        edgesIncidentTo(new Set([node.id])).forEach(updateEdgePath);
+        redrawMinimap();
+        if (raw < 1) {
+          bodyResetJobs.set(node.id, window.setTimeout(() => tick(performance.now()), 16));
+        } else {
+          finishReset();
+        }
+      }
+      bodyResetJobs.set(node.id, window.setTimeout(() => tick(performance.now()), 0));
+    }
+
+    function resetMindmapCornerSize(node, e) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!isMindmapWidthNode(node)) return;
+      delete node.width;
+      delete node.mindmapMinHeight;
+      node.mindmapSizeMode = 'auto';
+      nodeSizeCache.delete(node.id);
+      const el = nodeMap.get(node.id);
+      if (el) applyNodeStyle(el, node);
+      repairMindmapNodeSpacing(node, { history: false, notify: false });
+      edgesIncidentTo(new Set([node.id])).forEach(updateEdgePath);
+      dispatchMindmapSizeState();
+      pushHistory();
+      notify();
+    }
+
+    function currentMode() {
+      try { return localStorage.getItem('canvas:mode') || 'normal'; } catch (e) { return 'normal'; }
+    }
+    function clearTransientMovableDecor() {
+      if (!transientMovableDecorId) return;
+      const el = nodeMap.get(transientMovableDecorId);
+      if (el) el.classList.remove('transient-movable-decor');
+      transientMovableDecorId = null;
+    }
+    function isTransientMovableDecor(node) {
+      return !!(node && node.id === transientMovableDecorId
+        && isDecorationNode(node)
+        && selectedNodeIds.has(node.id));
+    }
+    function normalDefaultsKey(fullKey, cleanKey) {
+      return document.body.dataset.modeSubmode === 'clean' ? cleanKey : fullKey;
+    }
+    function readNodeDefaults() {
+      const key = normalDefaultsKey('canvas:proNodeDefaults', 'canvas:cleanNodeDefaults');
+      try { return JSON.parse(localStorage.getItem(key) || '{}') || {}; }
+      catch (e) { return {}; }
+    }
+    function applyProDefaults(node) {
+      if (currentMode() !== 'normal') return;
+      const d = readNodeDefaults();
+      let normalKind = '';
+      try { normalKind = localStorage.getItem('canvas:normalNodeKind') || ''; } catch (e) {}
+      if (normalKind === 'sticky') node.kind = 'sticky';
+      else if (normalKind === 'index' || normalKind === 'preview'
+          || normalKind === 'card' || normalKind === 'code') node.kind = normalKind;
+      else if (d.kind === 'index' || d.kind === 'text') node.kind = 'index';
+      else if (d.kind === 'preview') node.kind = 'preview';
+      else if (d.kind === 'sticky') node.kind = 'sticky';
+      else if (d.kind === 'code') node.kind = 'code';
+      else node.kind = 'card';
+      if (d.shape && d.shape !== 'rect') node.shape = d.shape;
+      if (d.borderColor && d.borderColor.toLowerCase() !== '#000000') node.borderColor = d.borderColor;
+      const fullStickyDefaults = document.body.dataset.modeSubmode !== 'clean' && isStickyNode(node);
+      if (fullStickyDefaults) {
+        const stickyBg = normalizeHexColor(d.stickyBgColor);
+        if (d.stickyColorMode === 'fixed' && stickyBg) node.bgColor = stickyBg;
+      } else if (d.bgColor && d.bgColor.toLowerCase() !== '#ffffff') {
+        node.bgColor = d.bgColor;
+      }
+      if (d.opacity != null && d.opacity !== 1) node.opacity = d.opacity;
+      if (d.hideChrome) node.hideChrome = true;
+      if (Number(d.scale) >= 0.5 && Number(d.scale) <= 2 && Number(d.scale) !== 1) node.scale = Number(d.scale);
+      if (Number(d.radius) >= 0 && Number(d.radius) !== 10) node.radius = Number(d.radius);
+      if (Object.prototype.hasOwnProperty.call(d, 'fontWeight')) {
+        const fontWeight = normalizedFontWeight(d.fontWeight);
+        if (Number.isFinite(fontWeight)) node.fontWeight = fontWeight;
+      }
+      if (Number(d.fontScale) > 0 && Number(d.fontScale) !== 1) node.fontScale = Number(d.fontScale);
+      if (d.textAlign === 'center' || d.textAlign === 'right') node.textAlign = d.textAlign;
+    }
+
+    const previewGeometryRafs = new Map();
+    function animatePreviewNodeGeometry(nodeId) {
+      if (previewGeometryRafs.has(nodeId)) return;
+      const started = performance.now();
+      function tick(now) {
+        edgesIncidentTo(new Set([nodeId])).forEach(updateEdgePath);
+        redrawMinimap();
+        if (now - started < 430) {
+          previewGeometryRafs.set(nodeId, requestAnimationFrame(tick));
+        } else {
+          previewGeometryRafs.delete(nodeId);
+        }
+      }
+      previewGeometryRafs.set(nodeId, requestAnimationFrame(tick));
+    }
+
+    // 剪贴板写入：优先 navigator.clipboard，失败回退 execCommand（保证 WebView2 / 非安全上下文也能复制）
+    function copyTextToClipboard(text) {
+      const str = String(text == null ? '' : text);
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        return navigator.clipboard.writeText(str).then(() => true).catch(() => fallbackCopyText(str));
+      }
+      return Promise.resolve(fallbackCopyText(str));
+    }
+    function fallbackCopyText(str) {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = str;
+        ta.setAttribute('readonly', '');
+        ta.style.cssText = 'position:fixed;top:-1000px;left:0;opacity:0;';
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, str.length);
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        return ok;
+      } catch (err) {
+        return false;
+      }
+    }
+    function flashCopyButton(btn) {
+      btn.classList.remove('copied');
+      void btn.offsetWidth;   // 强制回流，让动画可连续重复触发
+      btn.classList.add('copied');
+      if (btn._copyTimer) clearTimeout(btn._copyTimer);
+      btn._copyTimer = setTimeout(() => {
+        btn.classList.remove('copied');
+        btn._copyTimer = null;
+      }, 1200);
+    }
+    // 代码节点右下角「复制」：hover 浮现，点一下复制纯代码（不含围栏符号）。只建一次、复用。
+    function ensureCodeCopyButton(el) {
+      let btn = el.querySelector('.code-copy-btn');
+      if (btn) return btn;
+      btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'code-copy-btn';
+      btn.title = '复制代码';
+      btn.setAttribute('aria-label', '复制代码');
+      btn.innerHTML =
+        '<svg class="cc-glyph cc-copy" viewBox="0 0 24 24" aria-hidden="true">'
+        + '<rect x="8.5" y="8.5" width="11" height="12" rx="2.4"></rect>'
+        + '<path d="M5.4 15.5H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8.5a2 2 0 0 1 2 2v.4"></path>'
+        + '</svg>'
+        + '<svg class="cc-glyph cc-done" viewBox="0 0 24 24" aria-hidden="true">'
+        + '<path d="M5 12.7l4.2 4.3L19 7.2"></path>'
+        + '</svg>';
+      // 阻断冒泡：节点拖动 / 选中 / 进编辑都挂在 mousedown / dblclick 上，按钮要自己消化掉
+      btn.addEventListener('mousedown', (e) => e.stopPropagation());
+      btn.addEventListener('pointerdown', (e) => e.stopPropagation());
+      btn.addEventListener('dblclick', (e) => e.stopPropagation());
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const node = findNode(el.dataset.id);
+        if (!node) return;
+        copyTextToClipboard(node.body || '').then((ok) => { if (ok) flashCopyButton(btn); });
+      });
+      el.appendChild(btn);
+      return btn;
+    }
+
+    function renderTextNodeMeta(el, node) {
+      let meta = el.querySelector('.text-node-meta');
+      let previewBody = el.querySelector('.preview-node-body');
+      let codeLabel = el.querySelector('.code-node-language');
+      let copyBtn = el.querySelector('.code-copy-btn');
+      if (!isReadableNode(node)) {
+        if (meta) meta.remove();
+        if (previewBody) previewBody.remove();
+        if (codeLabel) codeLabel.remove();
+        if (copyBtn) copyBtn.remove();
+        el.classList.remove('node-card-filled');
+        return;
+      }
+      if (isStickyNode(node)) {
+        // 便签：无标题、无分隔线、无 caption；整块即正文，渲进主 .node-text（Markdown/公式）。
+        if (meta) meta.remove();
+        if (previewBody) previewBody.remove();
+        if (codeLabel) codeLabel.remove();
+        if (copyBtn) copyBtn.remove();
+        el.classList.remove('node-card-filled');
+        const stickyText = el.querySelector(':scope > .node-text');
+        if (stickyText && editingNodeId !== node.id) renderNodeText(stickyText, node.body || '', richMarks(node, 'body'));
+        return;
+      }
+      if (isCodeNode(node)) {
+        if (meta) meta.remove();
+        if (previewBody) previewBody.remove();
+        el.classList.remove('node-card-filled');
+        if (!codeLabel) {
+          codeLabel = document.createElement('span');
+          codeLabel.className = 'code-node-language';
+          el.appendChild(codeLabel);
+        }
+        codeLabel.textContent = codeLanguageLabel(node.language);
+        ensureCodeCopyButton(el);
+        const text = el.querySelector(':scope > .node-text');
+        if (text && editingNodeId !== node.id) renderCodeNodeText(text, node.body || '', node.language);
+        return;
+      }
+      if (codeLabel) codeLabel.remove();
+      if (copyBtn) copyBtn.remove();
+      if (isIndexNode(node)) {
+        el.classList.remove('node-card-filled');
+        if (!meta) {
+          meta = document.createElement('div');
+          meta.className = 'text-node-meta';
+          el.appendChild(meta);
+        }
+        meta.textContent = indexNodeMetaText(node);
+        meta.classList.toggle('empty', buildIndexTree(node, 4).count === 0);
+        if (previewBody) previewBody.remove();
+        return;
+      }
+      if (isCardNode(node)) {
+        // 卡片：不要 caption，标题加粗 + 分隔线 + 正文常驻显示（复用 .preview-node-body，
+        // 由 data-kind="card" 的 CSS 覆盖为始终展开）
+        if (meta) meta.remove();
+        const hasBody = !!String(node.body || '').trim();
+        // 空卡片（无正文）宽度收窄到普通节点尺寸；有正文时才撑宽（见 styles.css .node-card-filled）
+        el.classList.toggle('node-card-filled', hasBody);
+        if (hasBody) {
+          if (!previewBody) {
+            previewBody = document.createElement('div');
+            previewBody.className = 'node-text preview-node-body';
+            el.appendChild(previewBody);
+          }
+          const disp = readerDisplayBody(node);
+          renderNodeText(previewBody, disp.text, disp.marks);
+        } else if (previewBody) {
+          previewBody.remove();
+        }
+        return;
+      }
+      el.classList.remove('node-card-filled');
+      if (!meta) {
+        meta = document.createElement('div');
+        meta.className = 'text-node-meta';
+        el.appendChild(meta);
+      }
+      if (isPreviewNode(node)) {
+        const hasBody = !!String(node.body || '').trim();
+        if (!hasBody) {
+          // 空预览节点不再留「正文为空」提示，只剩标题 + 叠纸角，更清爽
+          if (meta) meta.remove();
+          if (previewBody) previewBody.remove();
+          return;
+        }
+        meta.textContent = '预览节点  ·  悬停展开正文';
+        if (!previewBody) {
+          previewBody = document.createElement('div');
+          previewBody.className = 'node-text preview-node-body';
+          el.appendChild(previewBody);
+        }
+        const disp = readerDisplayBody(node);
+        renderNodeText(previewBody, disp.text, disp.marks);
+      }
+      meta.classList.toggle('empty', !String(node.body || '').trim());
+    }
+
+    function indexNodeMetaText(node) {
+      const info = buildIndexTree(node, 4);
+      const englishUi = document.documentElement.dataset.uiLanguage === 'en'
+        || document.body.dataset.toolbarLanguage === 'en';
+      if (!info.count) return englishUi ? 'Not connected yet' : '尚未连接';
+      return englishUi
+        ? info.count + ' items · ' + info.depth + ' levels'
+        : info.count + ' 项 · ' + info.depth + ' 层';
+    }
+
+    // ── 节点任务清单（悬停节点左侧浮出，可勾选 / 增删改）──────────
+    // 数据：node.checklist = [{ text, done }]，空则不写字段；纯前端浮层，定位靠 DOM
+    // 内嵌在节点元素里（right:100%），随节点平移/缩放自动跟随，无需手算坐标。
+    function nodeChecklistArr(node) {
+      return Array.isArray(node.checklist) ? node.checklist : [];
+    }
+
+    function setNodeChecklist(node, list) {
+      if (list && list.length) node.checklist = list;
+      else delete node.checklist;
+    }
+
+    function reRenderNodeChecklist(node, enteringIdx) {
+      const el = nodeMap.get(node.id);
+      if (el) renderNodeChecklist(el, node, enteringIdx);
+    }
+
+    function toggleChecklistItem(node, idx) {
+      const list = nodeChecklistArr(node).slice();
+      if (!list[idx]) return;
+      pushHistory();
+      list[idx] = { text: list[idx].text, done: !list[idx].done };
+      setNodeChecklist(node, list);
+      reRenderNodeChecklist(node);
+      notify();
+    }
+
+    function nextChecklistDefaultText(node) {
+      let max = 0;
+      nodeChecklistArr(node).forEach(function (item) {
+        const match = String(item && item.text || '').trim().match(/^(\d+)\.?$/);
+        if (match) max = Math.max(max, parseInt(match[1], 10) || 0);
+      });
+      return String(max + 1) + '.';
+    }
+
+    function addChecklistItem(node) {
+      pushHistory();
+      const list = nodeChecklistArr(node).slice();
+      list.push({ text: nextChecklistDefaultText(node), done: false });
+      setNodeChecklist(node, list);
+      reRenderNodeChecklist(node, list.length - 1);
+      notify();
+    }
+
+    function deleteChecklistItem(node, idx) {
+      const list = nodeChecklistArr(node).slice();
+      if (!list[idx]) return;
+      pushHistory();
+      list.splice(idx, 1);
+      setNodeChecklist(node, list);
+      reRenderNodeChecklist(node);
+      notify();
+    }
+
+    // 通用可编辑行：单击文字后改写，Enter 保存，Esc 取消。
+    function makeChecklistEditRow(initial, onCommit, onCancel) {
+      const row = document.createElement('div');
+      row.className = 'checklist-item editing';
+      const box = document.createElement('span');
+      box.className = 'checklist-box';
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'checklist-edit';
+      input.value = initial || '';
+      input.placeholder = '任务内容';
+      let settled = false;
+      const commit = (chain) => {
+        if (settled) return;
+        settled = true;
+        onCommit(input.value, chain);
+      };
+      input.addEventListener('keydown', (e) => {
+        e.stopPropagation();
+        if (e.key === 'Enter') { e.preventDefault(); commit(true); }
+        else if (e.key === 'Escape') { e.preventDefault(); settled = true; onCancel(); }
+      });
+      input.addEventListener('blur', () => { if (!settled) commit(false); });
+      row.appendChild(box);
+      row.appendChild(input);
+      return { row, input };
+    }
+
+    function startChecklistEdit(node, idx, rowEl) {
+      const list = nodeChecklistArr(node);
+      const item = list[idx];
+      if (!item) return;
+      const er = makeChecklistEditRow(item.text || '', (text) => {
+        const t = String(text || '').trim();
+        pushHistory();
+        const next = nodeChecklistArr(node).slice();
+        if (t) next[idx] = { text: t, done: next[idx] ? next[idx].done : false };
+        else next.splice(idx, 1);   // 清空文字 = 删除该任务
+        setNodeChecklist(node, next);
+        reRenderNodeChecklist(node);
+        notify();
+      }, () => { reRenderNodeChecklist(node); });
+      if (rowEl && rowEl.parentNode) rowEl.parentNode.replaceChild(er.row, rowEl);
+      er.input.focus();
+      er.input.select();
+    }
+
+    function buildChecklistRow(node, item, idx, enteringIdx) {
+      const row = document.createElement('div');
+      row.className = 'checklist-item' + (item.done ? ' done' : '') + (idx === enteringIdx ? ' quick-enter' : '');
+      const box = document.createElement('button');
+      box.type = 'button';
+      box.className = 'checklist-box';
+      box.tabIndex = -1;
+      box.innerHTML = '<svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">'
+        + '<path d="M3 8.4 6.2 11.5 13 4.6" fill="none" stroke="currentColor" '
+        + 'stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+      box.addEventListener('click', () => toggleChecklistItem(node, idx));
+      const txt = document.createElement('div');
+      txt.className = 'checklist-text';
+      txt.textContent = item.text || '';
+      txt.title = '点击编辑';
+      txt.addEventListener('click', () => startChecklistEdit(node, idx, row));
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'checklist-delete';
+      del.tabIndex = -1;
+      del.title = '删除任务';
+      del.setAttribute('aria-label', '删除任务');
+      del.textContent = '×';
+      del.addEventListener('click', () => deleteChecklistItem(node, idx));
+      row.appendChild(box);
+      row.appendChild(txt);
+      row.appendChild(del);
+      return row;
+    }
+
+    function renderNodeChecklist(el, node, enteringIdx) {
+      let panel = el.querySelector(':scope > .node-checklist');
+      if (isDecorationNode(node) || node.handText) {
+        if (panel) panel.remove();
+        return;
+      }
+      if (!panel) {
+        panel = document.createElement('div');
+        panel.className = 'node-checklist';
+        // 面板内交互不应触发节点拖动 / 选择
+        ['mousedown', 'click', 'dblclick'].forEach((evt) => {
+          panel.addEventListener(evt, (e) => e.stopPropagation());
+        });
+        el.appendChild(panel);
+      }
+      panel.innerHTML = '';
+      const inner = document.createElement('div');
+      inner.className = 'node-checklist-inner';
+      panel.appendChild(inner);
+
+      nodeChecklistArr(node).forEach((item, idx) => {
+        inner.appendChild(buildChecklistRow(node, item, idx, enteringIdx));
+      });
+
+      const add = document.createElement('button');
+      add.type = 'button';
+      add.className = 'checklist-add';
+      add.innerHTML = '<span class="checklist-add-icon">+</span><span>任务</span>';
+      add.addEventListener('click', () => addChecklistItem(node));
+      inner.appendChild(add);
+    }
+
+    function createNodeEl(node) {
+      const el = document.createElement('div');
+      el.className = 'node';
+      el.dataset.id = node.id;
+      if (node.color) el.dataset.color = node.color;   // C1：节点颜色
+      applyNodeStyle(el, node);                         // 5-1：形状/颜色/透明度
+      applyTransform(el, node.x, node.y);
+
+      if (isDecorationNode(node)) {
+        renderDecoration(el, node);
+        ensureDecorResizeHandles(el, node);
+      } else {
+        const text = document.createElement('div');
+        text.className = 'node-text';
+        renderBodyNodeContent(text, node);
+        el.appendChild(text);
+        renderTextNodeMeta(el, node);
+
+        const removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.className = 'node-remove';
+        removeBtn.title = '删除（Delete）';
+        removeBtn.setAttribute('aria-label', '删除节点');
+        removeBtn.textContent = '×';
+        // 编辑态时按 Tab 不应该把焦点切到这个按钮（否则 title tooltip 会闪出来）
+        removeBtn.tabIndex = -1;
+        ['mousedown', 'click', 'dblclick'].forEach((evt) => {
+          removeBtn.addEventListener(evt, (e) => e.stopPropagation());
+        });
+        removeBtn.addEventListener('click', () => {
+          selectNodes([node.id], false);
+          deleteSelected();
+        });
+        el.appendChild(removeBtn);
+
+        renderNodeChecklist(el, node);   // 悬停左侧任务清单
+        ensureMindmapFoldControl(el, node);
+        ensureBodyResizeHandles(el, node);   // 卡片/代码/便签/预览：拖左右边缘改宽
+      }
+      if (hiddenMindmapNodeIds.has(node.id)) el.classList.add('mindmap-fold-hidden');
+      if (hiddenGroupNodeIds.has(node.id)) el.classList.add('group-fold-hidden');
+
+      bindNodeEvents(el, node);
+      return el;
+    }
+
+    // ── 连线 DOM ──────────────────────────────
+    // ── 5-2：线条自定义样式（粗细 / 箭头 / 直曲——直曲在 edgeGeom 里处理）──
+    // 粗细用 CSS 变量 --edge-w 喂给 .canvas-edge（hover/选中靠 calc 相对加粗，
+    // 保留反馈）；箭头用每条线自己的 <marker>（支持独立大小 + 单/双向）。
+    let edgeDefs = null;
+    function ensureDefs() {
+      if (!edgeDefs) {
+        edgeDefs = document.createElementNS(SVG_NS, 'defs');
+        edgesLayer.appendChild(edgeDefs);
+      }
+      return edgeDefs;
+    }
+    function buildArrowMarker(markerId, size, orient, color) {
+      const m = document.createElementNS(SVG_NS, 'marker');
+      m.setAttribute('id', markerId);
+      m.setAttribute('markerUnits', 'userSpaceOnUse');
+      m.setAttribute('markerWidth', size);
+      m.setAttribute('markerHeight', size);
+      m.setAttribute('refX', size * 0.9);
+      m.setAttribute('refY', size / 2);
+      m.setAttribute('orient', orient);
+      const tri = document.createElementNS(SVG_NS, 'path');
+      tri.setAttribute('d', 'M0,0 L' + size + ',' + (size / 2) + ' L0,' + size + ' Z');
+      tri.setAttribute('fill', color || '#000');
+      m.appendChild(tri);
+      return m;
+    }
+    function removeEdgeMarkers(id) {
+      ['mk-' + id + '-e', 'mk-' + id + '-s'].forEach((mid) => {
+        const m = document.getElementById(mid);
+        if (m && m.parentNode) m.parentNode.removeChild(m);
+      });
+    }
+    function applyEdgeArrows(refs, edge) {
+      removeEdgeMarkers(edge.id);
+      const arrow = edge.arrow || 'none';
+      if (arrow === 'none') {
+        refs.path.removeAttribute('marker-end');
+        refs.path.removeAttribute('marker-start');
+        return;
+      }
+      const size = edge.arrowSize || 12;
+      const color = edgeStrokeColor(edge);
+      const defs = ensureDefs();
+      const endId = 'mk-' + edge.id + '-e';
+      defs.appendChild(buildArrowMarker(endId, size, 'auto', color));
+      refs.path.setAttribute('marker-end', 'url(#' + endId + ')');
+      if (arrow === 'both') {
+        const startId = 'mk-' + edge.id + '-s';
+        defs.appendChild(buildArrowMarker(startId, size, 'auto-start-reverse', color));
+        refs.path.setAttribute('marker-start', 'url(#' + startId + ')');
+      } else {
+        refs.path.removeAttribute('marker-start');
+      }
+    }
+    function applyEdgeStyle(refs, edge) {
+      if (edge.width) refs.path.style.setProperty('--edge-w', edge.width);
+      else refs.path.style.removeProperty('--edge-w');
+      const style = edgeVisualLineStyle(edge);
+      refs.path.classList.remove('edge-style-dashed', 'edge-style-dotted', 'edge-style-soft', 'edge-style-glow');
+      if (style !== 'solid') refs.path.classList.add('edge-style-' + style);
+      // 线条颜色：内联 stroke 覆盖 CSS 默认；同色喂给 --edge-color 供荧光光晕使用
+      const color = edgeStrokeColor(edge);
+      refs.path.style.stroke = color;
+      refs.path.style.setProperty('--edge-color', color);
+      applyEdgeArrows(refs, edge);
+    }
+
+    // 新建默认：普通模式按当前 clean/full 子模式读取各自样式，只对"新建"生效。
+    function readEdgeDefaults() {
+      const key = normalDefaultsKey('canvas:proEdgeDefaults', 'canvas:cleanEdgeDefaults');
+      try { return JSON.parse(localStorage.getItem(key) || '{}') || {}; }
+      catch (e) { return {}; }
+    }
+    function applyProEdgeDefaults(edge) {
+      if (currentMode() !== 'normal') return;
+      const d = readEdgeDefaults();
+      if (d.arrow && d.arrow !== 'none') edge.arrow = d.arrow;
+      if (d.curve && d.curve !== 'bezier') edge.curve = d.curve;
+      if (d.lineStyle && d.lineStyle !== 'solid') edge.lineStyle = d.lineStyle;
+      if (d.color && d.color.toLowerCase() !== '#000000') edge.color = d.color;
+      if (d.width && d.width !== 1.5) edge.width = d.width;
+      if (d.arrowSize && d.arrowSize !== 12) edge.arrowSize = d.arrowSize;
+    }
+
+    // ── 5-3：连线拐点（waypoints，编辑模式）──────────
+    // 编辑模式是持续工作的属性检查器，仍允许新建、粘贴、复制与 Alt 拖线；
+    // 只有图案模式会把交互专门让给装饰对象创建。
+    function canCreate() { return currentMode() !== 'decor'; }
+
+    let handleEls = [];   // 当前显示的拐点手柄（SVG 圆）
+
+    // 某连线当前的折点序列（两端锚点 + 各拐点），用于命中最近线段
+    function edgePoints(edge) {
+      const src = findNode(edge.from);
+      const tgt = findNode(edge.to);
+      if (!src || !tgt) return null;
+      const sr = nodeRect(src), tr = nodeRect(tgt);
+      const wps = Array.isArray(edge.waypoints) ? edge.waypoints : [];
+      let sExit, tExit;
+      if (wps.length) {
+        const a = edgeAnchors(sr, tr, wps);
+        sExit = a.s; tExit = a.t;
+      } else {
+        const sCx = sr.x + sr.w / 2, sCy = sr.y + sr.h / 2;
+        const tCx = tr.x + tr.w / 2, tCy = tr.y + tr.h / 2;
+        sExit = sideOfExit(sCx, sCy, sr.w / 2, sr.h / 2, tCx - sCx, tCy - sCy, sr.r);
+        tExit = sideOfExit(tCx, tCy, tr.w / 2, tr.h / 2, sCx - tCx, sCy - tCy, tr.r);
+      }
+      return [{ x: sExit.x, y: sExit.y }]
+        .concat(wps.map((w) => ({ x: w.x, y: w.y })))
+        .concat([{ x: tExit.x, y: tExit.y }]);
+    }
+
+    function distToSeg(px, py, a, b) {
+      const vx = b.x - a.x, vy = b.y - a.y;
+      const len2 = vx * vx + vy * vy;
+      let t = len2 ? ((px - a.x) * vx + (py - a.y) * vy) / len2 : 0;
+      t = Math.max(0, Math.min(1, t));
+      return Math.hypot(px - (a.x + t * vx), py - (a.y + t * vy));
+    }
+    // 点 (px,py) 落在第几段上（0 = 起点锚→首拐点）；插入索引即段号
+    function nearestSegment(pts, px, py) {
+      let best = 0, bestD = Infinity;
+      for (let i = 0; i < pts.length - 1; i++) {
+        const d = distToSeg(px, py, pts[i], pts[i + 1]);
+        if (d < bestD) { bestD = d; best = i; }
+      }
+      return best;
+    }
+
+    function clearEdgeHandles() {
+      handleEls.forEach((el) => el.remove());
+      handleEls = [];
+    }
+    // 编辑模式下，给选中连线的每个拐点画一个可拖手柄（SVG 圆，随 surface 缩放）
+    function renderEdgeHandles() {
+      clearEdgeHandles();
+      if (currentMode() === 'decor') return;
+      selectedEdgeIds.forEach((id) => {
+        const edge = data.edges.find((x) => x.id === id);
+        if (!edge || !Array.isArray(edge.waypoints)) return;
+        edge.waypoints.forEach((w, i) => {
+          const c = document.createElementNS(SVG_NS, 'circle');
+          c.setAttribute('class', 'edge-waypoint');
+          c.setAttribute('cx', w.x);
+          c.setAttribute('cy', w.y);
+          c.setAttribute('r', 5);
+          c.addEventListener('mousedown', (e) => startHandleDrag(edge, i, e));
+          c.addEventListener('dblclick', (e) => { e.stopPropagation(); deleteWaypoint(edge, i); });
+          edgesLayer.appendChild(c);
+          handleEls.push(c);
+        });
+      });
+    }
+
+    // 在连线上按下（编辑模式）→ 待定加拐点：真正拖动后才在最近段插入新拐点
+    function startBendPending(edge, e) {
+      const p = clientToSurface(e.clientX, e.clientY);
+      const pts = edgePoints(edge);
+      drag = {
+        mode: 'waypoint',
+        edgeId: edge.id,
+        wpIndex: null,                                  // null = 还没插入
+        segIndex: pts ? nearestSegment(pts, p.x, p.y) : 0,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        moved: false,
+      };
+    }
+    // 按下已有拐点手柄 → 直接拖动它
+    function startHandleDrag(edge, index, e) {
+      if (e.button !== 0) return;
+      e.stopPropagation();
+      if (!selectedEdgeIds.has(edge.id)) selectEdges([edge.id], false);
+      drag = {
+        mode: 'waypoint',
+        edgeId: edge.id,
+        wpIndex: index,
+        segIndex: index,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        moved: false,
+      };
+    }
+    function deleteWaypoint(edge, index) {
+      if (!Array.isArray(edge.waypoints)) return;
+      edge.waypoints.splice(index, 1);
+      if (edge.waypoints.length === 0) delete edge.waypoints;
+      updateEdgePath(edge);
+      renderEdgeHandles();
+      pushHistory();
+      notify();
+    }
+
+    // ── 5-4：编辑模式右侧抽屉（精修选中对象，支持批量）──────
+    // editNodeTargets：选中的内容节点集合（排除装饰）；批量样式改动作用于全部。
+    // 混选「节点+连线」时忽略连线，只批量编辑节点。editEdgeTargets 仅在没有选中
+    // 任何内容节点时才返回连线集合。单对象专属操作（正文/转换/阅读/清拐点）只在
+    // 恰好 1 个对象时启用，对应 editGetNode / editGetEdge 返回代表对象。
+    function editNodeTargets() {
+      if (selectedNodeIds.size === 0) return [];
+      const out = [];
+      selectedNodeIds.forEach((id) => {
+        const n = findNode(id);
+        if (n && !isDecorationNode(n)) out.push(n);
+      });
+      return out;
+    }
+    function editEdgeTargets() {
+      if (editNodeTargets().length > 0) return [];   // 混选：有内容节点就忽略连线
+      const out = [];
+      selectedEdgeIds.forEach((id) => {
+        const ed = data.edges.find((x) => x.id === id);
+        if (ed) out.push(ed);
+      });
+      return out;
+    }
+    function editGetNode() {
+      const t = editNodeTargets();
+      return t.length === 1 ? t[0] : null;
+    }
+    function editGetEdge() {
+      const t = editEdgeTargets();
+      return t.length === 1 ? t[0] : null;
+    }
+
+    // 抽屉控件引用（setupEditPanel 里填充）
+    let epEmpty, epNodeSec, epEdgeSec, enBatchNote, eeBatchNote;
+    let enSelectionTitle, enSelectionBadge, eeSelectionTitle, eeSelectionBadge, enCreateGroup;
+    let enMindmapContext, enMindmapState, enMindmapResetColor, enMindmapResetSize;
+    let enShapeBtns, enBorder, enBg, enOpacity, enOpacityVal, enHideChrome, enScale, enScaleVal;
+    let enNodeColorPresets, enResetColors, enResetGeometry, enResetTypography, enApplyDefaults;
+    let enShapeState, enBorderState, enBgState;
+    let enRadius, enRadiusVal, enFontWeight, enFontWeightVal, enFontScale, enFontScaleVal;
+    let enTextAlignBtns, enTextAlignState, enResetAppearance;
+    let enTextBanner, enKindLabel, enOpenReader, enConvertWrap, enConvertText, enConvertPreview, enConvertCard, enConvertCode;
+    let enSwitchKindWrap, enSwitchPreview, enSwitchText, enSwitchCard, enSwitchCode, enConvertNormalWrap, enConvertNormal;
+    let enCodeLanguageWrap, enCodeLanguage;
+    let enBodyWrap, enBody, enBodyRich, enBodyNote, enBodyHint;
+    let enReviewWrap, enReviewEnabled, enReviewQuestions, enReviewAnswer;
+    let enReviewBatchWrap, enReviewBatch;
+    let enBodyDirty = false;
+    let eeCurveBtns, eeLineStyleBtns, eeArrowBtns, eeWidth, eeWidthVal, eeArrowSize, eeArrowSizeVal, eeColor;
+    let eeCurveState, eeLineStyleState, eeArrowState, eeColorState, eeResetAppearance;
+    let eeColorPresets, eeApplyDefaults;
+    let editPanelSelectionKey = '';
+    let editPanelTransitionTimer = null;
+
+    function setActiveBtns(btns, attr, val) {
+      btns.forEach((b) => b.classList.toggle('active', b.dataset[attr] === val));
+    }
+    function editSharedState(targets, getter) {
+      if (!targets.length) return { value: undefined, mixed: false };
+      const value = getter(targets[0]);
+      const key = JSON.stringify(value);
+      const mixed = targets.slice(1).some((item) => JSON.stringify(getter(item)) !== key);
+      return { value: value, mixed: mixed };
+    }
+    function setEditMixedControl(control, mixed) {
+      if (!control) return;
+      if (mixed) control.dataset.mixed = '1';
+      else control.removeAttribute('data-mixed');
+    }
+    function editNodeTypeLabel(n) {
+      var tc = (typeof window.__tc === 'function') ? window.__tc : function(k) { return k; };
+      if (!n) return tc('epNodes');
+      if (isIndexNode(n)) return tc('epKindIndex');
+      if (isCodeNode(n)) return tc('epKindCode');
+      if (isStickyNode(n)) return tc('epKindSticky');
+      if (isCardNode(n)) return tc('epKindCard');
+      if (isPreviewNode(n)) return tc('epKindPreview');
+      return tc('epKindNormal');
+    }
+    function editIsMindmapNode(n) {
+      return !!(n && (n.mindmapStyleRole || n.mindmapStylePreset || n.mindmapRoot));
+    }
+    function editIsMindmapEdge(edge) {
+      if (!edge) return false;
+      const from = findNode(edge.from);
+      const to = findNode(edge.to);
+      return editIsMindmapNode(from) && editIsMindmapNode(to);
+    }
+    function editSelectionKey(nodeTargets, edgeTargets) {
+      if (nodeTargets.length) return 'node:' + nodeTargets.map((node) => node.id).sort().join(',');
+      if (edgeTargets.length) return 'edge:' + edgeTargets.map((edge) => edge.id).sort().join(',');
+      return '';
+    }
+    function animateEditSelectionSections() {
+      const sections = [epNodeSec, epEdgeSec].filter((section) => section && !section.hidden);
+      if (!sections.length) return;
+      if (editPanelTransitionTimer) window.clearTimeout(editPanelTransitionTimer);
+      [epNodeSec, epEdgeSec].forEach((section) => {
+        if (section) section.classList.remove('edit-selection-changing');
+      });
+      // 允许同一区块在连续点选不同对象时重新播放短促的内容替换动画。
+      void sections[0].offsetWidth;
+      sections.forEach((section) => section.classList.add('edit-selection-changing'));
+      editPanelTransitionTimer = window.setTimeout(() => {
+        sections.forEach((section) => section.classList.remove('edit-selection-changing'));
+        editPanelTransitionTimer = null;
+      }, 190);
+    }
+    function refreshEditPanel() {
+      if (!editPanel) return;
+      var tc = (typeof window.__tc === 'function') ? window.__tc : function(k) { return k; };
+      const nodeTargets = editNodeTargets();
+      const edgeTargets = editEdgeTargets();
+      const n = nodeTargets[0] || null;     // 代表节点（面板取值用，改动批量作用全部）
+      const ed = edgeTargets[0] || null;    // 代表连线
+      const multiN = nodeTargets.length > 1;
+      const multiE = edgeTargets.length > 1;
+      const nextSelectionKey = editSelectionKey(nodeTargets, edgeTargets);
+      const animateSelectionChange = !!(
+        editPanelSelectionKey
+        && nextSelectionKey
+        && editPanelSelectionKey !== nextSelectionKey
+        && document.body.dataset.inspectorView === 'selection'
+      );
+      editPanelSelectionKey = nextSelectionKey;
+      // 清空选择时，检查器外壳会紧接着退场。先保留最后一帧内容与高度，
+      // 避免它在淡出前瞬间切到空状态、从长面板闪缩成短面板。
+      if (!n && !ed && document.body.dataset.inspectorView === 'selection') return;
+      if (epEmpty) epEmpty.hidden = !!(n || ed);
+      if (epNodeSec) epNodeSec.hidden = !n;
+      if (epEdgeSec) epEdgeSec.hidden = !ed;
+      if (enSelectionTitle && n) {
+        const labels = new Set(nodeTargets.map(editNodeTypeLabel));
+        enSelectionTitle.textContent = multiN
+          ? (labels.size === 1 ? labels.values().next().value + tc('epBatchEdit') : tc('epMixedBatch'))
+          : editNodeTypeLabel(n);
+      }
+      if (enSelectionBadge && n) enSelectionBadge.textContent = multiN ? nodeTargets.length + tc('epCount') : tc('epSingle');
+      if (eeSelectionTitle && ed) {
+        const mindmapEdgeCount = edgeTargets.filter(editIsMindmapEdge).length;
+        eeSelectionTitle.textContent = multiE
+          ? (mindmapEdgeCount === edgeTargets.length ? tc('epEdgeBatch') : tc('epEdgeMixed'))
+          : (mindmapEdgeCount ? tc('epEdgeMindmap') : tc('epEdgeCurrent'));
+      }
+      if (eeSelectionBadge && ed) eeSelectionBadge.textContent = multiE ? edgeTargets.length + tc('epEdgeCount') : tc('epSingle');
+      if (enBatchNote) {
+        enBatchNote.hidden = !multiN;
+        if (multiN) enBatchNote.textContent = tc('epBatchNote').replace('N', nodeTargets.length);
+      }
+      if (enReviewBatchWrap) {
+        // 多选正文节点使用三态复选框：横线明确表示仅部分节点已加入。
+        // （editNodeTargets 已过滤装饰节点，nodeTargets 全是可复习的正文节点）
+        enReviewBatchWrap.hidden = !multiN;
+        if (multiN && enReviewBatch) {
+          const enabledCount = nodeTargets.filter((t) => t.review && t.review.enabled === true).length;
+          enReviewBatch.indeterminate = enabledCount > 0 && enabledCount < nodeTargets.length;
+          enReviewBatch.checked = enabledCount === nodeTargets.length;
+        }
+      }
+      if (enCreateGroup) enCreateGroup.hidden = nodeTargets.length < 2;
+      if (eeBatchNote) {
+        eeBatchNote.hidden = !multiE;
+        if (multiE) eeBatchNote.textContent = tc('epBatchEdgeNote').replace('N', edgeTargets.length);
+      }
+      const mindmapTargets = nodeTargets.filter(editIsMindmapNode);
+      if (enMindmapContext) enMindmapContext.hidden = !mindmapTargets.length;
+      if (mindmapTargets.length && enMindmapState) {
+        const allColorAuto = mindmapTargets.every((item) => item.mindmapColorMode !== 'custom');
+        const allSizeAuto = mindmapTargets.every((item) => item.mindmapSizeMode !== 'custom');
+        const partial = mindmapTargets.length !== nodeTargets.length;
+        enMindmapState.textContent = partial ? tc('epMixedSelection')
+          : (allColorAuto && allSizeAuto ? tc('epFollowPreset')
+            : (!allColorAuto && !allSizeAuto ? tc('epManualColorSize')
+              : (!allColorAuto ? tc('epManualColor') : tc('epManualSize'))));
+      }
+      if (enMindmapResetColor) enMindmapResetColor.disabled = !mindmapTargets.length;
+      if (enMindmapResetSize) enMindmapResetSize.disabled = !mindmapTargets.length;
+      if (enApplyDefaults) enApplyDefaults.disabled = !!nodeTargets.length
+        && nodeTargets.every(editIsMindmapNode);
+      // 多选节点时只批量改样式，隐藏正文/转换/阅读等单对象专属项
+      editPanel.classList.toggle('has-text-node', !!(n && !multiN && isReadableNode(n)));
+      if (n) {
+        const single = !multiN;
+        const indexNode = single && isIndexNode(n);
+        const previewNode = single && isPreviewNode(n);
+        const cardNode = single && isCardNode(n);
+        const codeNode = single && isCodeNode(n);
+        const stickyNode = single && isStickyNode(n);
+        const bodyNode = single && isBodyNode(n);
+        const readableNode = single && isReadableNode(n);
+        if (enTextBanner) enTextBanner.hidden = !readableNode;
+        if (enKindLabel) enKindLabel.textContent = indexNode ? tc('epKindIndex') : codeNode ? tc('epKindCode') : stickyNode ? tc('epKindSticky') : cardNode ? tc('epKindCard') : previewNode ? tc('epKindPreview') : tc('epNodes');
+        if (enOpenReader) enOpenReader.hidden = !readableNode;       // 索引/正文节点均可按 F 打开阅读浮层
+        if (enConvertWrap) enConvertWrap.hidden = !single || readableNode;
+        if (enSwitchKindWrap) enSwitchKindWrap.hidden = !readableNode;
+        // 正文类节点之间互转：只露其它种类
+        if (enSwitchText) enSwitchText.hidden = indexNode;
+        if (enSwitchPreview) enSwitchPreview.hidden = previewNode;
+        if (enSwitchCard) enSwitchCard.hidden = cardNode;
+        if (enSwitchCode) enSwitchCode.hidden = codeNode;
+        if (enConvertNormalWrap) enConvertNormalWrap.hidden = !readableNode;
+        if (enCodeLanguageWrap) enCodeLanguageWrap.hidden = !codeNode;
+        if (enCodeLanguage && codeNode) enCodeLanguage.value = normalizeCodeLanguage(n.language);
+        if (enBodyWrap) enBodyWrap.hidden = !bodyNode;
+        if (enBodyNote) enBodyNote.textContent = codeNode ? tc('bodyNoteCode') : stickyNode ? tc('bodyNoteSticky') : cardNode ? tc('bodyNoteCard') : previewNode ? tc('bodyNotePreview') : tc('bodyNoteIndex');
+        if (enBodyHint) enBodyHint.textContent = codeNode
+          ? tc('epBodyHintCode')
+          : stickyNode
+          ? tc('epBodyHintSticky')
+          : cardNode
+          ? tc('epBodyHintCard')
+          : previewNode
+          ? tc('epBodyHintPreview')
+          : tc('epBodyHintIndex');
+        if (enBody) {
+          enBody.hidden = !bodyNode || !codeNode;
+          if (bodyNode && codeNode && document.activeElement !== enBody) {
+            enBody.value = n.body || '';
+            enBody.placeholder = '直接输入代码。Tab 缩进，Shift+Tab 减少缩进。';
+            enBody.classList.add('code-source-editor');
+          }
+        }
+        if (enBodyRich) {
+          enBodyRich.hidden = !bodyNode || codeNode;
+          if (bodyNode && !codeNode && document.activeElement !== enBodyRich) {
+            setRichEditable(enBodyRich, n.body || '', richMarks(n, 'body'));
+          }
+        }
+        if (enBody && !bodyNode) {
+          enBody.value = '';
+          enBodyDirty = false;
+        }
+        if (enBodyRich && !bodyNode) enBodyRich.textContent = '';
+        if (enReviewWrap) enReviewWrap.hidden = !single || isDecorationNode(n);
+        if (enReviewEnabled && single) {
+          const review = (n.review && typeof n.review === 'object') ? n.review : {};
+          enReviewEnabled.checked = review.enabled === true;
+        }
+        if (enReviewQuestions && single && document.activeElement !== enReviewQuestions) {
+          const review = (n.review && typeof n.review === 'object') ? n.review : {};
+          const questions = Array.isArray(review.questions) ? review.questions : [];
+          enReviewQuestions.value = questions.join('\n');
+        }
+        if (enReviewAnswer && single && document.activeElement !== enReviewAnswer) {
+          const review = (n.review && typeof n.review === 'object') ? n.review : {};
+          enReviewAnswer.value = typeof review.answer === 'string' ? review.answer : '';
+        }
+        const shapeState = editSharedState(nodeTargets, (item) => item.shape || 'rect');
+        setActiveBtns(enShapeBtns, 'shape', shapeState.mixed ? '' : shapeState.value);
+        if (enShapeState) enShapeState.textContent = shapeState.mixed ? '混合' : '';
+
+        const borderState = editSharedState(nodeTargets, (item) => String(item.borderColor || '#000000').toLowerCase());
+        enBorder.value = borderState.value;
+        setEditMixedControl(enBorder, borderState.mixed);
+        if (enBorderState) enBorderState.textContent = borderState.mixed ? '混合' : '';
+
+        const bgState = editSharedState(nodeTargets, (item) => String(item.bgColor || '#ffffff').toLowerCase());
+        enBg.value = bgState.value;
+        setEditMixedControl(enBg, bgState.mixed);
+        if (enBgState) enBgState.textContent = bgState.mixed ? '混合' : '';
+        if (enNodeColorPresets) {
+          enNodeColorPresets.querySelectorAll('[data-node-color-preset]').forEach((button) => {
+            const preset = NORMAL_NODE_COLOR_PRESETS.find((item) => item.id === button.dataset.nodeColorPreset);
+            button.classList.toggle('active', !!preset && !borderState.mixed && !bgState.mixed
+              && preset.borderColor.toLowerCase() === borderState.value
+              && preset.bgColor.toLowerCase() === bgState.value);
+          });
+        }
+
+        const opacityState = editSharedState(nodeTargets, (item) => item.opacity == null ? 100 : Math.round(Number(item.opacity) * 100));
+        enOpacity.value = opacityState.value;
+        enOpacityVal.textContent = opacityState.mixed ? '混合' : opacityState.value + '%';
+        setEditMixedControl(enOpacity, opacityState.mixed);
+
+        const hideState = editSharedState(nodeTargets, (item) => !!item.hideChrome);
+        if (enHideChrome) {
+          enHideChrome.indeterminate = hideState.mixed;
+          enHideChrome.checked = !hideState.mixed && hideState.value;
+        }
+
+        const scaleState = editSharedState(nodeTargets, (item) => item.scale == null ? 100 : Math.round(Number(item.scale) * 100));
+        enScale.value = scaleState.value;
+        enScaleVal.textContent = scaleState.mixed ? '混合' : scaleState.value + '%';
+        setEditMixedControl(enScale, scaleState.mixed);
+
+        const radiusState = editSharedState(nodeTargets, (item) => editIsMindmapNode(item)
+          ? (Number(item.mindmapRadius) >= 0 ? Math.round(Number(item.mindmapRadius)) : 6)
+          : (Number(item.radius) >= 0 ? Math.round(Number(item.radius)) : 10));
+        if (enRadius) enRadius.value = radiusState.value;
+        if (enRadiusVal) enRadiusVal.textContent = radiusState.mixed ? '混合' : radiusState.value + 'px';
+        setEditMixedControl(enRadius, radiusState.mixed);
+
+        const weightState = editSharedState(nodeTargets, nodeFontWeightInfo);
+        const weightInfo = weightState.value || nodeFontWeightInfo(null);
+        const defaultWeightState = editSharedState(nodeTargets, editDefaultFontWeightForNode);
+        if (enFontWeight) enFontWeight.value = weightInfo.value;
+        if (enFontWeight) global.CanvasDiscreteRange.sync(enFontWeight, {
+          defaultValue: defaultWeightState.mixed ? null : defaultWeightState.value,
+        });
+        if (enFontWeightVal) enFontWeightVal.textContent = weightState.mixed
+          ? ((document.documentElement.dataset.uiLanguage === 'en') ? 'Mixed' : '混合')
+          : nodeFontWeightLabel(weightInfo, document.documentElement.dataset.uiLanguage === 'en');
+        setEditMixedControl(enFontWeight, weightState.mixed);
+
+        const fontScaleState = editSharedState(nodeTargets, (item) => Number(item.fontScale) > 0 ? Math.round(Number(item.fontScale) * 100) : 100);
+        if (enFontScale) enFontScale.value = fontScaleState.value;
+        if (enFontScaleVal) enFontScaleVal.textContent = fontScaleState.mixed ? '混合' : fontScaleState.value + '%';
+        setEditMixedControl(enFontScale, fontScaleState.mixed);
+
+        const alignState = editSharedState(nodeTargets, (item) => editIsMindmapNode(item)
+          ? (item.mindmapTextAlign || 'left') : (item.textAlign || 'left'));
+        setActiveBtns(enTextAlignBtns, 'textAlign', alignState.mixed ? '' : alignState.value);
+        if (enTextAlignState) enTextAlignState.textContent = alignState.mixed ? '混合' : '';
+      } else if (ed) {
+        if (eeApplyDefaults) eeApplyDefaults.disabled = edgeTargets.every(editIsMindmapEdge);
+        const curveState = editSharedState(edgeTargets, edgeCurveType);
+        setActiveBtns(eeCurveBtns, 'curve', curveState.mixed ? '' : curveState.value);
+        if (eeCurveState) eeCurveState.textContent = curveState.mixed ? '混合' : '';
+        const lineState = editSharedState(edgeTargets, edgeLineStyle);
+        setActiveBtns(eeLineStyleBtns, 'lineStyle', lineState.mixed ? '' : lineState.value);
+        if (eeLineStyleState) eeLineStyleState.textContent = lineState.mixed ? '混合' : '';
+        const arrowState = editSharedState(edgeTargets, (item) => item.arrow || 'none');
+        setActiveBtns(eeArrowBtns, 'arrow', arrowState.mixed ? '' : arrowState.value);
+        if (eeArrowState) eeArrowState.textContent = arrowState.mixed ? '混合' : '';
+        const widthState = editSharedState(edgeTargets, (item) => item.width == null ? 1.5 : Number(item.width));
+        eeWidth.value = widthState.value;
+        eeWidthVal.textContent = widthState.mixed ? '混合' : String(widthState.value);
+        setEditMixedControl(eeWidth, widthState.mixed);
+        const arrowSizeState = editSharedState(edgeTargets, (item) => item.arrowSize == null ? 12 : Number(item.arrowSize));
+        eeArrowSize.value = arrowSizeState.value;
+        eeArrowSizeVal.textContent = arrowSizeState.mixed ? '混合' : String(arrowSizeState.value);
+        setEditMixedControl(eeArrowSize, arrowSizeState.mixed);
+        const colorState = editSharedState(edgeTargets, (item) => String(item.color || '#000000').toLowerCase());
+        if (eeColor) eeColor.value = colorState.value;
+        setEditMixedControl(eeColor, colorState.mixed);
+        if (eeColorState) eeColorState.textContent = colorState.mixed ? '混合' : '';
+        if (eeColorPresets) {
+          eeColorPresets.querySelectorAll('[data-edge-color-preset]').forEach((button) => {
+            const preset = NORMAL_EDGE_COLOR_PRESETS.find((item) => item.id === button.dataset.edgeColorPreset);
+            button.classList.toggle('active', !!preset && !colorState.mixed
+              && preset.color.toLowerCase() === colorState.value);
+          });
+        }
+      } else {
+        if (enBody) { enBody.value = ''; enBody.hidden = true; }
+        if (enBodyRich) { enBodyRich.textContent = ''; enBodyRich.hidden = true; }
+        if (enReviewWrap) enReviewWrap.hidden = true;
+        if (enReviewQuestions) enReviewQuestions.value = '';
+        enBodyDirty = false;
+      }
+      if (animateSelectionChange) animateEditSelectionSections();
+    }
+    // 改当前选中节点/连线的某属性（批量：作用于全部选中目标）。
+    // isDefault=true → 删字段回默认，保 .canvas 干净。
+    function notifyEditStyleChange() {
+      redrawMinimap();
+      onChange();
+    }
+    function editNodeField(prop, value, isDefault) {
+      const targets = editNodeTargets();
+      if (!targets.length) return;
+      const changedIds = new Set();
+      targets.forEach((n) => {
+        if (isDefault) delete n[prop]; else n[prop] = value;
+        if ((prop === 'bgColor' || prop === 'borderColor' || prop === 'opacity' || prop === 'hideChrome')
+            && (n.mindmapColorMode || n.mindmapStylePreset)) {
+          markMindmapNodeColorCustom(n);
+        }
+        if ((prop === 'scale' || prop === 'width' || prop === 'shape') && (n.mindmapSizeMode || n.mindmapStylePreset)) {
+          n.mindmapSizeMode = 'custom';
+        }
+        const el = nodeMap.get(n.id);
+        if (el) applyNodeStyle(el, n);
+        if (prop === 'scale' || prop === 'width') {
+          nodeSizeCache.delete(n.id);
+          changedIds.add(n.id);
+        }
+      });
+      if (changedIds.size) {
+        edgesIncidentTo(changedIds).forEach(updateEdgePath);
+        redrawMinimap();
+      }
+      notifyEditStyleChange();
+    }
+    function editEdgeField(prop, value, isDefault) {
+      const targets = editEdgeTargets();
+      if (!targets.length) return;
+      targets.forEach((ed) => {
+        if (isDefault) delete ed[prop]; else ed[prop] = value;
+        const refs = edgeMap.get(ed.id); if (refs) applyEdgeStyle(refs, ed);
+        updateEdgePath(ed);
+      });
+      notifyEditStyleChange();
+    }
+    function editNodeContextField(kind, value) {
+      const targets = editNodeTargets();
+      if (!targets.length) return;
+      const changedIds = new Set();
+      targets.forEach((node) => {
+        const mindmap = editIsMindmapNode(node);
+        if (kind === 'radius') {
+          if (mindmap) node.mindmapRadius = value;
+          else node.radius = value;
+        } else if (kind === 'fontWeight') {
+          if (mindmap) node.mindmapFontWeight = value;
+          else node.fontWeight = value;
+        } else if (kind === 'textAlign') {
+          if (mindmap) node.mindmapTextAlign = value;
+          else node.textAlign = value;
+        } else if (kind === 'fontScale') {
+          if (Number(value) === 1) delete node.fontScale;
+          else node.fontScale = value;
+        }
+        if (mindmap) node.mindmapSizeMode = 'custom';
+        const el = nodeMap.get(node.id);
+        if (el) applyNodeStyle(el, node);
+        nodeSizeCache.delete(node.id);
+        changedIds.add(node.id);
+      });
+      edgesIncidentTo(changedIds).forEach(updateEdgePath);
+      notifyEditStyleChange();
+    }
+    function writeNormalNodeAppearance(node, source) {
+      if (!node || editIsMindmapNode(node)) return false;
+      const d = source && typeof source === 'object' ? source : {};
+      const shape = d.shape === 'square' || d.shape === 'circle' ? d.shape : 'rect';
+      if (shape === 'rect') delete node.shape; else node.shape = shape;
+
+      const border = typeof d.borderColor === 'string' ? d.borderColor.toLowerCase() : '#000000';
+      if (border === '#000000') delete node.borderColor; else node.borderColor = border;
+      const fullStickyDefaults = document.body.dataset.modeSubmode !== 'clean' && isStickyNode(node);
+      if (fullStickyDefaults) {
+        const stickyBg = normalizeHexColor(d.stickyBgColor);
+        if (d.stickyColorMode === 'fixed' && stickyBg) node.bgColor = stickyBg;
+        else node.bgColor = randomStickyColor(node.bgColor);
+      } else {
+        const bg = typeof d.bgColor === 'string' ? d.bgColor.toLowerCase() : '#ffffff';
+        if (bg === '#ffffff') delete node.bgColor; else node.bgColor = bg;
+      }
+
+      const opacity = Number(d.opacity);
+      if (!Number.isFinite(opacity) || opacity === 1) delete node.opacity; else node.opacity = opacity;
+      if (d.hideChrome) node.hideChrome = true; else delete node.hideChrome;
+      const scale = Number(d.scale);
+      if (!Number.isFinite(scale) || scale === 1) delete node.scale;
+      else node.scale = Math.max(0.5, Math.min(2, scale));
+
+      const radius = Number(d.radius);
+      if (!Number.isFinite(radius) || radius === 10) delete node.radius; else node.radius = radius;
+      const fontWeight = normalizedFontWeight(d.fontWeight);
+      if (Object.prototype.hasOwnProperty.call(d, 'fontWeight') && Number.isFinite(fontWeight)) node.fontWeight = fontWeight;
+      else delete node.fontWeight;
+      const fontScale = Number(d.fontScale);
+      if (!Number.isFinite(fontScale) || fontScale === 1) delete node.fontScale; else node.fontScale = fontScale;
+      const textAlign = d.textAlign === 'center' || d.textAlign === 'right' ? d.textAlign : 'left';
+      if (textAlign === 'left') delete node.textAlign; else node.textAlign = textAlign;
+      return true;
+    }
+    function refreshEditedNodes(targets, sizeChanged) {
+      const changedIds = new Set();
+      targets.forEach((node) => {
+        const el = nodeMap.get(node.id);
+        if (el) applyNodeStyle(el, node);
+        if (sizeChanged) {
+          nodeSizeCache.delete(node.id);
+          changedIds.add(node.id);
+        }
+      });
+      if (changedIds.size) edgesIncidentTo(changedIds).forEach(updateEdgePath);
+      notifyEditStyleChange();
+      refreshEditPanel();
+    }
+    function applySelectedNodeColorPreset(preset) {
+      const targets = editNodeTargets();
+      if (!targets.length || !preset) return false;
+      const border = String(preset.borderColor || '#000000').toLowerCase();
+      const bg = String(preset.bgColor || '#ffffff').toLowerCase();
+      targets.forEach((node) => {
+        if (border === '#000000') delete node.borderColor; else node.borderColor = border;
+        // 普通节点无 bgColor 时本来就是白底；便签过去却会落到旧的黄色 CSS
+        // 兜底。批量混选后点“黑框白底”时，为便签显式保留白色，避免同一
+        // 个预设在不同节点类型上呈现成两种颜色。
+        if (bg === '#ffffff' && !isStickyNode(node)) delete node.bgColor;
+        else node.bgColor = bg;
+        if (editIsMindmapNode(node)) markMindmapNodeColorCustom(node);
+      });
+      refreshEditedNodes(targets, false);
+      pushHistory();
+      showCanvasToast(((typeof window.__tc === 'function') ? window.__tc('epAppliedColors') : '') || '已应用配色');
+      return true;
+    }
+    function applySelectedEdgeColorPreset(preset) {
+      const targets = editEdgeTargets();
+      if (!targets.length || !preset) return false;
+      const color = String(preset.color || '#000000').toLowerCase();
+      targets.forEach((edge) => {
+        if (color === '#000000') delete edge.color; else edge.color = color;
+        const refs = edgeMap.get(edge.id);
+        if (refs) applyEdgeStyle(refs, edge);
+        updateEdgePath(edge);
+      });
+      notifyEditStyleChange();
+      refreshEditPanel();
+      pushHistory();
+      showCanvasToast(((typeof window.__tc === 'function') ? window.__tc('epAppliedLineColor') : '') || '已应用连线颜色');
+      return true;
+    }
+    function editDefaultFontWeightForNode(node) {
+      if (!editIsMindmapNode(node)) return nodeFontWeightDefaultInfo(node).value;
+      const tree = buildManagedMindmapTree(node);
+      if (!tree || !tree.valid || !tree.depth.has(node.id)) return 500;
+      const depth = tree.depth.get(node.id) || 0;
+      const presetId = MINDMAP_STYLE_PRESETS[node.mindmapStylePreset]
+        ? node.mindmapStylePreset
+        : ((document.body && document.body.dataset.mindmapPreset) || 'paper');
+      const level = mindmapLevelForDepth(mindmapPreset(presetId), depth);
+      return Number(level.fontWeight) || 500;
+    }
+    function restoreEditMindmapTypographyForNode(node) {
+      if (!editIsMindmapNode(node)) return false;
+      const tree = buildManagedMindmapTree(node);
+      if (!tree || !tree.valid || !tree.depth.has(node.id)) return false;
+      const depth = tree.depth.get(node.id) || 0;
+      const presetId = MINDMAP_STYLE_PRESETS[node.mindmapStylePreset]
+        ? node.mindmapStylePreset
+        : ((document.body && document.body.dataset.mindmapPreset) || 'paper');
+      const level = mindmapLevelForDepth(mindmapPreset(presetId), depth);
+      node.mindmapRadius = level.radius;
+      node.mindmapFontWeight = editDefaultFontWeightForNode(node);
+      node.mindmapTextAlign = level.textAlign;
+      delete node.fontScale;
+      return true;
+    }
+    function resetSelectedNodeFontWeight() {
+      const targets = editNodeTargets();
+      if (!targets.length) return false;
+      const changed = targets.filter((node) => {
+        if (editIsMindmapNode(node)) {
+          const next = editDefaultFontWeightForNode(node);
+          if (Number(node.mindmapFontWeight) === next) return false;
+          node.mindmapFontWeight = next;
+          node.mindmapSizeMode = 'custom';
+          return true;
+        }
+        if (!Object.prototype.hasOwnProperty.call(node, 'fontWeight')) return false;
+        delete node.fontWeight;
+        return true;
+      });
+      if (!changed.length) return false;
+      refreshEditedNodes(changed, true);
+      pushHistory();
+      return true;
+    }
+    function resetSelectedNodeAppearanceSection(section) {
+      const targets = editNodeTargets();
+      if (!targets.length) return false;
+      let sizeChanged = false;
+      targets.forEach((node) => {
+        const mindmap = editIsMindmapNode(node);
+        if (section === 'colors') {
+          if (mindmap) restoreEditMindmapColorForNode(node);
+          else {
+            delete node.borderColor;
+            if (isStickyNode(node)) node.bgColor = randomStickyColor(node.bgColor);
+            else delete node.bgColor;
+          }
+        } else if (section === 'geometry') {
+          delete node.shape;
+          delete node.scale;
+          if (mindmap) restoreEditMindmapSizeForNode(node);
+          sizeChanged = true;
+        } else if (section === 'typography') {
+          if (mindmap) restoreEditMindmapTypographyForNode(node);
+          else ['radius', 'fontWeight', 'fontScale', 'textAlign'].forEach((prop) => { delete node[prop]; });
+          sizeChanged = true;
+        }
+      });
+      refreshEditedNodes(targets, sizeChanged);
+      pushHistory();
+      const tc = typeof window.__tc === 'function' ? window.__tc : function () { return ''; };
+      const key = section === 'colors' ? 'epRestoredColors'
+        : (section === 'geometry' ? 'epRestoredGeometry' : 'epRestoredTypography');
+      showCanvasToast(tc(key) || '已恢复所选外观');
+      return true;
+    }
+    function applyCurrentNodeDefaultsToSelection() {
+      const targets = editNodeTargets();
+      if (!targets.length) return false;
+      const ordinary = targets.filter((node) => !editIsMindmapNode(node));
+      const tc = typeof window.__tc === 'function' ? window.__tc : function () { return ''; };
+      if (!ordinary.length) {
+        showCanvasToast(tc('epNormalDefaultsMindmapOnly') || '脑图节点请使用脑图预设恢复');
+        return false;
+      }
+      const defaults = readNodeDefaults();
+      ordinary.forEach((node) => { writeNormalNodeAppearance(node, defaults); });
+      refreshEditedNodes(ordinary, true);
+      pushHistory();
+      const skipped = targets.length - ordinary.length;
+      showCanvasToast(skipped
+        ? (tc('epAppliedDefaultsSkipped') || '已应用新建样式，并跳过脑图节点').replace('N', skipped)
+        : (tc('epAppliedDefaults') || '已应用当前新建样式'));
+      return true;
+    }
+    function applyCurrentEdgeDefaultsToSelection() {
+      const targets = editEdgeTargets();
+      if (!targets.length) return false;
+      const ordinary = targets.filter((edge) => !editIsMindmapEdge(edge));
+      const tc = typeof window.__tc === 'function' ? window.__tc : function () { return ''; };
+      if (!ordinary.length) {
+        showCanvasToast(tc('epNormalDefaultsMindmapEdgeOnly') || '脑图连线请使用脑图预设恢复');
+        return false;
+      }
+      const d = readEdgeDefaults();
+      ordinary.forEach((edge) => {
+        const curve = d.curve && d.curve !== 'bezier' ? d.curve : '';
+        if (curve) edge.curve = curve; else delete edge.curve;
+        const lineStyle = d.lineStyle && d.lineStyle !== 'solid' ? d.lineStyle : '';
+        if (lineStyle) edge.lineStyle = lineStyle; else delete edge.lineStyle;
+        const arrow = d.arrow && d.arrow !== 'none' ? d.arrow : '';
+        if (arrow) edge.arrow = arrow; else delete edge.arrow;
+        const color = typeof d.color === 'string' ? d.color.toLowerCase() : '#000000';
+        if (color === '#000000') delete edge.color; else edge.color = color;
+        const width = Number(d.width);
+        if (!Number.isFinite(width) || width === 1.5) delete edge.width; else edge.width = width;
+        const arrowSize = Number(d.arrowSize);
+        if (!Number.isFinite(arrowSize) || arrowSize === 12) delete edge.arrowSize; else edge.arrowSize = arrowSize;
+        const refs = edgeMap.get(edge.id);
+        if (refs) applyEdgeStyle(refs, edge);
+        updateEdgePath(edge);
+      });
+      notifyEditStyleChange();
+      refreshEditPanel();
+      pushHistory();
+      const skipped = targets.length - ordinary.length;
+      showCanvasToast(skipped
+        ? (tc('epAppliedEdgeDefaultsSkipped') || '已应用新建连线样式，并跳过脑图连线').replace('N', skipped)
+        : (tc('epAppliedEdgeDefaults') || '已应用当前新建连线样式'));
+      return true;
+    }
+    function restoreEditMindmapColorForNode(node) {
+      if (!editIsMindmapNode(node)) return false;
+      const tree = buildManagedMindmapTree(node);
+      if (!tree || !tree.valid || !tree.depth.has(node.id)) return false;
+      const depth = tree.depth.get(node.id) || 0;
+      const presetId = MINDMAP_STYLE_PRESETS[node.mindmapStylePreset]
+        ? node.mindmapStylePreset
+        : ((document.body && document.body.dataset.mindmapPreset) || 'paper');
+      const preset = mindmapPreset(presetId);
+      if (depth === 0) {
+        writeMindmapNodePalette(node, {
+          bgColor: preset.center.bgColor,
+          borderColor: preset.center.borderColor,
+          opacity: preset.center.opacity,
+        }, presetId, preset.center.borderColor, 0, 'auto');
+      } else {
+        const level = depth === 1 ? preset.branch : preset.leaf;
+        const branchColor = mindmapBranchColor(tree, node.id, preset);
+        writeMindmapNodePalette(node, {
+          bgColor: mixMindmapHex(branchColor, '#ffffff', level.bgMix),
+          borderColor: branchColor,
+          opacity: level.opacity,
+        }, presetId, branchColor, depth, 'auto');
+      }
+      return true;
+    }
+    function restoreEditMindmapSizeForNode(node) {
+      if (!editIsMindmapNode(node)) return false;
+      const tree = buildManagedMindmapTree(node);
+      if (!tree || !tree.valid || !tree.depth.has(node.id)) return false;
+      const depth = tree.depth.get(node.id) || 0;
+      const presetId = MINDMAP_STYLE_PRESETS[node.mindmapStylePreset]
+        ? node.mindmapStylePreset
+        : ((document.body && document.body.dataset.mindmapPreset) || 'paper');
+      const factor = Number(node.mindmapSizeFactor) > 0 ? Number(node.mindmapSizeFactor) : 1;
+      writeMindmapNodeSize(node, presetId, depth, factor, true);
+      return true;
+    }
+    function restoreEditMindmapColors() {
+      const targets = editNodeTargets().filter(editIsMindmapNode);
+      if (!targets.length) return;
+      let changed = 0;
+      targets.forEach((node) => { if (restoreEditMindmapColorForNode(node)) changed += 1; });
+      if (!changed) return;
+      pushHistory();
+      notifyEditStyleChange();
+      refreshEditPanel();
+      showCanvasToast('已恢复预设配色');
+    }
+    function restoreEditMindmapSizes() {
+      const targets = editNodeTargets().filter(editIsMindmapNode);
+      if (!targets.length) return;
+      const changedIds = new Set();
+      targets.forEach((node) => {
+        if (restoreEditMindmapSizeForNode(node)) changedIds.add(node.id);
+      });
+      if (!changedIds.size) return;
+      edgesIncidentTo(changedIds).forEach(updateEdgePath);
+      pushHistory();
+      notifyEditStyleChange();
+      refreshEditPanel();
+      showCanvasToast('已恢复自动文字尺寸');
+    }
+    function resetSelectedNodeAppearance() {
+      const targets = editNodeTargets();
+      if (!targets.length) return;
+      const changedIds = new Set();
+      targets.forEach((node) => {
+        if (editIsMindmapNode(node)) {
+          restoreEditMindmapColorForNode(node);
+          restoreEditMindmapSizeForNode(node);
+          const tree = buildManagedMindmapTree(node);
+          const depth = tree && tree.valid && tree.depth.has(node.id) ? (tree.depth.get(node.id) || 0) : 0;
+          const presetId = MINDMAP_STYLE_PRESETS[node.mindmapStylePreset]
+            ? node.mindmapStylePreset : ((document.body && document.body.dataset.mindmapPreset) || 'paper');
+          const level = mindmapLevelForDepth(mindmapPreset(presetId), depth);
+          delete node.shape;
+          if (level.hideChrome) node.hideChrome = true;
+          else delete node.hideChrome;
+        } else {
+          ['shape', 'borderColor', 'bgColor', 'opacity', 'hideChrome', 'scale', 'radius', 'fontWeight', 'fontScale', 'textAlign']
+            .forEach((prop) => { delete node[prop]; });
+        }
+        const el = nodeMap.get(node.id);
+        if (el) applyNodeStyle(el, node);
+        nodeSizeCache.delete(node.id);
+        changedIds.add(node.id);
+      });
+      edgesIncidentTo(changedIds).forEach(updateEdgePath);
+      pushHistory();
+      notifyEditStyleChange();
+      refreshEditPanel();
+      showCanvasToast(((typeof window.__tc === 'function') ? window.__tc('epRestoredBuiltIn') : '') || '已恢复内置朴素外观');
+    }
+    function resetSelectedEdgeAppearance() {
+      const targets = editEdgeTargets();
+      if (!targets.length) return;
+      targets.forEach((edge) => {
+        if (restoreEditMindmapEdgeForPreset(edge)) return;
+        ['curve', 'lineStyle', 'arrow', 'width', 'arrowSize', 'color'].forEach((prop) => { delete edge[prop]; });
+        const refs = edgeMap.get(edge.id);
+        if (refs) applyEdgeStyle(refs, edge);
+        updateEdgePath(edge);
+      });
+      pushHistory();
+      notifyEditStyleChange();
+      refreshEditPanel();
+      showCanvasToast(((typeof window.__tc === 'function') ? window.__tc('epRestoredBuiltInLine') : '') || '已恢复内置朴素连线');
+    }
+    function createGroupFromSelection() {
+      const members = editNodeTargets();
+      if (members.length < 2) return;
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      members.forEach(function (node) {
+        const rect = nodeRect(node);
+        minX = Math.min(minX, rect.x);
+        minY = Math.min(minY, rect.y);
+        maxX = Math.max(maxX, rect.x + rect.w);
+        maxY = Math.max(maxY, rect.y + rect.h);
+      });
+      const padX = 34, padTop = 38, padBottom = 28;
+      createGroupBoxFromRect({
+        x: minX - padX,
+        y: minY - padTop,
+        w: Math.max(120, maxX - minX + padX * 2),
+        h: Math.max(82, maxY - minY + padTop + padBottom),
+      }, members.map(function (node) { return node.id; }));
+    }
+    function editMindmapEdgePresetStyle(edge) {
+      if (!editIsMindmapEdge(edge)) return false;
+      const from = findNode(edge.from);
+      const tree = buildManagedMindmapTree(from);
+      if (!tree || !tree.valid || !tree.depth.has(edge.from) || !tree.depth.has(edge.to)) return false;
+      let childId = null;
+      if (tree.parentOf.get(edge.to) === edge.from) childId = edge.to;
+      else if (tree.parentOf.get(edge.from) === edge.to) childId = edge.from;
+      else childId = (tree.depth.get(edge.to) || 0) >= (tree.depth.get(edge.from) || 0) ? edge.to : edge.from;
+      const child = findNode(childId);
+      const depth = tree.depth.get(childId) || 1;
+      const presetId = MINDMAP_STYLE_PRESETS[child && child.mindmapStylePreset]
+        ? child.mindmapStylePreset
+        : ((document.body && document.body.dataset.mindmapPreset) || 'paper');
+      const preset = mindmapPreset(presetId);
+      const level = depth <= 1 ? preset.branch : preset.leaf;
+      const branchColor = mindmapBranchColor(tree, childId, preset);
+      return {
+        color: branchColor,
+        width: level.width,
+        curve: level.curve,
+        lineStyle: level.lineStyle,
+      };
+    }
+    function restoreEditMindmapEdgeForPreset(edge) {
+      const style = editMindmapEdgePresetStyle(edge);
+      if (!style) return false;
+      writeMindmapEdgeStyle(edge, style, false);
+      return true;
+    }
+    function titleFromBody(body) {
+      const first = String(body || '').split(/\r?\n/).find((line) => line.trim()) || '';
+      const clean = first.replace(/^\s*#{1,6}\s+/, '').trim();
+      if (!clean) return '未命名索引';
+      return clean.length > 32 ? clean.slice(0, 32) + '...' : clean;
+    }
+    function syncStickyTitleFromBody(node, body) {
+      const value = String(body || '');
+      const lines = value.split(/\r?\n/);
+      let offset = 0;
+      let raw = '';
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].trim()) { raw = lines[i]; break; }
+        offset += lines[i].length + 1;
+      }
+      if (!raw) {
+        node.text = '';
+        delete node.textMarks;
+        return;
+      }
+      const heading = /^\s*#{1,6}\s+/.exec(raw);
+      const withoutHeading = raw.slice(heading ? heading[0].length : 0);
+      const leading = (withoutHeading.match(/^\s*/) || [''])[0].length;
+      const clean = withoutHeading.trim();
+      node.text = clean.length > 32 ? clean.slice(0, 32) + '...' : clean;
+      const start = offset + (heading ? heading[0].length : 0) + leading;
+      const marks = RichText ? RichText.slice(value, richMarks(node, 'body'), start, start + Math.min(32, clean.length)) : [];
+      storeRichMarks(node, 'text', marks);
+    }
+    function codeTitleFromBody(body, language) {
+      const first = String(body || '').split(/\r?\n/).find((line) => line.trim()) || '';
+      const label = codeLanguageLabel(language);
+      if (!first) return label + ' 代码';
+      const clean = first.trim();
+      return clean.length > 32 ? clean.slice(0, 32) + '...' : clean;
+    }
+    function prependNodeTitleToBody(node) {
+      const title = String(node.text || '');
+      const body = String(node.body || '');
+      if (!title) return;
+      const first = body.split('\n')[0].trim();
+      if (body && title.trim() === first) return;
+      const bundle = RichText ? RichText.concat([
+        { text: title, marks: richMarks(node, 'text') },
+        { text: body ? '\n\n' : '', marks: [] },
+        { text: body, marks: richMarks(node, 'body') },
+      ]) : { text: title + (body ? '\n\n' + body : ''), marks: [] };
+      node.body = bundle.text;
+      storeRichMarks(node, 'body', bundle.marks);
+    }
+    function stripDuplicateTitleFromBody(node) {
+      const original = String(node.body || '');
+      if (!original || !node.text || node.text.trim() !== original.split('\n')[0].trim()) return;
+      const lines = original.split('\n');
+      let firstBodyLine = 1;
+      while (firstBodyLine < lines.length && lines[firstBodyLine].trim() === '') firstBodyLine += 1;
+      const rest = lines.slice(firstBodyLine).join('\n');
+      const offset = original.length - rest.length;
+      const nextMarks = richSlice(node, 'body', offset, original.length);
+      if (rest) node.body = rest;
+      else delete node.body;
+      storeRichMarks(node, 'body', nextMarks);
+    }
+    function convertSelectedToBodyNode(kind) {
+      const n = editGetNode();
+      if (!n || isReadableNode(n) || currentMode() === 'decor') return;
+      const body = n.text || '';
+      n.kind = kind;
+      ensureStickyNodeColor(n);
+      if (kind === 'code') n.language = normalizeCodeLanguage(n.language || readDefaultCodeLanguage());
+      if (kind !== 'index' && body) {
+        n.body = body;
+        if (kind === 'code') delete n.bodyMarks;
+        else storeRichMarks(n, 'body', richMarks(n, 'text'));
+      }
+      if (kind === 'index') delete n.bodyMarks;
+      n.text = kind === 'code' ? codeTitleFromBody(body, n.language) : (body || titleFromBody(body));
+      if (kind === 'code') delete n.textMarks;
+      const el = nodeMap.get(n.id);
+      if (el) {
+        applyNodeStyle(el, n);
+        const textEl = el.querySelector('.node-text');
+        delete textEl.dataset.source;
+        renderBodyNodeContent(textEl, n);
+        renderTextNodeMeta(el, n);
+      }
+      edgesIncidentTo(new Set([n.id])).forEach(updateEdgePath);
+      pushHistory();
+      notify();
+      refreshEditPanel();
+    }
+    function convertSelectedToTextNode() {
+      convertSelectedToBodyNode('index');
+    }
+    function convertSelectedToPreviewNode() {
+      convertSelectedToBodyNode('preview');
+    }
+    function convertSelectedToCardNode() {
+      convertSelectedToBodyNode('card');
+    }
+    function convertSelectedToCodeNode() {
+      convertSelectedToBodyNode('code');
+    }
+    function switchSelectedBodyNodeKind(kind) {
+      const n = editGetNode();
+      if (!n || !isReadableNode(n) || (isIndexNode(n) ? kind === 'index' : n.kind === kind) || currentMode() === 'decor') return;
+      var prevKind = n.kind;
+
+      // ── 内容迁移：标题不在转换中丢失或重复 ──
+      // 卡片/预览 → 便签/代码：便签和代码只展示 body，标题 text 在画布上不可见
+      if ((prevKind === 'card' || prevKind === 'preview') && (kind === 'sticky' || kind === 'code')) {
+        prependNodeTitleToBody(n);
+      }
+
+      // 便签/代码 → 卡片/预览：text 是 body 首行的自动提取，转换为卡片后标题和正文首行重复
+      if ((prevKind === 'sticky' || prevKind === 'code') && (kind === 'card' || kind === 'preview')) {
+        stripDuplicateTitleFromBody(n);
+      }
+
+      n.kind = kind;
+      ensureStickyNodeColor(n);
+      if (kind === 'index') {
+        delete n.body;
+        delete n.bodyMarks;
+        delete n.language;
+      }
+      if (kind === 'code') {
+        n.language = normalizeCodeLanguage(n.language || readDefaultCodeLanguage());
+        delete n.bodyMarks;
+      }
+      const el = nodeMap.get(n.id);
+      if (el) {
+        applyNodeStyle(el, n);
+        const textEl = el.querySelector('.node-text');
+        delete textEl.dataset.source;
+        if (isCodeNode(n)) renderCodeNodeText(textEl, n.body || '', n.language);
+        else renderBodyNodeContent(textEl, n);
+        renderTextNodeMeta(el, n);
+      }
+      // 正文节点都支持 F 阅读：切换种类时阅读浮层保持打开，只刷新标签
+      if (readingNodeId === n.id) renderTextReader(n);
+      edgesIncidentTo(new Set([n.id])).forEach(updateEdgePath);
+      pushHistory();
+      notify();
+      refreshEditPanel();
+    }
+    function requestConvertSelectedToNormalNode() {
+      const n = editGetNode();
+      if (!n || !isReadableNode(n) || currentMode() === 'decor') return;
+      const nodeId = n.id;
+      showConfirm({
+        title: tc('epConvertConfirmTitle'),
+        detail: tc('epConvertConfirmDetail') + (n.text || 'Untitled'),
+        okLabel: tc('epConvertConfirmOk'),
+        destructive: true,
+      }, function () {
+        const node = findNode(nodeId);
+        if (!node || !isReadableNode(node)) return;
+        if (readingNodeId === node.id) closeTextReader();
+        delete node.kind;
+        delete node.body;
+        delete node.bodyMarks;
+        delete node.language;
+        enBodyDirty = false;
+        const el = nodeMap.get(node.id);
+        if (el) {
+          applyNodeStyle(el, node);
+          const textEl = el.querySelector('.node-text');
+          delete textEl.dataset.source;
+          renderNodeText(textEl, node.text || '', richMarks(node, 'text'));
+          renderTextNodeMeta(el, node);
+        }
+        edgesIncidentTo(new Set([node.id])).forEach(updateEdgePath);
+        pushHistory();
+        notify();
+        refreshEditPanel();
+      });
+    }
+    function applyTextNodeBody(node, value, marks) {
+      if (!node || !isBodyNode(node)) return;
+      if (!isCodeNode(node) && marks != null) {
+        const draft = canonicalRichDraft({ text: value, marks: marks });
+        value = draft.text;
+        marks = draft.marks;
+      }
+      if (value) node.body = value;
+      else delete node.body;
+      if (isCodeNode(node)) delete node.bodyMarks;
+      else if (marks != null) storeRichMarks(node, 'body', marks);
+      if (isCodeNode(node)) {
+        node.text = codeTitleFromBody(value, node.language);
+        delete node.textMarks;
+      }
+      else if (isStickyNode(node)) syncStickyTitleFromBody(node, value);
+      const el = nodeMap.get(node.id);
+      if (el) {
+        renderTextNodeMeta(el, node);
+        if (isPreviewNode(node) || isCardNode(node) || isStickyNode(node)) animatePreviewNodeGeometry(node.id);
+      }
+      if (enBody && editGetNode() === node && document.activeElement !== enBody) {
+        enBody.value = value;
+      }
+      if (enBodyRich && editGetNode() === node && document.activeElement !== enBodyRich && !isCodeNode(node)) {
+        setRichEditable(enBodyRich, value, richMarks(node, 'body'));
+      }
+      notify();
+    }
+    function updateTextNodeBody() {
+      const n = editGetNode();
+      if (!n || !isBodyNode(n) || currentMode() === 'decor' || !enBody) return;
+      enBodyDirty = true;
+      applyTextNodeBody(n, enBody.value);
+    }
+    function updateRichTextNodeBody() {
+      const n = editGetNode();
+      if (!n || !isBodyNode(n) || isCodeNode(n) || currentMode() === 'decor' || !enBodyRich) return;
+      const draft = readRichEditable(enBodyRich);
+      enBodyDirty = true;
+      applyTextNodeBody(n, draft.text, draft.marks);
+    }
+    function renderNormalColorPresetButtons(container, presets, type) {
+      if (!container) return;
+      const english = document.body && document.body.dataset.toolbarLanguage === 'en';
+      const frag = document.createDocumentFragment();
+      presets.forEach((preset) => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = type === 'node' ? 'canvas-color-preset' : 'canvas-edge-color-preset';
+        const label = english ? preset.en : preset.zh;
+        button.title = label;
+        button.setAttribute('aria-label', label);
+        if (type === 'node') {
+          button.dataset.nodeColorPreset = preset.id;
+          button.style.setProperty('--canvas-preset-border', preset.borderColor);
+          button.style.setProperty('--canvas-preset-bg', preset.bgColor);
+          button.addEventListener('click', () => applySelectedNodeColorPreset(preset));
+        } else {
+          button.dataset.edgeColorPreset = preset.id;
+          button.style.setProperty('--canvas-edge-preset-color', preset.color);
+          button.addEventListener('click', () => applySelectedEdgeColorPreset(preset));
+        }
+        frag.append(button);
+      });
+      container.replaceChildren(frag);
+    }
+    function setupEditPanel() {
+      if (!editPanel) return;
+      const q = (sel) => editPanel.querySelector(sel);
+      const qa = (sel) => editPanel.querySelectorAll(sel);
+      epEmpty = q('[data-role="edit-empty"]');
+      epNodeSec = q('[data-role="edit-node"]');
+      epEdgeSec = q('[data-role="edit-edge"]');
+      enSelectionTitle = q('[data-role="en-selection-title"]');
+      enSelectionBadge = q('[data-role="en-selection-badge"]');
+      eeSelectionTitle = q('[data-role="ee-selection-title"]');
+      eeSelectionBadge = q('[data-role="ee-selection-badge"]');
+      enCreateGroup = q('[data-role="en-create-group"]');
+      enBatchNote = q('[data-role="en-batch-note"]');
+      eeBatchNote = q('[data-role="ee-batch-note"]');
+      enMindmapContext = q('[data-role="en-mindmap-context"]');
+      enMindmapState = q('[data-role="en-mindmap-state"]');
+      enMindmapResetColor = q('[data-role="en-mindmap-reset-color"]');
+      enMindmapResetSize = q('[data-role="en-mindmap-reset-size"]');
+      enShapeBtns = qa('[data-role="en-shape"] button');
+      enShapeState = q('[data-role="en-shape-state"]');
+      enBorder = q('[data-role="en-border"]');
+      enBorderState = q('[data-role="en-border-state"]');
+      enBg = q('[data-role="en-bg"]');
+      enBgState = q('[data-role="en-bg-state"]');
+      enNodeColorPresets = q('[data-role="en-node-color-presets"]');
+      enResetColors = q('[data-role="en-reset-colors"]');
+      enOpacity = q('[data-role="en-opacity"]');
+      enOpacityVal = q('[data-role="en-opacity-val"]');
+      enHideChrome = q('[data-role="en-hide-chrome"]');
+      enScale = q('[data-role="en-scale"]');
+      enScaleVal = q('[data-role="en-scale-val"]');
+      enResetGeometry = q('[data-role="en-reset-geometry"]');
+      enRadius = q('[data-role="en-radius"]');
+      enRadiusVal = q('[data-role="en-radius-val"]');
+      enFontWeight = q('[data-role="en-font-weight"]');
+      enFontWeightVal = q('[data-role="en-font-weight-val"]');
+      enFontScale = q('[data-role="en-font-scale"]');
+      enFontScaleVal = q('[data-role="en-font-scale-val"]');
+      enTextAlignBtns = qa('[data-role="en-text-align"] button');
+      enTextAlignState = q('[data-role="en-text-align-state"]');
+      enResetTypography = q('[data-role="en-reset-typography"]');
+      enApplyDefaults = q('[data-role="en-apply-defaults"]');
+      enResetAppearance = q('[data-role="en-reset-appearance"]');
+      enTextBanner = q('[data-role="en-text-banner"]');
+      enKindLabel = q('[data-role="en-kind-label"]');
+      enOpenReader = q('[data-role="en-open-reader"]');
+      enConvertWrap = q('[data-role="en-convert-wrap"]');
+      enConvertText = q('[data-role="en-convert-text"]');
+      enConvertPreview = q('[data-role="en-convert-preview"]');
+      enConvertCard = q('[data-role="en-convert-card"]');
+      enConvertCode = q('[data-role="en-convert-code"]');
+      enSwitchKindWrap = q('[data-role="en-switch-kind-wrap"]');
+      enSwitchPreview = q('[data-role="en-switch-preview"]');
+      enSwitchText = q('[data-role="en-switch-text"]');
+      enSwitchCard = q('[data-role="en-switch-card"]');
+      enSwitchCode = q('[data-role="en-switch-code"]');
+      enConvertNormalWrap = q('[data-role="en-convert-normal-wrap"]');
+      enConvertNormal = q('[data-role="en-convert-normal"]');
+      enCodeLanguageWrap = q('[data-role="en-code-language-wrap"]');
+      enCodeLanguage = q('[data-role="en-code-language"]');
+      enBodyWrap = q('[data-role="en-body-wrap"]');
+      enBody = q('[data-role="en-body"]');
+      enBodyRich = q('[data-role="en-body-rich"]');
+      enBodyNote = q('[data-role="en-body-note"]');
+      enBodyHint = q('[data-role="en-body-hint"]');
+      enReviewWrap = q('[data-role="en-review-wrap"]');
+      enReviewEnabled = q('[data-role="en-review-enabled"]');
+      enReviewQuestions = q('[data-role="en-review-questions"]');
+      enReviewAnswer = q('[data-role="en-review-answer"]');
+      enReviewBatchWrap = q('[data-role="en-review-batch-wrap"]');
+      enReviewBatch = q('[data-role="en-review-batch"]');
+      eeCurveBtns = qa('[data-role="ee-curve"] button');
+      eeCurveState = q('[data-role="ee-curve-state"]');
+      eeLineStyleBtns = qa('[data-role="ee-line-style"] button');
+      eeLineStyleState = q('[data-role="ee-line-style-state"]');
+      eeArrowBtns = qa('[data-role="ee-arrow"] button');
+      eeArrowState = q('[data-role="ee-arrow-state"]');
+      eeWidth = q('[data-role="ee-width"]');
+      eeWidthVal = q('[data-role="ee-width-val"]');
+      eeArrowSize = q('[data-role="ee-arrowsize"]');
+      eeArrowSizeVal = q('[data-role="ee-arrowsize-val"]');
+      eeColor = q('[data-role="ee-color"]');
+      eeColorState = q('[data-role="ee-color-state"]');
+      eeColorPresets = q('[data-role="ee-color-presets"]');
+      eeApplyDefaults = q('[data-role="ee-apply-defaults"]');
+      eeResetAppearance = q('[data-role="ee-reset-appearance"]');
+      enhanceDiscreteRange(enFontWeight, {
+        detent: 10, fineStep: 10, majorStep: 100, pageStep: 100, defaultValue: 400,
+      });
+      const eeColorReset = q('[data-role="ee-color-reset"]');
+      const eeClearWp = q('[data-role="ee-clear-waypoints"]');
+
+      renderNormalColorPresetButtons(enNodeColorPresets, NORMAL_NODE_COLOR_PRESETS, 'node');
+      renderNormalColorPresetButtons(eeColorPresets, NORMAL_EDGE_COLOR_PRESETS, 'edge');
+      document.addEventListener('editor:languagechange', () => {
+        renderNormalColorPresetButtons(enNodeColorPresets, NORMAL_NODE_COLOR_PRESETS, 'node');
+        renderNormalColorPresetButtons(eeColorPresets, NORMAL_EDGE_COLOR_PRESETS, 'edge');
+        refreshEditPanel();
+      });
+
+      // 节点：形状（离散→直接入历史）；颜色/透明度 input 实时预览、change 入历史
+      if (enMindmapResetColor) enMindmapResetColor.addEventListener('click', restoreEditMindmapColors);
+      if (enMindmapResetSize) enMindmapResetSize.addEventListener('click', restoreEditMindmapSizes);
+      if (enCreateGroup) enCreateGroup.addEventListener('click', createGroupFromSelection);
+      if (enResetColors) enResetColors.addEventListener('click', () => resetSelectedNodeAppearanceSection('colors'));
+      if (enResetGeometry) enResetGeometry.addEventListener('click', () => resetSelectedNodeAppearanceSection('geometry'));
+      if (enResetTypography) enResetTypography.addEventListener('click', () => resetSelectedNodeAppearanceSection('typography'));
+      if (enApplyDefaults) enApplyDefaults.addEventListener('click', applyCurrentNodeDefaultsToSelection);
+      enShapeBtns.forEach((b) => b.addEventListener('click', () => {
+        const v = b.dataset.shape;
+        editNodeField('shape', v, v === 'rect');
+        pushHistory(); refreshEditPanel();
+      }));
+      enBorder.addEventListener('input', () => {
+        setEditMixedControl(enBorder, false);
+        if (enBorderState) enBorderState.textContent = '';
+        editNodeField('borderColor', enBorder.value, enBorder.value.toLowerCase() === '#000000');
+      });
+      enBorder.addEventListener('change', () => { pushHistory(); refreshEditPanel(); });
+      enBg.addEventListener('input', () => {
+        setEditMixedControl(enBg, false);
+        if (enBgState) enBgState.textContent = '';
+        editNodeField('bgColor', enBg.value, enBg.value.toLowerCase() === '#ffffff');
+      });
+      enBg.addEventListener('change', () => { pushHistory(); refreshEditPanel(); });
+      enOpacity.addEventListener('input', () => {
+        const v = parseInt(enOpacity.value, 10);
+        enOpacityVal.textContent = v + '%';
+        setEditMixedControl(enOpacity, false);
+        editNodeField('opacity', v / 100, v === 100);
+      });
+      enOpacity.addEventListener('change', () => { pushHistory(); refreshEditPanel(); });
+      if (enHideChrome) enHideChrome.addEventListener('change', () => {
+        editNodeField('hideChrome', true, !enHideChrome.checked);
+        pushHistory();
+        refreshEditPanel();
+      });
+      enScale.addEventListener('input', () => {
+        const v = parseInt(enScale.value, 10);
+        enScaleVal.textContent = v + '%';
+        setEditMixedControl(enScale, false);
+        editNodeField('scale', v / 100, v === 100);
+      });
+      enScale.addEventListener('change', () => { pushHistory(); refreshEditPanel(); });
+      if (enRadius) {
+        enRadius.addEventListener('input', () => {
+          const v = parseInt(enRadius.value, 10);
+          enRadiusVal.textContent = v + 'px';
+          setEditMixedControl(enRadius, false);
+          editNodeContextField('radius', v);
+        });
+        enRadius.addEventListener('change', () => { pushHistory(); refreshEditPanel(); });
+      }
+      if (enFontWeight) {
+        enFontWeight.addEventListener('discrete-range:restore-default', () => {
+          resetSelectedNodeFontWeight();
+          refreshEditPanel();
+        });
+        enFontWeight.addEventListener('input', () => {
+          const v = parseInt(enFontWeight.value, 10);
+          enFontWeightVal.textContent = String(v);
+          setEditMixedControl(enFontWeight, false);
+          editNodeContextField('fontWeight', v);
+        });
+        enFontWeight.addEventListener('change', () => { pushHistory(); refreshEditPanel(); });
+      }
+      if (enFontScale) {
+        enFontScale.addEventListener('input', () => {
+          const v = parseInt(enFontScale.value, 10);
+          enFontScaleVal.textContent = v + '%';
+          setEditMixedControl(enFontScale, false);
+          editNodeContextField('fontScale', v / 100);
+        });
+        enFontScale.addEventListener('change', () => { pushHistory(); refreshEditPanel(); });
+      }
+      enTextAlignBtns.forEach((b) => b.addEventListener('click', () => {
+        editNodeContextField('textAlign', b.dataset.textAlign);
+        pushHistory();
+        refreshEditPanel();
+      }));
+      if (enResetAppearance) enResetAppearance.addEventListener('click', resetSelectedNodeAppearance);
+      if (enConvertText) enConvertText.addEventListener('click', convertSelectedToTextNode);
+      if (enConvertPreview) enConvertPreview.addEventListener('click', convertSelectedToPreviewNode);
+      if (enConvertCard) enConvertCard.addEventListener('click', convertSelectedToCardNode);
+      if (enConvertCode) enConvertCode.addEventListener('click', convertSelectedToCodeNode);
+      if (enSwitchPreview) enSwitchPreview.addEventListener('click', () => switchSelectedBodyNodeKind('preview'));
+      if (enSwitchText) enSwitchText.addEventListener('click', () => switchSelectedBodyNodeKind('index'));
+      if (enSwitchCard) enSwitchCard.addEventListener('click', () => switchSelectedBodyNodeKind('card'));
+      if (enSwitchCode) enSwitchCode.addEventListener('click', () => switchSelectedBodyNodeKind('code'));
+      if (enConvertNormal) enConvertNormal.addEventListener('click', requestConvertSelectedToNormalNode);
+      if (enCodeLanguage) enCodeLanguage.addEventListener('change', () => {
+        const n = editGetNode();
+        if (!n || !isCodeNode(n)) return;
+        n.language = normalizeCodeLanguage(enCodeLanguage.value);
+        const el = nodeMap.get(n.id);
+        if (el) {
+          applyNodeStyle(el, n);
+          const textEl = el.querySelector('.node-text');
+          delete textEl.dataset.source;
+          renderCodeNodeText(textEl, n.body || '', n.language);
+          renderTextNodeMeta(el, n);
+        }
+        if (readingNodeId === n.id) renderTextReader(n);
+        pushHistory();
+        notify();
+        refreshEditPanel();
+      });
+      if (enOpenReader) enOpenReader.addEventListener('click', () => {
+        const n = editGetNode();
+        if (n && isReadableNode(n)) openTextReader(n);
+      });
+      if (enBody) {
+        enBody.addEventListener('keydown', (e) => {
+          const n = editGetNode();
+          if (!n || !isCodeNode(n) || e.key !== 'Tab') return;
+          e.preventDefault();
+          indentCodeTextarea(enBody, e.shiftKey);
+        });
+        enBody.addEventListener('input', updateTextNodeBody);
+        enBody.addEventListener('select', scheduleSelToolbar);
+        enBody.addEventListener('keyup', scheduleSelToolbar);
+        enBody.addEventListener('blur', scheduleSelToolbar);
+        enBody.addEventListener('change', () => {
+          if (!enBodyDirty) return;
+          enBodyDirty = false;
+          pushHistory();
+        });
+      }
+      if (enBodyRich) {
+        prepareRichEditable(enBodyRich);
+        enBodyRich.addEventListener('input', updateRichTextNodeBody);
+        enBodyRich.addEventListener('keyup', scheduleTextDock);
+        enBodyRich.addEventListener('blur', () => {
+          scheduleTextDock();
+          if (!enBodyDirty) return;
+          const n = editGetNode();
+          if (n && isBodyNode(n) && !isCodeNode(n)) {
+            setRichEditable(enBodyRich, n.body || '', richMarks(n, 'body'));
+          }
+          enBodyDirty = false;
+          pushHistory();
+        });
+      }
+      if (enReviewEnabled) enReviewEnabled.addEventListener('change', () => {
+        const n = editGetNode();
+        if (!n) return;
+        const review = (n.review && typeof n.review === 'object') ? n.review : {};
+        n.review = Object.assign({}, review, { enabled: !!enReviewEnabled.checked });
+        pushHistory();
+        notify();
+        refreshEditPanel();
+      });
+      if (enReviewQuestions) {
+        enReviewQuestions.addEventListener('input', () => {
+          const n = editGetNode();
+          if (!n) return;
+          const lines = enReviewQuestions.value.split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter(Boolean)
+            .slice(0, 12);
+          const review = (n.review && typeof n.review === 'object') ? n.review : {};
+          n.review = Object.assign({}, review, { questions: lines });
+          notify();
+        });
+        enReviewQuestions.addEventListener('change', () => pushHistory());
+      }
+      if (enReviewAnswer) {
+        enReviewAnswer.addEventListener('input', () => {
+          const n = editGetNode();
+          if (!n) return;
+          const review = (n.review && typeof n.review === 'object') ? n.review : {};
+          n.review = Object.assign({}, review, { answer: enReviewAnswer.value });
+          notify();
+        });
+        enReviewAnswer.addEventListener('change', () => pushHistory());
+      }
+      if (enReviewBatch) enReviewBatch.addEventListener('click', () => {
+        const targets = editNodeTargets();   // 已是正文节点（装饰被过滤）
+        if (targets.length < 2) return;        // 仅多选时有效
+        const enable = !!enReviewBatch.checked;
+        targets.forEach((t) => {
+          const review = (t.review && typeof t.review === 'object') ? t.review : {};
+          t.review = Object.assign({}, review, { enabled: enable });
+        });
+        pushHistory();
+        notify();
+        refreshEditPanel();
+      });
+
+      // 连线：线型/箭头（离散）；粗细/箭头大小 input 预览、change 入历史
+      eeCurveBtns.forEach((b) => b.addEventListener('click', () => {
+        const v = b.dataset.curve;
+        editEdgeField('curve', v, v === 'bezier');
+        pushHistory(); refreshEditPanel();
+      }));
+      eeLineStyleBtns.forEach((b) => b.addEventListener('click', () => {
+        const v = b.dataset.lineStyle;
+        editEdgeField('lineStyle', v, v === 'solid');
+        pushHistory(); refreshEditPanel();
+      }));
+      eeArrowBtns.forEach((b) => b.addEventListener('click', () => {
+        const v = b.dataset.arrow;
+        editEdgeField('arrow', v, v === 'none');
+        pushHistory(); refreshEditPanel();
+      }));
+      eeWidth.addEventListener('input', () => {
+        const v = parseFloat(eeWidth.value);
+        eeWidthVal.textContent = String(v);
+        setEditMixedControl(eeWidth, false);
+        editEdgeField('width', v, v === 1.5);
+      });
+      eeWidth.addEventListener('change', () => pushHistory());
+      eeArrowSize.addEventListener('input', () => {
+        const v = parseInt(eeArrowSize.value, 10);
+        eeArrowSizeVal.textContent = String(v);
+        setEditMixedControl(eeArrowSize, false);
+        editEdgeField('arrowSize', v, v === 12);
+      });
+      eeArrowSize.addEventListener('change', () => pushHistory());
+      if (eeColor) {
+        eeColor.addEventListener('input', () => {
+          setEditMixedControl(eeColor, false);
+          if (eeColorState) eeColorState.textContent = '';
+          editEdgeField('color', eeColor.value, eeColor.value.toLowerCase() === '#000000');
+        });
+        eeColor.addEventListener('change', () => pushHistory());
+      }
+      if (eeColorReset) eeColorReset.addEventListener('click', () => {
+        const targets = editEdgeTargets();
+        if (!targets.length) return;
+        targets.forEach((edge) => {
+          const presetStyle = editMindmapEdgePresetStyle(edge);
+          if (presetStyle) edge.color = presetStyle.color;
+          else delete edge.color;
+          const refs = edgeMap.get(edge.id);
+          if (refs) applyEdgeStyle(refs, edge);
+          updateEdgePath(edge);
+        });
+        notifyEditStyleChange();
+        pushHistory();
+        refreshEditPanel();
+      });
+      if (eeClearWp) eeClearWp.addEventListener('click', () => {
+        const targets = editEdgeTargets().filter((ed) => Array.isArray(ed.waypoints));
+        if (!targets.length) return;
+        targets.forEach((ed) => { delete ed.waypoints; updateEdgePath(ed); });
+        renderEdgeHandles();
+        pushHistory(); notify();
+      });
+      if (eeApplyDefaults) eeApplyDefaults.addEventListener('click', applyCurrentEdgeDefaultsToSelection);
+      if (eeResetAppearance) eeResetAppearance.addEventListener('click', resetSelectedEdgeAppearance);
+    }
+
+    // ── 新版 EXE 第 7 项：图案模式（装饰图案 / 图片）──────────
+    const DECOR_MAX_SIZE = 6000;   // 装饰/附件拖拽缩放的硬上限（可远超右侧滑条 max，实现"自由调节"）
+    const DECOR_DEFAULT_BORDER = '#b8b3aa';
+    const DECOR_DEFAULT_FILL = '#ffffff';
+    const DECOR_SLIDER_BORDER = '#8b8b8b';
+    const DECOR_SHAPE_COLOR_KEY = 'canvas:decorShapeColors';
+    const DECOR_SHAPE_DEFAULT_KEY = 'canvas:decorShapeDefaults';
+    const DECOR_TEXT_PRESET_DEFAULT_KEY = 'canvas:decorTextPresetDefaults';
+    const DECOR_IMAGE_DEFAULT_KEY = 'canvas:decorImageDefaults';
+
+    function decorationLayer(node) {
+      return node && node.layer === 'front' ? 'front' : 'back';
+    }
+
+    function decorationZOrder(node) {
+      const value = Number(node && node.zOrder);
+      return Number.isFinite(value) ? Math.round(value) : Number.POSITIVE_INFINITY;
+    }
+
+    function decorationNodesInLayer(layer) {
+      const wantedLayer = layer === 'front' ? 'front' : 'back';
+      const dataOrder = new Map(data.nodes.map((node, index) => [node, index]));
+      return data.nodes.filter((node) => isDecorationNode(node) && decorationLayer(node) === wantedLayer)
+        .sort((a, b) => {
+          const aOrder = decorationZOrder(a);
+          const bOrder = decorationZOrder(b);
+          if (Number.isFinite(aOrder) && Number.isFinite(bOrder) && aOrder !== bOrder) return aOrder - bOrder;
+          if (Number.isFinite(aOrder) !== Number.isFinite(bOrder)) return Number.isFinite(aOrder) ? -1 : 1;
+          return dataOrder.get(a) - dataOrder.get(b);
+        });
+    }
+
+    function normalizeDecorationZOrders(layers) {
+      const wanted = Array.isArray(layers) && layers.length
+        ? [...new Set(layers.map((layer) => layer === 'front' ? 'front' : 'back'))]
+        : ['back', 'front'];
+      wanted.forEach((layer) => {
+        decorationNodesInLayer(layer).forEach((node, index) => {
+          node.zOrder = index;
+        });
+      });
+    }
+
+    function prepareNewDecorationNode(node) {
+      if (!isDecorationNode(node)) return node;
+      node.layer = decorationLayer(node);
+      const ordered = decorationNodesInLayer(node.layer);
+      node.zOrder = ordered.length ? decorationZOrder(ordered[ordered.length - 1]) + 1 : 0;
+      return node;
+    }
+
+    function syncDecorationStackingOrder() {
+      ['back', 'front'].forEach((layer) => {
+        decorationNodesInLayer(layer).forEach((node) => {
+          const el = nodeMap.get(node.id);
+          if (el && el.parentNode === surface) surface.appendChild(el);
+        });
+      });
+    }
+    const DECOR_FILL_MODES = new Set(['none', 'tint', 'solid']);
+    const DECOR_GROUP_BORDER_STYLES = new Set(['solid', 'dashed', 'dotted']);
+    const DECOR_GROUP_TITLE_COLORS = { light: '#ffffff', dark: '#2f2c24' };
+    const GROUP_BOX_MIN_WIDTH = 20;
+    const GROUP_BOX_MIN_HEIGHT = 8;
+    const DECOR_COLOR_PRESETS = [
+      '#d9b7ad', '#e7dcc3', '#d9bd70', '#dbeecb', '#cfe3f7', '#96a5c4',
+      '#f8d4dc', '#d58f88', '#d3ede8', '#f1ddc9', '#96b292', '#f2b978',
+      '#efaaa5', '#e3a36d', '#fff0b8', '#d7e4d1', '#7fadaa', '#ded0f1',
+    ];
+    const DECOR_TEXT_BORDER_STYLES = new Set(['solid', 'dashed', 'dotted', 'double']);
+    const DECOR_TEXT_STYLE_PRESETS = {
+      'emphasis-card': [
+        { id: 'sun', name: '暖金纸', fillColor: '#f6eab8', borderColor: '#b99a48', color: '#383225', borderWidth: 1, borderStyle: 'solid' },
+        { id: 'cream', name: '象牙纸', fillColor: '#f3eed9', borderColor: '#ad9d64', color: '#353329', borderWidth: 1, borderStyle: 'solid' },
+        { id: 'peach', name: '陶粉纸', fillColor: '#f2e0d5', borderColor: '#ae826b', color: '#3d312b', borderWidth: 1, borderStyle: 'solid' },
+        { id: 'rose', name: '藕荷纸', fillColor: '#f0dfe3', borderColor: '#aa7887', color: '#3e3035', borderWidth: 1, borderStyle: 'solid' },
+        { id: 'lavender', name: '灰紫纸', fillColor: '#e9e4f0', borderColor: '#88789e', color: '#332f3d', borderWidth: 1, borderStyle: 'solid' },
+        { id: 'sky', name: '雾蓝纸', fillColor: '#e1eaf0', borderColor: '#70889b', color: '#29343d', borderWidth: 1, borderStyle: 'solid' },
+        { id: 'mint', name: '鼠尾草', fillColor: '#e3ebe1', borderColor: '#73866f', color: '#2d372c', borderWidth: 1, borderStyle: 'solid' },
+        { id: 'paper', name: '原色纸', fillColor: '#eee6d8', borderColor: '#9e835e', color: '#373128', borderWidth: 1, borderStyle: 'solid' },
+      ],
+      'note-bubble': [
+        { id: 'ink', name: '墨线留白', fillColor: '#fbfaf6', borderColor: '#4f5b55', color: '#26302b', borderWidth: 1.5, borderStyle: 'solid' },
+        { id: 'mist', name: '雾蓝细框', fillColor: '#e8eef4', borderColor: '#718aa6', color: '#293745', borderWidth: 1, borderStyle: 'solid' },
+        { id: 'mint-dash', name: '灰绿虚线', fillColor: '#e8f0e8', borderColor: '#65856d', color: '#29392e', borderWidth: 2, borderStyle: 'dashed' },
+        { id: 'rose-dot', name: '藕粉点线', fillColor: '#f3e7e9', borderColor: '#a96f7f', color: '#443035', borderWidth: 2, borderStyle: 'dotted' },
+        { id: 'sun-bold', name: '赭金粗框', fillColor: '#f4edd2', borderColor: '#a68036', color: '#40371f', borderWidth: 3, borderStyle: 'solid' },
+        { id: 'lavender-double', name: '灰紫双线', fillColor: '#ede9f3', borderColor: '#7d6b99', color: '#342f40', borderWidth: 4, borderStyle: 'double' },
+        { id: 'sage-dash', name: '苔灰短线', fillColor: '#edf0e9', borderColor: '#74816d', color: '#30362d', borderWidth: 1.5, borderStyle: 'dashed' },
+        { id: 'graphite-dot', name: '石墨点线', fillColor: '#f1f1ee', borderColor: '#6d716d', color: '#30322f', borderWidth: 1.5, borderStyle: 'dotted' },
+      ],
+    };
+    const DECOR_GROUP_STYLE_PRESETS = [
+      { id: 'parchment', name: '暖金', borderColor: '#d6b96a', fillColor: '#fffdf3', titleColor: '#ffffff', fillMode: 'solid', opacity: 0.74, layer: 'back', borderWidth: 2.4, borderStyle: 'solid' },
+      { id: 'mist', name: '雾蓝', borderColor: '#718da3', fillColor: '#eaf2f5', titleColor: '#ffffff', fillMode: 'solid', opacity: 0.70, layer: 'back', borderWidth: 2.2, borderStyle: 'solid' },
+      { id: 'sage', name: '草木绿', borderColor: '#73866f', fillColor: '#edf2e8', titleColor: '#ffffff', fillMode: 'solid', opacity: 0.72, layer: 'back', borderWidth: 2.2, borderStyle: 'dashed' },
+      { id: 'rose', name: '藕粉', borderColor: '#a77b87', fillColor: '#f5e9ec', titleColor: '#ffffff', fillMode: 'solid', opacity: 0.70, layer: 'back', borderWidth: 2.5, borderStyle: 'dotted' },
+      { id: 'ink', name: '墨白', borderColor: '#555b57', fillColor: '#fbfaf5', titleColor: '#ffffff', fillMode: 'tint', opacity: 0.82, layer: 'back', borderWidth: 1.8, borderStyle: 'solid' },
+      { id: 'lake-green', name: '湖水青', borderColor: '#7bb3aa', fillColor: '#edf8f5', titleColor: '#ffffff', fillMode: 'solid', opacity: 0.72, layer: 'back', borderWidth: 2.2, borderStyle: 'solid' },
+      { id: 'apricot', name: '杏橙', borderColor: '#cf9a7d', fillColor: '#fcf0e9', titleColor: '#ffffff', fillMode: 'solid', opacity: 0.74, layer: 'back', borderWidth: 2.1, borderStyle: 'dotted' },
+      { id: 'lemon', name: '柠檬黄', borderColor: '#e4c934', fillColor: '#fff59a', titleColor: '#463d0b', fillMode: 'solid', opacity: 0.86, layer: 'back', borderWidth: 2.4, borderStyle: 'dashed' },
+      { id: 'sky', name: '天空蓝', borderColor: '#6f9fc1', fillColor: '#e8f4fa', titleColor: '#ffffff', fillMode: 'solid', opacity: 0.70, layer: 'back', borderWidth: 2.2, borderStyle: 'dotted' },
+      { id: 'mint', name: '薄荷绿', borderColor: '#689986', fillColor: '#e7f3ed', titleColor: '#ffffff', fillMode: 'solid', opacity: 0.72, layer: 'back', borderWidth: 2.1, borderStyle: 'solid' },
+      { id: 'peach', name: '珊瑚红', borderColor: '#d85f63', fillColor: '#fde7e8', titleColor: '#ffffff', fillMode: 'solid', opacity: 0.78, layer: 'back', borderWidth: 2.4, borderStyle: 'solid' },
+      { id: 'lavender', name: '淡紫', borderColor: '#8d7da7', fillColor: '#f0ebf6', titleColor: '#ffffff', fillMode: 'solid', opacity: 0.70, layer: 'back', borderWidth: 2.4, borderStyle: 'dotted' },
+      { id: 'coffee', name: '咖啡棕', borderColor: '#896b55', fillColor: '#f2e8df', titleColor: '#ffffff', fillMode: 'tint', opacity: 0.84, layer: 'back', borderWidth: 2.2, borderStyle: 'solid' },
+      { id: 'clear-gray', name: '透明灰', borderColor: '#7f8581', fillColor: '#f7f7f4', titleColor: '#ffffff', fillMode: 'none', opacity: 0.90, layer: 'back', borderWidth: 2, borderStyle: 'dashed' },
+    ];
+    const DECOR_MENU_COLOR_MAP = {
+      gray: '#c8c8c6',
+      blue: '#8fb0e8',
+      green: '#8fc89b',
+      yellow: '#e3c66a',
+      red: '#e09a96',
+      purple: '#b399e0',
+    };
+    const DECOR_BASE_SIZES = {
+      'rounded-rect': { width: 260, height: 150 },
+      rect: { width: 240, height: 140 },
+      ellipse: { width: 240, height: 140 },
+      circle: { width: 150, height: 150 },
+      triangle: { width: 170, height: 150 },
+      diamond: { width: 170, height: 150 },
+      'sketch-rounded-rect': { width: 220, height: 150 },
+      'sketch-diamond': { width: 170, height: 170 },
+      'sketch-ellipse': { width: 240, height: 140 },
+      arrow: { width: 230, height: 100 },
+      divider: { width: 280, height: 30 },
+      slider: { width: 34, height: 260 },
+      'dashed-box': { width: 320, height: 210 },
+      'group-box': { width: 340, height: 230 },
+      'color-block': { width: 180, height: 120 },
+      pill: { width: 220, height: 90 },
+      'corner-frame': { width: 220, height: 160 },
+      bracket: { width: 180, height: 220 },
+      question: { width: 110, height: 110 },
+    };
+    const DECOR_TEXT_PRESETS = {
+      'emphasis-card': {
+        label: '重点便签',
+        text: '写下重点',
+        width: 290,
+        height: 200,
+        fontSize: 21,
+        color: '#383225',
+        fillColor: '#f6eab8',
+        borderColor: '#b99a48',
+        borderWidth: 1,
+        borderStyle: 'solid',
+        layer: 'front',
+      },
+      'note-bubble': {
+        label: '旁注框',
+        text: '写下旁注',
+        width: 300,
+        height: 160,
+        fontSize: 20,
+        color: '#26302b',
+        fillColor: '#fbfaf6',
+        borderColor: '#4f5b55',
+        borderWidth: 1.5,
+        borderStyle: 'solid',
+        layer: 'front',
+      },
+    };
+    let dpEmpty, dpSelection, dpKindLabel, dpWidth, dpWidthVal, dpHeight, dpHeightVal;
+    let dpFontSize, dpFontSizeVal, dpFontSizeWrap, dpRotation, dpRotationVal, dpOpacity, dpOpacityVal;
+    let dpShapeColors, dpBorder, dpBorderState, dpFill, dpFillState, dpTextColor, dpTextColorState, dpTextColorWrap;
+    let dpBorderWidth, dpBorderWidthVal, dpBorderWidthWrap, dpBorderStyleWrap, dpBorderStyleBtns, dpBorderStyleState;
+    let dpBorderWrap, dpFillWrap, dpFillLabel, dpFillModeWrap, dpFillModeBtns, dpColorPresets;
+    let dpFillModeState, dpColorPresetsWrap, dpColorPresetsLabel, dpGroupPresets, dpGroupPresetMode, dpGroupPresetHint;
+    let dpTitleToneWrap, dpTitleToneBtns, dpTitleToneState;
+    let dpProgressWrap, dpProgress, dpProgressVal, dpLayerBtns, dpLayerState, dpStackWrap, dpStackBtns, dpStackHint;
+    let dpAddImage, dpAddAttachment, dpResetFill, dpResetDefaults;
+    let dpWidthWrap, dpHeightWrap, dpRotationWrap, dpOpacityWrap, dpLayerWrap, dpDelete;
+
+    function cleanDecorColor(value, fallback) {
+      const text = String(value || '').trim();
+      return /^#[0-9a-fA-F]{6}$/.test(text) ? text.toLowerCase() : fallback;
+    }
+
+    function cleanDecorTextBorderStyle(value, fallback) {
+      return DECOR_TEXT_BORDER_STYLES.has(value) ? value : fallback;
+    }
+
+    function cleanDecorGroupBorderStyle(value, fallback) {
+      return DECOR_GROUP_BORDER_STYLES.has(value) ? value : fallback;
+    }
+
+    function decorGroupTitleTone(value) {
+      const color = cleanDecorColor(value, DECOR_GROUP_TITLE_COLORS.light);
+      return color === DECOR_GROUP_TITLE_COLORS.light ? 'light' : 'dark';
+    }
+
+    function readJsonPreference(key) {
+      try {
+        const raw = JSON.parse(localStorage.getItem(key) || '{}');
+        return raw && typeof raw === 'object' ? raw : {};
+      } catch (e) {
+        return {};
+      }
+    }
+
+    function writeJsonPreference(key, value) {
+      try {
+        localStorage.setItem(key, JSON.stringify(value));
+      } catch (e) {
+        // 偏好写入失败不影响画布编辑。
+      }
+    }
+
+    function cleanDecorNumber(value, fallback, min, max, round) {
+      const num = Number(value);
+      if (!Number.isFinite(num)) return fallback;
+      const clamped = Math.max(min, Math.min(max, num));
+      return round ? Math.round(clamped) : clamped;
+    }
+
+    function decorBaseDefaults(shapeType) {
+      const size = DECOR_BASE_SIZES[shapeType] || { width: 240, height: 140 };
+      const sketchShape = shapeType && shapeType.indexOf('sketch-') === 0;
+      let defaultBorder = DECOR_DEFAULT_BORDER;
+      if (shapeType === 'slider') defaultBorder = DECOR_SLIDER_BORDER;
+      else if (sketchShape) defaultBorder = '#1f1f1f';
+      else if (shapeType === 'dashed-box') defaultBorder = '#8fb0e8';
+      else if (shapeType === 'question') defaultBorder = '#1f1f1f';
+      else if (shapeType === 'group-box') defaultBorder = '#d6b96a';
+      else if (shapeType === 'color-block') defaultBorder = '#d9b7ad';
+      else if (shapeType === 'corner-frame' || shapeType === 'bracket') defaultBorder = '#1f1f1f';
+      let defaultFill = DECOR_DEFAULT_FILL;
+      if (shapeType === 'group-box') defaultFill = '#fffdf3';
+      else if (shapeType === 'color-block') defaultFill = '#d9b7ad';
+      return {
+        width: size.width,
+        height: size.height,
+        rotation: 0,
+        opacity: shapeType === 'group-box' ? 0.74 : 1,
+        layer: 'back',
+        borderColor: defaultBorder,
+        fillColor: defaultFill,
+        fillMode: defaultDecorFillMode(shapeType),
+        borderWidth: shapeType === 'group-box' ? 2.4 : undefined,
+        borderStyle: shapeType === 'group-box' ? 'solid' : undefined,
+        titleColor: shapeType === 'group-box' ? '#ffffff' : undefined,
+        progress: shapeType === 'slider' ? 100 : undefined,
+      };
+    }
+
+    function decorImageBaseDefaults() {
+      return {
+        width: 320,
+        height: 220,
+        rotation: 0,
+        opacity: 1,
+        layer: 'back',
+      };
+    }
+
+    function cleanDecorLayer(value, fallback) {
+      return value === 'front' || value === 'back' ? value : fallback;
+    }
+
+    function cleanDecorFillMode(value, fallback) {
+      return DECOR_FILL_MODES.has(value) ? value : fallback;
+    }
+
+    function isLineOnlyDecorShapeType(shapeType) {
+      return shapeType === 'divider' || shapeType === 'corner-frame' || shapeType === 'bracket';
+    }
+
+    function defaultDecorFillMode(shapeType) {
+      if (shapeType === 'dashed-box' || shapeType === 'question' || isLineOnlyDecorShapeType(shapeType)) return 'none';
+      return 'solid';
+    }
+
+    function decorFillMode(node) {
+      if (!isShapeNode(node)) return 'solid';
+      if (DECOR_FILL_MODES.has(node.fillMode)) return node.fillMode;
+      // Existing dashed boxes predate fillMode and used a light border-colored fill.
+      if (node.shapeType === 'dashed-box') return 'tint';
+      return defaultDecorFillMode(node.shapeType);
+    }
+
+    function decorShapeDefaults(shapeType) {
+      const base = decorBaseDefaults(shapeType);
+      const stored = readJsonPreference(DECOR_SHAPE_DEFAULT_KEY)[shapeType] || {};
+      const oldColor = readJsonPreference(DECOR_SHAPE_COLOR_KEY)[shapeType] || {};
+      return {
+        width: cleanDecorNumber(stored.width, base.width, 20, 1200, true),
+        height: cleanDecorNumber(stored.height, base.height, 8, 900, true),
+        rotation: cleanDecorNumber(stored.rotation, base.rotation, -180, 180, true),
+        opacity: cleanDecorNumber(stored.opacity, base.opacity, 0, 1, false),
+        layer: cleanDecorLayer(stored.layer, base.layer),
+        borderColor: cleanDecorColor(stored.borderColor || oldColor.borderColor, base.borderColor),
+        fillColor: cleanDecorColor(stored.fillColor || oldColor.fillColor, base.fillColor),
+        fillMode: cleanDecorFillMode(stored.fillMode, base.fillMode),
+        borderWidth: shapeType === 'group-box'
+          ? cleanDecorNumber(stored.borderWidth, base.borderWidth, 1, 6, false)
+          : undefined,
+        borderStyle: shapeType === 'group-box'
+          ? cleanDecorGroupBorderStyle(stored.borderStyle, base.borderStyle)
+          : undefined,
+        titleColor: shapeType === 'group-box'
+          ? cleanDecorColor(stored.titleColor, base.titleColor)
+          : undefined,
+        progress: shapeType === 'slider'
+          ? cleanDecorNumber(stored.progress, base.progress, 0, 100, true)
+          : undefined,
+      };
+    }
+
+    function decorTextPresetBase(preset) {
+      return DECOR_TEXT_PRESETS[preset] || DECOR_TEXT_PRESETS['emphasis-card'];
+    }
+
+    function decorTextPresetDefaults(preset) {
+      const base = decorTextPresetBase(preset);
+      const stored = readJsonPreference(DECOR_TEXT_PRESET_DEFAULT_KEY)[preset] || {};
+      return {
+        width: cleanDecorNumber(stored.width, base.width, 80, 1200, true),
+        height: cleanDecorNumber(stored.height, base.height, 48, 900, true),
+        rotation: cleanDecorNumber(stored.rotation, 0, -180, 180, true),
+        opacity: cleanDecorNumber(stored.opacity, 1, 0, 1, false),
+        layer: cleanDecorLayer(stored.layer, base.layer || 'front'),
+        fontSize: cleanDecorNumber(stored.fontSize, base.fontSize, 10, 96, true),
+        color: cleanDecorColor(stored.color, base.color),
+        borderColor: cleanDecorColor(stored.borderColor, base.borderColor),
+        fillColor: cleanDecorColor(stored.fillColor, base.fillColor),
+        borderWidth: cleanDecorNumber(stored.borderWidth, base.borderWidth, 1, 6, false),
+        borderStyle: cleanDecorTextBorderStyle(stored.borderStyle, base.borderStyle),
+      };
+    }
+
+    function decorImageDefaults() {
+      const base = decorImageBaseDefaults();
+      const stored = readJsonPreference(DECOR_IMAGE_DEFAULT_KEY);
+      return {
+        width: cleanDecorNumber(stored.width, base.width, 20, 1200, true),
+        height: cleanDecorNumber(stored.height, base.height, 8, 900, true),
+        rotation: cleanDecorNumber(stored.rotation, base.rotation, -180, 180, true),
+        opacity: cleanDecorNumber(stored.opacity, base.opacity, 0, 1, false),
+        layer: cleanDecorLayer(stored.layer, base.layer),
+      };
+    }
+
+    function rememberDecorShapeDefaults(shapeType, patch) {
+      if (!shapeType) return;
+      const defaults = readJsonPreference(DECOR_SHAPE_DEFAULT_KEY);
+      const current = defaults[shapeType] || {};
+      defaults[shapeType] = Object.assign({}, current, patch);
+      writeJsonPreference(DECOR_SHAPE_DEFAULT_KEY, defaults);
+    }
+
+    function resetDecorShapeDefaults(shapeType) {
+      if (!shapeType) return;
+      const defaults = readJsonPreference(DECOR_SHAPE_DEFAULT_KEY);
+      delete defaults[shapeType];
+      writeJsonPreference(DECOR_SHAPE_DEFAULT_KEY, defaults);
+      const oldColors = readJsonPreference(DECOR_SHAPE_COLOR_KEY);
+      if (oldColors[shapeType]) {
+        delete oldColors[shapeType];
+        writeJsonPreference(DECOR_SHAPE_COLOR_KEY, oldColors);
+      }
+    }
+
+    function rememberDecorTextPresetDefaults(preset, patch) {
+      if (!preset) return;
+      const defaults = readJsonPreference(DECOR_TEXT_PRESET_DEFAULT_KEY);
+      const current = defaults[preset] || {};
+      defaults[preset] = Object.assign({}, current, patch);
+      writeJsonPreference(DECOR_TEXT_PRESET_DEFAULT_KEY, defaults);
+    }
+
+    function resetDecorTextPresetDefaults(preset) {
+      if (!preset) return;
+      const defaults = readJsonPreference(DECOR_TEXT_PRESET_DEFAULT_KEY);
+      delete defaults[preset];
+      writeJsonPreference(DECOR_TEXT_PRESET_DEFAULT_KEY, defaults);
+    }
+
+    function rememberDecorImageDefaults(patch) {
+      const current = readJsonPreference(DECOR_IMAGE_DEFAULT_KEY);
+      writeJsonPreference(DECOR_IMAGE_DEFAULT_KEY, Object.assign({}, current, patch));
+    }
+
+    function resetDecorImageDefaults() {
+      writeJsonPreference(DECOR_IMAGE_DEFAULT_KEY, {});
+    }
+
+    function rememberDecorShapeField(node, prop, value) {
+      if (!isShapeNode(node)) return;
+      if (prop === 'width') {
+        rememberDecorShapeDefaults(node.shapeType, {
+          width: cleanDecorNumber(value, decorBaseDefaults(node.shapeType).width, 20, 1200, true),
+        });
+      } else if (prop === 'height') {
+        rememberDecorShapeDefaults(node.shapeType, {
+          height: cleanDecorNumber(value, decorBaseDefaults(node.shapeType).height, 8, 900, true),
+        });
+      } else if (prop === 'rotation') {
+        rememberDecorShapeDefaults(node.shapeType, {
+          rotation: cleanDecorNumber(value, 0, -180, 180, true),
+        });
+      } else if (prop === 'opacity') {
+        rememberDecorShapeDefaults(node.shapeType, {
+          opacity: cleanDecorNumber(value, 1, 0, 1, false),
+        });
+      } else if (prop === 'layer') {
+        rememberDecorShapeDefaults(node.shapeType, {
+          layer: cleanDecorLayer(value, 'back'),
+        });
+      } else if (prop === 'progress' && node.shapeType === 'slider') {
+        rememberDecorShapeDefaults(node.shapeType, {
+          progress: cleanDecorNumber(value, 100, 0, 100, true),
+        });
+      } else if (prop === 'borderColor') {
+        rememberDecorShapeDefaults(node.shapeType, {
+          borderColor: cleanDecorColor(value, decorBaseDefaults(node.shapeType).borderColor),
+        });
+      } else if (prop === 'fillColor') {
+        rememberDecorShapeDefaults(node.shapeType, {
+          fillColor: cleanDecorColor(value, DECOR_DEFAULT_FILL),
+        });
+      } else if (prop === 'fillMode') {
+        rememberDecorShapeDefaults(node.shapeType, {
+          fillMode: cleanDecorFillMode(value, defaultDecorFillMode(node.shapeType)),
+        });
+      } else if (prop === 'borderWidth' && node.shapeType === 'group-box') {
+        rememberDecorShapeDefaults(node.shapeType, {
+          borderWidth: cleanDecorNumber(value, 2.4, 1, 6, false),
+        });
+      } else if (prop === 'borderStyle' && node.shapeType === 'group-box') {
+        rememberDecorShapeDefaults(node.shapeType, {
+          borderStyle: cleanDecorGroupBorderStyle(value, 'solid'),
+        });
+      } else if (prop === 'titleColor' && node.shapeType === 'group-box') {
+        rememberDecorShapeDefaults(node.shapeType, {
+          titleColor: cleanDecorColor(value, '#ffffff'),
+        });
+      }
+    }
+
+    function rememberDecorTextPresetField(node, prop, value) {
+      if (!isTextBoxNode(node) || !node.boxStyle) return;
+      const base = decorTextPresetBase(node.boxStyle);
+      if (prop === 'width') {
+        rememberDecorTextPresetDefaults(node.boxStyle, {
+          width: cleanDecorNumber(value, base.width, 80, 1200, true),
+        });
+      } else if (prop === 'height') {
+        rememberDecorTextPresetDefaults(node.boxStyle, {
+          height: cleanDecorNumber(value, base.height, 48, 900, true),
+        });
+      } else if (prop === 'rotation') {
+        rememberDecorTextPresetDefaults(node.boxStyle, {
+          rotation: cleanDecorNumber(value, 0, -180, 180, true),
+        });
+      } else if (prop === 'opacity') {
+        rememberDecorTextPresetDefaults(node.boxStyle, {
+          opacity: cleanDecorNumber(value, 1, 0, 1, false),
+        });
+      } else if (prop === 'layer') {
+        rememberDecorTextPresetDefaults(node.boxStyle, {
+          layer: cleanDecorLayer(value, base.layer || 'front'),
+        });
+      } else if (prop === 'borderColor') {
+        rememberDecorTextPresetDefaults(node.boxStyle, {
+          borderColor: cleanDecorColor(value, base.borderColor),
+        });
+      } else if (prop === 'fillColor') {
+        rememberDecorTextPresetDefaults(node.boxStyle, {
+          fillColor: cleanDecorColor(value, base.fillColor),
+        });
+      } else if (prop === 'color') {
+        rememberDecorTextPresetDefaults(node.boxStyle, {
+          color: cleanDecorColor(value, base.color),
+        });
+      } else if (prop === 'fontSize') {
+        rememberDecorTextPresetDefaults(node.boxStyle, {
+          fontSize: cleanDecorNumber(value, base.fontSize, 10, 96, true),
+        });
+      } else if (prop === 'borderWidth') {
+        rememberDecorTextPresetDefaults(node.boxStyle, {
+          borderWidth: cleanDecorNumber(value, base.borderWidth, 1, 6, false),
+        });
+      } else if (prop === 'borderStyle') {
+        rememberDecorTextPresetDefaults(node.boxStyle, {
+          borderStyle: cleanDecorTextBorderStyle(value, base.borderStyle),
+        });
+      }
+    }
+
+    function rememberDecorImageField(node, prop, value) {
+      if (!isImageNode(node)) return;
+      if (prop === 'width') {
+        rememberDecorImageDefaults({
+          width: cleanDecorNumber(value, decorImageBaseDefaults().width, 20, 1200, true),
+        });
+      } else if (prop === 'height') {
+        rememberDecorImageDefaults({
+          height: cleanDecorNumber(value, decorImageBaseDefaults().height, 8, 900, true),
+        });
+      } else if (prop === 'rotation') {
+        rememberDecorImageDefaults({
+          rotation: cleanDecorNumber(value, 0, -180, 180, true),
+        });
+      } else if (prop === 'opacity') {
+        rememberDecorImageDefaults({
+          opacity: cleanDecorNumber(value, 1, 0, 1, false),
+        });
+      } else if (prop === 'layer') {
+        rememberDecorImageDefaults({
+          layer: cleanDecorLayer(value, 'back'),
+        });
+      }
+    }
+
+    function applyDecorShapeDefaults(node, defaults) {
+      node.width = defaults.width;
+      node.height = defaults.height;
+      node.rotation = defaults.rotation;
+      node.opacity = defaults.opacity;
+      node.layer = defaults.layer;
+      node.borderColor = defaults.borderColor;
+      node.fillColor = defaults.fillColor;
+      node.fillMode = defaults.fillMode;
+      if (node.shapeType === 'group-box') {
+        node.borderWidth = defaults.borderWidth;
+        node.borderStyle = defaults.borderStyle;
+        node.titleColor = defaults.titleColor;
+      } else {
+        delete node.borderWidth;
+        delete node.borderStyle;
+        delete node.titleColor;
+      }
+      if (node.shapeType === 'slider') node.progress = defaults.progress;
+      else delete node.progress;
+    }
+
+    function applyDecorTextPresetDefaults(node, defaults) {
+      node.width = defaults.width;
+      node.height = defaults.height;
+      node.rotation = defaults.rotation;
+      node.opacity = defaults.opacity;
+      node.layer = defaults.layer;
+      node.fontSize = defaults.fontSize;
+      node.color = defaults.color;
+      node.borderColor = defaults.borderColor;
+      node.fillColor = defaults.fillColor;
+      node.borderWidth = defaults.borderWidth;
+      node.borderStyle = defaults.borderStyle;
+      node.fontPreset = 'ui';
+    }
+
+    function applyDecorImageDefaults(node, defaults) {
+      node.width = defaults.width;
+      node.height = defaults.height;
+      node.rotation = defaults.rotation;
+      node.opacity = defaults.opacity;
+      node.layer = defaults.layer;
+    }
+
+    function decorNodeTargets() {
+      if (document.body.dataset.objectInspectorEnabled !== '1') return [];
+      if (selectedNodeIds.size === 0 || selectedEdgeIds.size !== 0) return [];
+      const targets = [];
+      for (const id of selectedNodeIds) {
+        const node = findNode(id);
+        // 图案检查器只接管纯装饰选区；混入正文节点时交回普通选择检查器。
+        if (!isDecorationNode(node)) return [];
+        targets.push(node);
+      }
+      return targets;
+    }
+
+    function decorGetNode() {
+      const targets = decorNodeTargets();
+      return targets.length === 1 ? targets[0] : null;
+    }
+
+    function hasActiveDecorTool() {
+      return !!(activeDecorShapeType || activeDecorTextPreset);
+    }
+
+    function clearActiveDecorTool() {
+      activeDecorShapeType = null;
+      activeDecorTextPreset = null;
+      refreshDecorToolButtons();
+      refreshDecorPanel();
+    }
+
+    function decorToolDefaults(shapeType) {
+      const defaults = decorShapeDefaults(shapeType);
+      const stored = readJsonPreference(DECOR_SHAPE_DEFAULT_KEY)[shapeType] || {};
+      const clickSize = decorClickSize(shapeType);
+      if (clickSize && !Number.isFinite(Number(stored.width))) defaults.width = clickSize.width;
+      if (clickSize && !Number.isFinite(Number(stored.height))) defaults.height = clickSize.height;
+      return defaults;
+    }
+
+    // 图案模式未选中对象、也未激活创建工具时，右栏仍以纯色色块作为常驻预设。
+    // 这里只提供默认值编辑，不激活画布绘制；真正绘制仍需点击“纯色色块”按钮。
+    function decorPanelDefaultShapeType() {
+      return activeDecorShapeType || (!activeDecorTextPreset ? 'color-block' : null);
+    }
+
+    function decorToolDraftNode() {
+      let node = null;
+      const defaultShapeType = decorPanelDefaultShapeType();
+      if (defaultShapeType) {
+        node = { kind: 'shape', shapeType: defaultShapeType, __decorDraft: true };
+        applyDecorShapeDefaults(node, decorToolDefaults(defaultShapeType));
+      } else if (activeDecorTextPreset) {
+        const base = decorTextPresetBase(activeDecorTextPreset);
+        node = {
+          kind: 'textBox',
+          boxStyle: activeDecorTextPreset,
+          text: global.RelatumI18n ? global.RelatumI18n.t(base.text) : base.text,
+          __decorDraft: true,
+        };
+        applyDecorTextPresetDefaults(node, decorTextPresetDefaults(activeDecorTextPreset));
+      }
+      return node;
+    }
+
+    function decorPanelNode() {
+      const targets = decorNodeTargets();
+      return targets[0] || decorToolDraftNode();
+    }
+
+    function decorPanelEditingDefaults() {
+      return decorNodeTargets().length === 0 && !!decorToolDraftNode();
+    }
+
+    function pushDecorHistoryIfEditingNode() {
+      if (decorNodeTargets().length) pushHistory();
+    }
+
+    function refreshDecorPanel() {
+      if (!decorPanel) return;
+      const targets = decorNodeTargets();
+      const multi = targets.length > 1;
+      const editingDefaults = decorPanelEditingDefaults();
+      const node = decorPanelNode();
+      if (dpEmpty) dpEmpty.hidden = !!node;
+      if (dpSelection) dpSelection.hidden = !node;
+      refreshGroupStylePresets();
+      if (!node) return;
+      const panelTargets = targets.length ? targets : [node];
+      const shape = panelTargets.every((item) => isShapeNode(item) && item.shapeType === node.shapeType);
+      const styledText = panelTargets.every((item) => isTextBoxNode(item) && !!item.boxStyle && item.boxStyle === node.boxStyle);
+      const isSlider = shape && node.shapeType === 'slider';
+      const englishUi = document.documentElement.dataset.uiLanguage === 'en'
+        || document.body.dataset.toolbarLanguage === 'en';
+      const shapeNames = englishUi ? {
+        'rounded-rect': 'Rounded Rectangle',
+        rect: 'Rectangle',
+        ellipse: 'Ellipse',
+        circle: 'Circle',
+        triangle: 'Triangle',
+        diamond: 'Diamond',
+        arrow: 'Arrow',
+        divider: 'Divider',
+        slider: 'Slider',
+        'dashed-box': 'Dashed Box',
+        'group-box': 'Box',
+        'color-block': 'Color Block',
+        pill: 'Pill Label',
+        'corner-frame': 'Corner Frame',
+        bracket: 'Bracket',
+        question: 'Question',
+      } : {
+        'rounded-rect': '圆角矩形',
+        rect: '矩形',
+        ellipse: '椭圆',
+        circle: '圆形',
+        triangle: '正三角形',
+        diamond: '菱形',
+        arrow: '箭头图案',
+        divider: '分隔线',
+        slider: '滑条',
+        'dashed-box': '虚线框',
+        'group-box': '盒子',
+        'color-block': '纯色色块',
+        pill: '胶囊标签',
+        'corner-frame': '角标框',
+        bracket: '括号标记',
+        question: '问号',
+      };
+      const textPresetNames = englishUi ? {
+        'emphasis-card': 'Emphasis Note',
+        'note-bubble': 'Side Note',
+      } : {
+        'emphasis-card': '重点便签',
+        'note-bubble': '旁注框',
+      };
+      if (dpKindLabel) {
+        let kindLabel = shape ? (shapeNames[node.shapeType] || (englishUi ? 'Shape' : '图案'))
+          : styledText ? (textPresetNames[node.boxStyle] || (englishUi ? 'Text Box' : '文字框'))
+          : isTextBoxNode(node) ? (englishUi ? 'Text Box' : '文字框')
+          : (isPdfNode(node) ? (englishUi ? 'PDF Attachment' : 'PDF 附件')
+            : (isMdNode(node) ? (englishUi ? 'Markdown Attachment' : 'Markdown 附件')
+              : (englishUi ? 'Image' : '图片')));
+        if (isGroupBoxNode(node) && Array.isArray(node.groupMemberIds) && node.groupMemberIds.length) {
+          const memberCount = semanticGroupMembers(node).length;
+          kindLabel = englishUi
+            ? ('Group · ' + memberCount + (memberCount === 1 ? ' node' : ' nodes'))
+            : ('分组 · ' + memberCount + ' 个节点');
+        }
+        if (multi) {
+          const sameKind = panelTargets.every((item) => item.kind === node.kind
+            && item.shapeType === node.shapeType && item.boxStyle === node.boxStyle);
+          kindLabel = sameKind
+            ? kindLabel + ' · ' + targets.length + (englishUi ? ' selected' : ' 个')
+            : (englishUi ? targets.length + ' decorations selected' : '已选择 ' + targets.length + ' 个图案');
+        }
+        if (editingDefaults && (shape || styledText)) kindLabel += englishUi ? ' · Preset' : ' · 预设';
+        dpKindLabel.textContent = kindLabel;
+      }
+      const mixedText = englishUi ? 'Mixed' : '混合';
+      const widthState = editSharedState(panelTargets, (item) => Math.round(Number(item.width) || 240));
+      const heightState = editSharedState(panelTargets, (item) => Math.round(Number(item.height) || 120));
+      const fontSizeState = editSharedState(panelTargets, (item) => Math.round(Number(item.fontSize)
+        || (styledText ? decorTextPresetBase(item.boxStyle).fontSize : 22)));
+      const rotationState = editSharedState(panelTargets, (item) => Math.round(Number(item.rotation) || 0));
+      const opacityState = editSharedState(panelTargets, (item) => Math.round((item.opacity == null ? 1 : item.opacity) * 100));
+      const width = widthState.value;
+      const height = heightState.value;
+      const fontSize = fontSizeState.value;
+      const textBase = styledText ? decorTextPresetBase(node.boxStyle) : null;
+      const borderWidthState = editSharedState(panelTargets, (item) => styledText
+        ? cleanDecorNumber(item.borderWidth, textBase.borderWidth, 1, 6, false)
+        : 1);
+      const borderStyleState = editSharedState(panelTargets, (item) => styledText
+        ? cleanDecorTextBorderStyle(item.borderStyle, textBase.borderStyle)
+        : 'solid');
+      const rotation = rotationState.value;
+      const opacity = opacityState.value;
+      dpWidth.value = width; dpWidthVal.textContent = widthState.mixed ? mixedText : width + 'px';
+      dpHeight.value = height; dpHeightVal.textContent = heightState.mixed ? mixedText : height + 'px';
+      setEditMixedControl(dpWidth, widthState.mixed);
+      setEditMixedControl(dpHeight, heightState.mixed);
+      if (dpFontSize) dpFontSize.value = fontSize;
+      if (dpFontSizeVal) dpFontSizeVal.textContent = fontSizeState.mixed ? mixedText : fontSize + 'px';
+      setEditMixedControl(dpFontSize, fontSizeState.mixed);
+      if (dpBorderWidth) dpBorderWidth.value = borderWidthState.value;
+      if (dpBorderWidthVal) dpBorderWidthVal.textContent = borderWidthState.mixed ? mixedText : borderWidthState.value + 'px';
+      setEditMixedControl(dpBorderWidth, borderWidthState.mixed);
+      dpRotation.value = rotation; dpRotationVal.textContent = rotationState.mixed ? mixedText : rotation + '°';
+      setEditMixedControl(dpRotation, rotationState.mixed);
+      dpOpacity.value = opacity; dpOpacityVal.textContent = opacityState.mixed ? mixedText : opacity + '%';
+      setEditMixedControl(dpOpacity, opacityState.mixed);
+      if (dpShapeColors) dpShapeColors.hidden = !(shape || styledText);
+      const simpleBlock = shape && isColorBlockNode(node);
+      const lineOnly = shape && isLineOnlyDecorShapeType(node.shapeType);
+      if (dpWidthWrap) dpWidthWrap.hidden = false;
+      if (dpHeightWrap) dpHeightWrap.hidden = false;
+      if (dpFontSizeWrap) dpFontSizeWrap.hidden = !styledText;
+      if (dpBorderWidthWrap) dpBorderWidthWrap.hidden = !styledText;
+      if (dpBorderStyleWrap) dpBorderStyleWrap.hidden = !styledText;
+      if (dpTitleToneWrap) dpTitleToneWrap.hidden = !(shape && isGroupBoxNode(node));
+      if (dpRotationWrap) dpRotationWrap.hidden = panelTargets.some(isAttachmentNode);
+      if (dpOpacityWrap) dpOpacityWrap.hidden = false;
+      if (dpLayerWrap) dpLayerWrap.hidden = false;
+      if (dpResetDefaults) {
+        dpResetDefaults.hidden = !editingDefaults && !panelTargets.every(hasDecorCreationDefaults);
+        dpResetDefaults.textContent = editingDefaults
+          ? (englishUi ? 'Reset creation preset' : '重置新建预设')
+          : (englishUi ? 'Apply creation preset' : '应用新建预设');
+      }
+      if (dpResetFill) {
+        dpResetFill.hidden = false;
+        dpResetFill.textContent = editingDefaults
+          ? (englishUi ? 'Reset default colors' : '重置默认颜色')
+          : (englishUi ? 'Apply preset colors' : '应用预设颜色');
+      }
+      if (dpDelete) dpDelete.hidden = editingDefaults;
+      if (dpDelete && !editingDefaults) {
+        dpDelete.textContent = multi
+          ? (englishUi ? 'Delete ' + targets.length + ' decorations' : '删除选中的 ' + targets.length + ' 个图案')
+          : (englishUi ? 'Delete decoration' : '删除此装饰对象');
+      }
+      if (shape) {
+        const defaults = decorShapeDefaults(node.shapeType);
+        const borderState = editSharedState(panelTargets, (item) => cleanDecorColor(item.borderColor, defaults.borderColor));
+        const fillState = editSharedState(panelTargets, (item) => cleanDecorColor(item.fillColor, defaults.fillColor));
+        dpBorder.value = borderState.value;
+        dpFill.value = fillState.value;
+        setEditMixedControl(dpBorder, borderState.mixed);
+        setEditMixedControl(dpFill, fillState.mixed);
+        if (dpBorderState) dpBorderState.textContent = borderState.mixed ? mixedText : '';
+        if (dpFillState) dpFillState.textContent = fillState.mixed ? mixedText : '';
+        if (isGroupBoxNode(node)) {
+          const toneState = editSharedState(panelTargets, (item) => decorGroupTitleTone(item.titleColor || defaults.titleColor));
+          setActiveBtns(dpTitleToneBtns, 'titleTone', toneState.mixed ? '' : toneState.value);
+          if (dpTitleToneState) dpTitleToneState.textContent = toneState.mixed ? mixedText : '';
+        }
+        if (dpBorderWrap) dpBorderWrap.hidden = simpleBlock;
+        if (dpFillWrap) dpFillWrap.hidden = lineOnly;
+        if (dpTextColorWrap) dpTextColorWrap.hidden = true;
+        if (dpFillLabel) dpFillLabel.textContent = simpleBlock ? '颜色' : '填充颜色';
+        if (dpFillModeWrap) dpFillModeWrap.hidden = simpleBlock || lineOnly;
+        if (dpResetFill) dpResetFill.hidden = lineOnly;
+        const fillModeState = editSharedState(panelTargets, decorFillMode);
+        if (dpFillModeBtns) setActiveBtns(dpFillModeBtns, 'fillMode', fillModeState.mixed ? '' : fillModeState.value);
+        if (dpFillModeState) dpFillModeState.textContent = fillModeState.mixed ? mixedText : '';
+        if (dpBorderStyleState) dpBorderStyleState.textContent = '';
+        if (dpTextColorState) dpTextColorState.textContent = '';
+        renderDecorColorPresets(simpleBlock ? 'block' : null, node);
+      } else if (styledText) {
+        const defaults = decorTextPresetDefaults(node.boxStyle);
+        const borderState = editSharedState(panelTargets, (item) => cleanDecorColor(item.borderColor, defaults.borderColor));
+        const fillState = editSharedState(panelTargets, (item) => cleanDecorColor(item.fillColor, defaults.fillColor));
+        const textColorState = editSharedState(panelTargets, (item) => cleanDecorColor(item.color, defaults.color));
+        dpBorder.value = borderState.value;
+        dpFill.value = fillState.value;
+        if (dpTextColor) dpTextColor.value = textColorState.value;
+        setEditMixedControl(dpBorder, borderState.mixed);
+        setEditMixedControl(dpFill, fillState.mixed);
+        setEditMixedControl(dpTextColor, textColorState.mixed);
+        if (dpBorderState) dpBorderState.textContent = borderState.mixed ? mixedText : '';
+        if (dpFillState) dpFillState.textContent = fillState.mixed ? mixedText : '';
+        if (dpTextColorState) dpTextColorState.textContent = textColorState.mixed ? mixedText : '';
+        if (dpBorderWrap) dpBorderWrap.hidden = false;
+        if (dpFillWrap) dpFillWrap.hidden = false;
+        if (dpTextColorWrap) dpTextColorWrap.hidden = false;
+        if (dpFillLabel) dpFillLabel.textContent = '背景颜色';
+        if (dpFillModeWrap) dpFillModeWrap.hidden = true;
+        if (dpResetFill) dpResetFill.hidden = false;
+        if (dpBorderStyleBtns) setActiveBtns(dpBorderStyleBtns, 'borderStyle', borderStyleState.mixed ? '' : borderStyleState.value);
+        if (dpBorderStyleState) dpBorderStyleState.textContent = borderStyleState.mixed ? mixedText : '';
+        if (dpFillModeState) dpFillModeState.textContent = '';
+        if (dpTitleToneState) dpTitleToneState.textContent = '';
+        renderDecorColorPresets('text:' + node.boxStyle, node);
+      } else {
+        if (dpTextColorWrap) dpTextColorWrap.hidden = true;
+        [dpBorder, dpFill, dpTextColor].forEach((control) => setEditMixedControl(control, false));
+        [dpBorderState, dpFillState, dpTextColorState, dpBorderStyleState, dpFillModeState, dpTitleToneState]
+          .forEach((state) => { if (state) state.textContent = ''; });
+        renderDecorColorPresets(null, node);
+      }
+      if (dpProgressWrap) dpProgressWrap.hidden = !isSlider;
+      if (isSlider) {
+        const defaults = decorShapeDefaults(node.shapeType);
+        const progressState = editSharedState(panelTargets, (item) => Math.round(item.progress == null ? defaults.progress : Number(item.progress)));
+        dpProgress.value = progressState.value;
+        dpProgressVal.textContent = progressState.mixed ? mixedText : progressState.value + '%';
+        setEditMixedControl(dpProgress, progressState.mixed);
+      }
+      const layerState = editSharedState(panelTargets, decorationLayer);
+      setActiveBtns(dpLayerBtns, 'layer', layerState.mixed ? '' : layerState.value);
+      if (dpLayerState) dpLayerState.textContent = layerState.mixed ? mixedText : '';
+      refreshDecorStackControls(targets, englishUi);
+    }
+
+    // 图案模式的右栏兼作“对象属性”与“新建预设”。特殊模式检查器开关变化时，
+    // 立即在两者之间切换，不必等待用户重新点选对象。
+    document.addEventListener('editor:inspectorpreferencechange', refreshDecorPanel);
+    document.addEventListener('editor:modechange', refreshDecorPanel);
+    document.addEventListener('relatum:languagechange', refreshDecorPanel);
+
+    function decorStackAvailability(targets) {
+      const selected = new Set((targets || []).map((node) => node.id));
+      const available = { bottom: false, backward: false, forward: false, top: false };
+      if (!selected.size) return available;
+      ['back', 'front'].forEach((layer) => {
+        const ordered = decorationNodesInLayer(layer);
+        const layerSelected = ordered.filter((node) => selected.has(node.id));
+        if (!layerSelected.length) return;
+        const count = layerSelected.length;
+        available.bottom = available.bottom
+          || ordered.slice(0, count).some((node) => !selected.has(node.id));
+        available.top = available.top
+          || ordered.slice(Math.max(0, ordered.length - count)).some((node) => !selected.has(node.id));
+        available.backward = available.backward
+          || ordered.some((node, index) => selected.has(node.id)
+            && index > 0 && !selected.has(ordered[index - 1].id));
+        available.forward = available.forward
+          || ordered.some((node, index) => selected.has(node.id)
+            && index < ordered.length - 1 && !selected.has(ordered[index + 1].id));
+      });
+      return available;
+    }
+
+    function refreshDecorStackControls(targets, englishUi) {
+      const available = decorStackAvailability(targets);
+      if (dpStackBtns) {
+        dpStackBtns.forEach((button) => {
+          button.disabled = !available[button.dataset.stackAction];
+        });
+      }
+      if (dpStackHint) {
+        dpStackHint.textContent = targets.length
+          ? (englishUi
+            ? 'Only changes the selected decorations\' order within their current layer.'
+            : '只调整所选图案在当前显示图层内的先后顺序。')
+          : (englishUi
+            ? 'Select one or more decorations to change their stacking order.'
+            : '选中一个或多个图案后，可调整叠放顺序。');
+      }
+    }
+
+    function writeDecorationLayerOrder(ordered) {
+      ordered.forEach((node, index) => { node.zOrder = index; });
+    }
+
+    function moveSelectedDecorations(action) {
+      const targets = decorNodeTargets();
+      if (!targets.length) return;
+      const selected = new Set(targets.map((node) => node.id));
+      let changed = false;
+      ['back', 'front'].forEach((layer) => {
+        const ordered = decorationNodesInLayer(layer);
+        if (!ordered.some((node) => selected.has(node.id))) return;
+        const before = ordered.map((node) => node.id).join('\n');
+        let next = ordered.slice();
+        if (action === 'bottom') {
+          next = next.filter((node) => selected.has(node.id))
+            .concat(next.filter((node) => !selected.has(node.id)));
+        } else if (action === 'top') {
+          next = next.filter((node) => !selected.has(node.id))
+            .concat(next.filter((node) => selected.has(node.id)));
+        } else if (action === 'backward') {
+          for (let index = 1; index < next.length; index += 1) {
+            if (selected.has(next[index].id) && !selected.has(next[index - 1].id)) {
+              const previous = next[index - 1];
+              next[index - 1] = next[index];
+              next[index] = previous;
+            }
+          }
+        } else if (action === 'forward') {
+          for (let index = next.length - 2; index >= 0; index -= 1) {
+            if (selected.has(next[index].id) && !selected.has(next[index + 1].id)) {
+              const following = next[index + 1];
+              next[index + 1] = next[index];
+              next[index] = following;
+            }
+          }
+        }
+        if (next.map((node) => node.id).join('\n') !== before) changed = true;
+        writeDecorationLayerOrder(next);
+      });
+      if (!changed) {
+        refreshDecorPanel();
+        return;
+      }
+      syncDecorationStackingOrder();
+      notify();
+      pushHistory();
+      refreshDecorPanel();
+    }
+
+    function moveDecorationTargetsToLayer(targets, layer) {
+      const nextLayer = layer === 'front' ? 'front' : 'back';
+      if (!targets.some((node) => decorationLayer(node) !== nextLayer)) return false;
+      const selected = new Set(targets.map((node) => node.id));
+      const selectedOrdered = [];
+      ['back', 'front'].forEach((currentLayer) => {
+        decorationNodesInLayer(currentLayer).forEach((node) => {
+          if (selected.has(node.id)) selectedOrdered.push(node);
+        });
+      });
+      const remaining = decorationNodesInLayer(nextLayer).filter((node) => !selected.has(node.id));
+      selectedOrdered.forEach((node) => { node.layer = nextLayer; });
+      writeDecorationLayerOrder(remaining.concat(selectedOrdered));
+      normalizeDecorationZOrders(['back', 'front']);
+      return true;
+    }
+
+    function renderEditedDecoration(node) {
+      const el = nodeMap.get(node.id);
+      if (!el) return;
+      applyNodeStyle(el, node);
+      renderDecoration(el, node);
+    }
+
+    function editDecorToolDefaultField(prop, value) {
+      const defaultShapeType = decorPanelDefaultShapeType();
+      if (defaultShapeType) {
+        const shapeType = defaultShapeType;
+        const draft = { kind: 'shape', shapeType: shapeType };
+        if (isColorBlockNode(draft) && (prop === 'fillColor' || prop === 'borderColor')) {
+          const color = cleanDecorColor(value, decorBaseDefaults(shapeType).fillColor);
+          rememberDecorShapeDefaults(shapeType, { fillColor: color, borderColor: color });
+        } else {
+          rememberDecorShapeField(draft, prop, value);
+        }
+      } else if (activeDecorTextPreset) {
+        const draft = { kind: 'textBox', boxStyle: activeDecorTextPreset };
+        rememberDecorTextPresetField(draft, prop, value);
+      } else {
+        return false;
+      }
+      refreshDecorPanel();
+      return true;
+    }
+
+    function editDecorationField(prop, value) {
+      const targets = decorNodeTargets();
+      if (!targets.length) {
+        editDecorToolDefaultField(prop, value);
+        return false;
+      }
+      if (prop === 'layer') {
+        if (!moveDecorationTargetsToLayer(targets, value)) return false;
+      } else {
+        targets.forEach((node) => {
+          node[prop] = value;
+          if (isColorBlockNode(node) && (prop === 'fillColor' || prop === 'borderColor')) {
+            node.fillColor = value;
+            node.borderColor = value;
+          }
+        });
+      }
+      targets.forEach((node) => {
+        renderEditedDecoration(node);
+      });
+      if (prop === 'layer') syncDecorationStackingOrder();
+      notify();
+      refreshDecorPanel();
+      return true;
+    }
+
+    function groupStylePresetPatch(preset) {
+      return {
+        borderColor: cleanDecorColor(preset.borderColor, '#d6b96a'),
+        fillColor: cleanDecorColor(preset.fillColor, '#fffdf3'),
+        titleColor: cleanDecorColor(preset.titleColor, '#ffffff'),
+        fillMode: cleanDecorFillMode(preset.fillMode, 'solid'),
+        opacity: cleanDecorNumber(preset.opacity, 0.74, 0, 1, false),
+        layer: cleanDecorLayer(preset.layer, 'back'),
+        borderWidth: cleanDecorNumber(preset.borderWidth, 2.4, 1, 6, false),
+        borderStyle: cleanDecorGroupBorderStyle(preset.borderStyle, 'solid'),
+      };
+    }
+
+    function groupStylePresetMatches(preset, defaults) {
+      const patch = groupStylePresetPatch(preset);
+      const current = defaults || decorShapeDefaults('group-box');
+      return patch.borderColor === current.borderColor
+        && patch.fillColor === current.fillColor
+        && patch.titleColor === current.titleColor
+        && patch.fillMode === current.fillMode
+        && patch.opacity === current.opacity
+        && patch.layer === current.layer
+        && patch.borderWidth === current.borderWidth
+        && patch.borderStyle === current.borderStyle;
+    }
+
+    function selectedGroupPresetTargets() {
+      const targets = decorNodeTargets();
+      return targets.length && targets.every(isGroupBoxNode) ? targets : [];
+    }
+
+    function refreshGroupStylePresets() {
+      if (!dpGroupPresets) return;
+      const defaults = decorShapeDefaults('group-box');
+      const targets = selectedGroupPresetTargets();
+      const applyingToSelection = targets.length > 0;
+      const englishUi = document.documentElement.dataset.uiLanguage === 'en'
+        || document.body.dataset.toolbarLanguage === 'en';
+      if (dpGroupPresetMode) {
+        dpGroupPresetMode.textContent = applyingToSelection
+          ? (englishUi ? 'Apply to selection' : '应用到选中')
+          : (englishUi ? 'Creation preset' : '新建预设');
+      }
+      if (dpGroupPresetHint) {
+        dpGroupPresetHint.textContent = applyingToSelection
+          ? (englishUi
+            ? 'Clicking only applies to the selected boxes or groups and does not change the creation preset.'
+            : '点击只应用到当前选中的盒子或分组，不修改新建预设。')
+          : (englishUi
+            ? 'With no box or group selected, clicking only changes the style for future creations.'
+            : '没有选中盒子或分组时，点击只修改之后新建的默认样式。');
+      }
+      dpGroupPresets.querySelectorAll('[data-group-style-preset]').forEach((button) => {
+        const preset = DECOR_GROUP_STYLE_PRESETS.find((item) => item.id === button.dataset.groupStylePreset);
+        const active = !!preset && (applyingToSelection
+          ? targets.every((node) => groupStylePresetMatches(preset, node))
+          : groupStylePresetMatches(preset, defaults));
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-pressed', active ? 'true' : 'false');
+        if (preset) {
+          button.setAttribute('aria-label', applyingToSelection
+            ? (englishUi ? 'Apply ' + preset.name + ' to selection' : '将' + preset.name + '应用到选中')
+            : (englishUi ? 'Use ' + preset.name + ' as creation preset' : '将' + preset.name + '设为新建预设'));
+        }
+      });
+    }
+
+    function applyGroupStylePreset(presetId) {
+      const preset = DECOR_GROUP_STYLE_PRESETS.find((item) => item.id === presetId);
+      if (!preset) return;
+      const patch = groupStylePresetPatch(preset);
+      const applyTargets = selectedGroupPresetTargets();
+      const applyToSelection = applyTargets.length > 0;
+      if (applyToSelection) {
+        moveDecorationTargetsToLayer(applyTargets, patch.layer);
+        applyTargets.forEach((node) => {
+          Object.assign(node, patch);
+          renderEditedDecoration(node);
+        });
+        syncDecorationStackingOrder();
+        notify();
+        pushHistory();
+      } else {
+        rememberDecorShapeDefaults('group-box', patch);
+      }
+      refreshDecorPanel();
+      showCanvasToast(applyToSelection
+        ? '已将“' + preset.name + '”应用到选中盒子 / 分组'
+        : '“' + preset.name + '”已设为盒子 / 分组新建预设');
+    }
+
+    function setupGroupStylePresets() {
+      if (!dpGroupPresets) return;
+      dpGroupPresets.innerHTML = '';
+      DECOR_GROUP_STYLE_PRESETS.forEach((preset) => {
+        const patch = groupStylePresetPatch(preset);
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'decor-group-preset';
+        button.dataset.groupStylePreset = preset.id;
+        button.dataset.groupBorderStyle = patch.borderStyle;
+        button.dataset.groupFillMode = patch.fillMode;
+        button.style.setProperty('--group-preset-border', patch.borderColor);
+        button.style.setProperty('--group-preset-fill', patch.fillColor);
+        button.style.setProperty('--group-preset-title', patch.borderColor);
+        button.style.setProperty('--group-preset-mix', Math.round(patch.opacity * 100) + '%');
+        button.style.setProperty('--group-preset-width', patch.borderWidth + 'px');
+        button.innerHTML = '<span class="decor-group-preset-preview"><i></i></span>'
+          + '<span class="decor-group-preset-name"></span>';
+        button.querySelector('.decor-group-preset-name').textContent = preset.name;
+        button.setAttribute('aria-label', '将' + preset.name + '设为新建预设');
+        button.setAttribute('aria-pressed', 'false');
+        button.addEventListener('click', () => applyGroupStylePreset(preset.id));
+        dpGroupPresets.appendChild(button);
+      });
+      refreshGroupStylePresets();
+    }
+
+    function addDecorationNode(node, point, animate, options) {
+      const opts = options || {};
+      const center = point || viewportCenterInSurface();
+      node.id = newNodeId();
+      // 与普通节点保持一致：画布已支持四向无界，附件/图片不能被夹回原点附近。
+      node.x = center.x - node.width / 2;
+      node.y = center.y - node.height / 2;
+      prepareNewDecorationNode(node);
+      data.nodes.push(node);
+      indexNodeData(node);
+      const el = createNodeEl(node);
+      surface.appendChild(el);
+      nodeMap.set(node.id, el);
+      if (animate) {
+        el.classList.add('decor-inserted');
+        el.addEventListener('animationend', () => el.classList.remove('decor-inserted'), { once: true });
+      }
+      if (opts.transientMovableDecor) transientMovableDecorId = node.id;
+      selectNodes([node.id], false);
+      applySelection();
+      lastCreatedNodeId = node.id;
+      pushHistory();
+      notify();
+    }
+
+    function createShapeDecoration(shapeType) {
+      const defaults = decorShapeDefaults(shapeType);
+      const node = {
+        kind: 'shape',
+        shapeType: shapeType,
+      };
+      applyDecorShapeDefaults(node, defaults);
+      addDecorationNode(node);
+    }
+
+    function createDecorTextPresetNode(preset) {
+      const base = decorTextPresetBase(preset);
+      const node = {
+        kind: 'textBox',
+        boxStyle: preset,
+        text: global.RelatumI18n ? global.RelatumI18n.t(base.text) : base.text,
+      };
+      applyDecorTextPresetDefaults(node, decorTextPresetDefaults(preset));
+      return node;
+    }
+
+    function startDecorTextPresetCreate(e, preset) {
+      const p = clientToSurface(e.clientX, e.clientY);
+      const node = createDecorTextPresetNode(preset);
+      node.id = newNodeId();
+      node.x = Math.round(p.x - node.width / 2);
+      node.y = Math.round(p.y - node.height / 2);
+      prepareNewDecorationNode(node);
+      data.nodes.push(node);
+      indexNodeData(node);
+      const el = createNodeEl(node);
+      surface.appendChild(el);
+      el.classList.add('decor-pending');
+      nodeMap.set(node.id, el);
+      if (nodeSizeObserver) nodeSizeObserver.observe(el);
+      el.classList.add('decor-inserted');
+      el.addEventListener('animationend', () => el.classList.remove('decor-inserted'), { once: true });
+      const hadPriorSelection = selectedNodeIds.size > 0 || selectedEdgeIds.size > 0;
+      selectNodes([node.id], false);
+      applySelection();
+      lastCreatedNodeId = node.id;
+      redrawMinimap();
+      drag = {
+        mode: 'decor-text-preset-create',
+        nodeId: node.id,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        startX: p.x,
+        startY: p.y,
+        moved: false,
+        hadPriorSelection: hadPriorSelection,
+      };
+      refreshDecorPanel();
+    }
+
+    function updateDecorTextPresetDrag(clientX, clientY) {
+      if (!drag || drag.mode !== 'decor-text-preset-create') return;
+      const node = findNode(drag.nodeId);
+      if (!isTextBoxNode(node)) return;
+      const p = clientToSurface(clientX, clientY);
+      const minW = 120;
+      const minH = 74;
+      let x = Math.min(drag.startX, p.x);
+      let y = Math.min(drag.startY, p.y);
+      let width = Math.abs(p.x - drag.startX);
+      let height = Math.abs(p.y - drag.startY);
+      if (width < minW) {
+        if (p.x < drag.startX) x = drag.startX - minW;
+        width = minW;
+      }
+      if (height < minH) {
+        if (p.y < drag.startY) y = drag.startY - minH;
+        height = minH;
+      }
+      node.x = Math.round(x);
+      node.y = Math.round(y);
+      node.width = Math.round(width);
+      node.height = Math.round(height);
+      const el = nodeMap.get(node.id);
+      if (el) applyTransform(el, node.x, node.y);
+      renderEditedDecoration(node);
+      refreshDecorPanel();
+      redrawMinimap();
+    }
+
+    function finishDecorTextPresetCreate() {
+      if (!drag || drag.mode !== 'decor-text-preset-create') return;
+      const node = findNode(drag.nodeId);
+      if (!isTextBoxNode(node)) return;
+      const el = nodeMap.get(node.id);
+      if (el) el.classList.remove('decor-pending');
+      enterTextBoxEdit(node, true);
+    }
+
+    // 取消单击创建文本框（mousedown 时建的占位节点在 mouseup 无拖动时回滚）
+    function cancelDecorTextPresetCreate() {
+      if (!drag || drag.mode !== 'decor-text-preset-create') return;
+      const node = findNode(drag.nodeId);
+      if (!node) return;
+      const el = nodeMap.get(node.id);
+      if (el && nodeSizeObserver) nodeSizeObserver.unobserve(el);
+      const idx = data.nodes.indexOf(node);
+      if (idx !== -1) {
+        data.nodes.splice(idx, 1);
+        unindexNodeData(node);
+      }
+      if (el) el.remove();
+      nodeMap.delete(node.id);
+      if (lastCreatedNodeId === node.id) lastCreatedNodeId = null;
+      clearSelection();
+      refreshDecorPanel();
+      redrawMinimap();
+    }
+
+    function currentCanvasTitle() {
+      return 'Untitled';
+    }
+
+    function addDecorationNodeAtRect(node, rect, animate, options) {
+      const opts = options || {};
+      node.id = newNodeId();
+      node.x = Math.round(rect.x);
+      node.y = Math.round(rect.y);
+      const minWidth = isGroupBoxNode(node) ? GROUP_BOX_MIN_WIDTH : 24;
+      const minHeight = isGroupBoxNode(node) ? GROUP_BOX_MIN_HEIGHT : 20;
+      node.width = Math.max(minWidth, Math.round(rect.w));
+      node.height = Math.max(minHeight, Math.round(rect.h));
+      prepareNewDecorationNode(node);
+      data.nodes.push(node);
+      indexNodeData(node);
+      const el = createNodeEl(node);
+      surface.appendChild(el);
+      nodeMap.set(node.id, el);
+      if (animate) {
+        el.classList.add('decor-inserted');
+        el.addEventListener('animationend', () => el.classList.remove('decor-inserted'), { once: true });
+      }
+      if (opts.activateMode !== false) activateDecorMode();
+      if (opts.transientMovableDecor) transientMovableDecorId = node.id;
+      selectNodes([node.id], false);
+      applySelection();
+      lastCreatedNodeId = node.id;
+      pushHistory();
+      notify();
+      refreshDecorPanel();
+      redrawMinimap();
+    }
+
+    function createGroupBoxFromRect(rect, memberIds) {
+      const defaults = decorShapeDefaults('group-box');
+      const node = { kind: 'shape', shapeType: 'group-box', title: 'Untitled' };
+      const members = (memberIds || []).filter(function (id, index, ids) {
+        const member = findNode(id);
+        return member && !isDecorationNode(member) && ids.indexOf(id) === index;
+      });
+      if (members.length) node.groupMemberIds = members;
+      applyDecorShapeDefaults(node, defaults);
+      addDecorationNodeAtRect(node, rect, true, { activateMode: false, transientMovableDecor: true });
+      if (members.length) showCanvasToast('已建立分组 · ' + members.length + ' 个节点');
+    }
+
+    function createColorBlockFromRect(rect) {
+      const defaults = decorShapeDefaults('color-block');
+      const node = { kind: 'shape', shapeType: 'color-block' };
+      applyDecorShapeDefaults(node, defaults);
+      node.borderColor = node.fillColor;
+      addDecorationNodeAtRect(node, rect, true, { activateMode: false, transientMovableDecor: true });
+    }
+
+    function startColorBlockCreate(e) {
+      hideFrameActionButton();
+      const p = clientToSurface(e.clientX, e.clientY);
+      drag = {
+        mode: 'color-block-create',
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        startX: p.x,
+        startY: p.y,
+        currentX: p.x,
+        currentY: p.y,
+        moved: false,
+      };
+    }
+
+    function updateSketchShapeDrag(clientX, clientY) {
+      if (!drag || drag.mode !== 'sketch-shape-create') return;
+      const node = findNode(drag.nodeId);
+      if (!isShapeNode(node)) return;
+      const p = clientToSurface(clientX, clientY);
+      const minW = 24;
+      const minH = 20;
+      let x = Math.min(drag.startX, p.x);
+      let y = Math.min(drag.startY, p.y);
+      let width = Math.abs(p.x - drag.startX);
+      let height = Math.abs(p.y - drag.startY);
+      if (width < minW) {
+        if (p.x < drag.startX) x = drag.startX - minW;
+        width = minW;
+      }
+      if (height < minH) {
+        if (p.y < drag.startY) y = drag.startY - minH;
+        height = minH;
+      }
+      node.x = Math.round(x);
+      node.y = Math.round(y);
+      node.width = Math.round(width);
+      node.height = Math.round(height);
+      const el = nodeMap.get(node.id);
+      if (el) applyTransform(el, node.x, node.y);
+      renderEditedDecoration(node);
+      refreshDecorPanel();
+      redrawMinimap();
+    }
+
+    // 左侧手绘图形「点按不拖动」时创建的小图标尺寸（拖动则按拖拽矩形）
+    function decorClickSize(shapeType) {
+      if (shapeType === 'sketch-diamond') return { width: 52, height: 52 };
+      if (shapeType === 'sketch-ellipse') return { width: 64, height: 44 };
+      if (shapeType === 'dashed-box') return { width: 150, height: 96 };
+      if (shapeType === 'color-block') return { width: 110, height: 72 };
+      if (shapeType === 'corner-frame') return { width: 130, height: 96 };
+      if (shapeType === 'bracket') return { width: 110, height: 140 };
+      if (shapeType === 'divider') return { width: 180, height: 22 };
+      if (shapeType === 'question') return { width: 72, height: 72 };
+      return { width: 60, height: 44 };   // sketch-rounded-rect 等
+    }
+    function finishSketchShapeClick() {
+      if (!drag || drag.mode !== 'sketch-shape-create') return;
+      const node = findNode(drag.nodeId);
+      if (!isShapeNode(node)) return;
+      const defaults = decorToolDefaults(node.shapeType);
+      node.width = defaults.width;
+      node.height = defaults.height;
+      node.x = Math.round(drag.startX - node.width / 2);
+      node.y = Math.round(drag.startY - node.height / 2);
+      const el = nodeMap.get(node.id);
+      if (el) applyTransform(el, node.x, node.y);
+      renderEditedDecoration(node);
+      refreshDecorPanel();
+      redrawMinimap();
+    }
+
+    // 取消单击创建形状（mousedown 时建的占位节点在 mouseup 无拖动时回滚）
+    function cancelSketchShapeCreate() {
+      if (!drag || drag.mode !== 'sketch-shape-create') return;
+      const node = findNode(drag.nodeId);
+      if (!node) return;
+      const idx = data.nodes.indexOf(node);
+      if (idx !== -1) {
+        data.nodes.splice(idx, 1);
+        unindexNodeData(node);
+      }
+      const el = nodeMap.get(node.id);
+      if (el) el.remove();
+      nodeMap.delete(node.id);
+      if (transientMovableDecorId === node.id) transientMovableDecorId = null;
+      if (lastCreatedNodeId === node.id) lastCreatedNodeId = null;
+      clearSelection();
+      refreshDecorPanel();
+      redrawMinimap();
+    }
+
+    function startSketchShapeCreate(e, shapeType) {
+      const defaults = decorToolDefaults(shapeType);
+      const p = clientToSurface(e.clientX, e.clientY);
+      const node = {
+        id: newNodeId(),
+        kind: 'shape',
+        shapeType: shapeType,
+      };
+      applyDecorShapeDefaults(node, defaults);
+      node.x = Math.round(p.x);
+      node.y = Math.round(p.y);
+      node.width = 24;
+      node.height = 20;
+      prepareNewDecorationNode(node);
+      data.nodes.push(node);
+      indexNodeData(node);
+      const el = createNodeEl(node);
+      surface.appendChild(el);
+      el.classList.add('decor-pending');
+      nodeMap.set(node.id, el);
+      transientMovableDecorId = node.id;
+      selectNodes([node.id], false);
+      applySelection();
+      refreshDecorPanel();
+      lastCreatedNodeId = node.id;
+      drag = {
+        mode: 'sketch-shape-create',
+        nodeId: node.id,
+        startX: p.x,
+        startY: p.y,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        moved: false,
+      };
+    }
+
+    function hasDecorCreationDefaults(node) {
+      return isShapeNode(node) || isImageNode(node)
+        || (isTextBoxNode(node) && !!node.boxStyle);
+    }
+
+    function storedDecorDefaultsForNode(node) {
+      // 可点击创建的图案使用 decorToolDefaults：它包含面板实际展示、且新建时真正采用的
+      // 单击尺寸；盒子 / 分组由拖拽范围决定实际大小，仍沿用其形状预设尺寸。
+      if (isShapeNode(node)) return isGroupBoxNode(node)
+        ? decorShapeDefaults(node.shapeType)
+        : decorToolDefaults(node.shapeType);
+      if (isTextBoxNode(node) && node.boxStyle) return decorTextPresetDefaults(node.boxStyle);
+      if (isImageNode(node)) return decorImageDefaults();
+      return null;
+    }
+
+    function applyStoredDecorDefaultsToTargets(targets) {
+      const applicable = (targets || []).filter(hasDecorCreationDefaults);
+      if (!applicable.length) return false;
+      const entries = applicable.map((node) => ({ node: node, defaults: storedDecorDefaultsForNode(node) }));
+      ['back', 'front'].forEach((layer) => {
+        const layerTargets = entries.filter((entry) => cleanDecorLayer(entry.defaults.layer, 'back') === layer)
+          .map((entry) => entry.node);
+        if (layerTargets.length) moveDecorationTargetsToLayer(layerTargets, layer);
+      });
+      entries.forEach((entry) => {
+        if (isShapeNode(entry.node)) {
+          applyDecorShapeDefaults(entry.node, entry.defaults);
+          if (isColorBlockNode(entry.node)) entry.node.borderColor = entry.node.fillColor;
+        }
+        else if (isTextBoxNode(entry.node) && entry.node.boxStyle) applyDecorTextPresetDefaults(entry.node, entry.defaults);
+        else if (isImageNode(entry.node)) applyDecorImageDefaults(entry.node, entry.defaults);
+        renderEditedDecoration(entry.node);
+      });
+      syncDecorationStackingOrder();
+      notify();
+      refreshDecorPanel();
+      pushHistory();
+      return true;
+    }
+
+    function resetDecorFillDefault() {
+      const targets = decorNodeTargets();
+      if (targets.length) {
+        const first = targets[0];
+        const sameShape = targets.every((node) => isShapeNode(node) && node.shapeType === first.shapeType);
+        const sameTextPreset = targets.every((node) => isTextBoxNode(node) && !!node.boxStyle
+          && node.boxStyle === first.boxStyle);
+        if (sameTextPreset) {
+          const defaults = decorTextPresetDefaults(first.boxStyle);
+          targets.forEach((node) => {
+            node.fillColor = defaults.fillColor;
+            node.borderColor = defaults.borderColor;
+            node.color = defaults.color;
+            renderEditedDecoration(node);
+          });
+        } else if (sameShape) {
+          const defaults = decorShapeDefaults(first.shapeType);
+          targets.forEach((node) => {
+            node.fillColor = defaults.fillColor;
+            if (isColorBlockNode(node)) node.borderColor = defaults.fillColor;
+            renderEditedDecoration(node);
+          });
+        } else {
+          return;
+        }
+        notify();
+        refreshDecorPanel();
+        pushHistory();
+        return;
+      }
+
+      if (activeDecorTextPreset) {
+        const base = decorTextPresetBase(activeDecorTextPreset);
+        rememberDecorTextPresetDefaults(activeDecorTextPreset, {
+          fillColor: base.fillColor,
+          borderColor: base.borderColor,
+          color: base.color,
+        });
+      } else {
+        const shapeType = decorPanelDefaultShapeType();
+        if (!shapeType) return;
+        const fillColor = decorBaseDefaults(shapeType).fillColor || DECOR_DEFAULT_FILL;
+        const patch = { fillColor: fillColor };
+        if (shapeType === 'color-block') patch.borderColor = fillColor;
+        rememberDecorShapeDefaults(shapeType, patch);
+      }
+      refreshDecorPanel();
+    }
+
+    function resetDecorDefaults() {
+      const targets = decorNodeTargets();
+      if (targets.length) {
+        applyStoredDecorDefaultsToTargets(targets);
+        return;
+      }
+      if (activeDecorTextPreset) resetDecorTextPresetDefaults(activeDecorTextPreset);
+      else if (decorPanelDefaultShapeType()) resetDecorShapeDefaults(decorPanelDefaultShapeType());
+      else return;
+      refreshDecorPanel();
+    }
+
+    function pickDecorImageFile() {
+      return new Promise((resolve) => {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'image/png,image/jpeg,image/webp,image/gif,image/bmp';
+        input.style.position = 'fixed';
+        input.style.left = '-9999px';
+        input.style.opacity = '0';
+        input.addEventListener('change', () => {
+          const file = input.files && input.files[0] ? input.files[0] : null;
+          input.remove();
+          resolve(file);
+        }, { once: true });
+        document.body.appendChild(input);
+        input.click();
+      });
+    }
+
+    function fileToDataUrl(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ''));
+        reader.onerror = () => reject(reader.error || new Error('读取图片失败'));
+        reader.readAsDataURL(file);
+      });
+    }
+
+    function fileToText(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ''));
+        reader.onerror = () => reject(reader.error || new Error('读取文件失败'));
+        reader.readAsText(file, 'utf-8');
+      });
+    }
+
+    function imageDisplaySize(file) {
+      return new Promise((resolve) => {
+        if (!file || !/^image\//.test(file.type || '') || typeof URL === 'undefined') {
+          resolve(null);
+          return;
+        }
+        const url = URL.createObjectURL(file);
+        const img = new Image();
+        img.onload = () => {
+          URL.revokeObjectURL(url);
+          const rawW = img.naturalWidth || img.width || 320;
+          const rawH = img.naturalHeight || img.height || 220;
+          const maxW = 420;
+          const maxH = 300;
+          const scale = Math.min(1, maxW / rawW, maxH / rawH);
+          resolve({
+            width: Math.max(40, Math.round(rawW * scale)),
+            height: Math.max(40, Math.round(rawH * scale)),
+          });
+        };
+        img.onerror = () => {
+          URL.revokeObjectURL(url);
+          resolve(null);
+        };
+        img.src = url;
+      });
+    }
+
+    async function addImageDecorationFromFile(file, messagePrefix, options) {
+      if (!isLikelyImageFile(file)) return false;
+      const opts = options || {};
+      const extByType = {
+        'image/png': '.png',
+        'image/jpeg': '.jpg',
+        'image/webp': '.webp',
+        'image/gif': '.gif',
+        'image/bmp': '.bmp',
+      };
+      const fallbackName = 'clipboard-image' + (extByType[file.type] || '.png');
+      const displaySize = await imageDisplaySize(file);
+      const dataUrl = await fileToDataUrl(file);
+      const response = await fetch('/api/upload-canvas-image', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: filePath, name: file.name || fallbackName, data: dataUrl }),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        window.alert(result.error || messagePrefix || '插入图片失败');
+        return false;
+      }
+      if (result.cancelled) return false;
+      const imageNode = {
+        kind: 'image',
+        assetPath: result.assetPath,
+      };
+      applyDecorImageDefaults(imageNode, decorImageDefaults());
+      if (displaySize) {
+        imageNode.width = displaySize.width;
+        imageNode.height = displaySize.height;
+      }
+      if (opts.activateMode !== false) activateDecorMode();
+      addDecorationNode(imageNode, opts.point || null, opts.animate !== false, {
+        transientMovableDecor: !!opts.transientMovableDecor,
+      });
+      return true;
+    }
+
+    async function importImageDecoration() {
+      if (!dpAddImage) return;
+      const file = await pickDecorImageFile();
+      if (!file) return;
+      dpAddImage.disabled = true;
+      try {
+        await addImageDecorationFromFile(file, '插入图片失败');
+      } catch (err) {
+        window.alert('插入图片失败：' + err.message);
+      } finally {
+        dpAddImage.disabled = false;
+      }
+    }
+
+    // 附件（PDF / Markdown）：上传到画布伴生 attachments/（后端按内容哈希去重），
+    // 按落点创建可缩放附件节点。不强制进图案模式——附件是用来读的，留在当前模式。
+    async function addAttachmentFromFile(file, messagePrefix, options) {
+      const opts = options || {};
+      const isPdf = isLikelyPdfFile(file);
+      if (!isPdf && !isLikelyMdFile(file)) return false;
+      const dataUrl = await fileToDataUrl(file);
+      const response = await fetch('/api/upload-canvas-attachment', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: filePath, name: file.name || (isPdf ? '文档.pdf' : '文档.md'), data: dataUrl }),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        window.alert(result.error || messagePrefix || '插入附件失败');
+        return false;
+      }
+      if (result.cancelled) return false;
+      const node = {
+        kind: isPdf ? 'pdf' : 'md',
+        assetPath: result.assetPath,
+        name: result.name || file.name || '',
+        width: isPdf ? 420 : 360,
+        height: isPdf ? 540 : 340,
+        layer: 'front',
+      };
+      addDecorationNode(node, opts.point || null, opts.animate !== false, {
+        transientMovableDecor: !!opts.transientMovableDecor,
+      });
+      if (isPdf) showOnboardingHint('pdf', '双击 PDF，或按 <kbd>F</kbd>，进入阅读与批注', 5200);
+      return true;
+    }
+
+    function pickAttachmentFile() {
+      return new Promise((resolve) => {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.pdf,.md,.markdown,application/pdf,text/markdown';
+        input.style.position = 'fixed';
+        input.style.left = '-9999px';
+        input.style.opacity = '0';
+        input.addEventListener('change', () => {
+          const file = input.files && input.files[0] ? input.files[0] : null;
+          input.remove();
+          resolve(file);
+        }, { once: true });
+        document.body.appendChild(input);
+        input.click();
+      });
+    }
+
+    async function importAttachment() {
+      if (!dpAddAttachment) return;
+      const file = await pickAttachmentFile();
+      if (!file) return;
+      dpAddAttachment.disabled = true;
+      try {
+        await addAttachmentFromFile(file, '插入附件失败');
+      } catch (err) {
+        window.alert('插入附件失败：' + err.message);
+      } finally {
+        dpAddAttachment.disabled = false;
+      }
+    }
+
+    function refreshDecorToolButtons() {
+      decorPaletteButtons.forEach((button) => {
+        const active = button.dataset.shapeType
+          ? button.dataset.shapeType === activeDecorShapeType
+          : button.dataset.textPreset === activeDecorTextPreset;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-pressed', active ? 'true' : 'false');
+      });
+      if (viewport) viewport.classList.toggle('decor-draw-ready', hasActiveDecorTool() && currentMode() === 'decor');
+    }
+
+    function setActiveDecorShapeTool(shapeType) {
+      activeDecorShapeType = shapeType || null;
+      activeDecorTextPreset = null;
+      if (activeDecorShapeType) setDrawTool('select');
+      refreshDecorToolButtons();
+      refreshDecorPanel();
+    }
+
+    function setActiveDecorTextPreset(preset) {
+      activeDecorTextPreset = preset || null;
+      activeDecorShapeType = null;
+      if (activeDecorTextPreset) setDrawTool('select');
+      refreshDecorToolButtons();
+      refreshDecorPanel();
+    }
+
+    function applyDecorTextStylePreset(stylePreset) {
+      if (!stylePreset) return;
+      const targets = decorNodeTargets();
+      const selectedTextTargets = targets.length
+        && targets.every((node) => isTextBoxNode(node) && node.boxStyle === targets[0].boxStyle)
+        ? targets : [];
+      if (targets.length && !selectedTextTargets.length) return;
+      const preset = selectedTextTargets.length ? selectedTextTargets[0].boxStyle : activeDecorTextPreset;
+      if (!preset) return;
+      const base = decorTextPresetBase(preset);
+      const patch = {
+        fillColor: cleanDecorColor(stylePreset.fillColor, base.fillColor),
+        borderColor: cleanDecorColor(stylePreset.borderColor, base.borderColor),
+        color: cleanDecorColor(stylePreset.color, base.color),
+        borderWidth: cleanDecorNumber(stylePreset.borderWidth, base.borderWidth, 1, 6, false),
+        borderStyle: cleanDecorTextBorderStyle(stylePreset.borderStyle, base.borderStyle),
+      };
+      if (selectedTextTargets.length) {
+        selectedTextTargets.forEach((node) => {
+          node.fillColor = patch.fillColor;
+          node.borderColor = patch.borderColor;
+          node.color = patch.color;
+          node.borderWidth = patch.borderWidth;
+          node.borderStyle = patch.borderStyle;
+          renderEditedDecoration(node);
+        });
+        notify();
+      } else {
+        rememberDecorTextPresetDefaults(preset, patch);
+      }
+      refreshDecorPanel();
+      pushDecorHistoryIfEditingNode();
+    }
+
+    function decorTextStylePresetActive(stylePreset, node) {
+      if (!stylePreset || !node || !node.boxStyle) return false;
+      const base = decorTextPresetBase(node.boxStyle);
+      return cleanDecorColor(node.fillColor, '') === cleanDecorColor(stylePreset.fillColor, '')
+        && cleanDecorColor(node.borderColor, '') === cleanDecorColor(stylePreset.borderColor, '')
+        && cleanDecorColor(node.color, '') === cleanDecorColor(stylePreset.color, '')
+        && cleanDecorNumber(node.borderWidth, base.borderWidth, 1, 6, false)
+          === cleanDecorNumber(stylePreset.borderWidth, base.borderWidth, 1, 6, false)
+        && cleanDecorTextBorderStyle(node.borderStyle, base.borderStyle)
+          === cleanDecorTextBorderStyle(stylePreset.borderStyle, base.borderStyle);
+    }
+
+    function setupDecorColorPresets() {
+      renderDecorColorPresets(null);
+    }
+
+    function renderDecorColorPresets(mode, node) {
+      if (!dpColorPresets) return;
+      const isTextStyle = typeof mode === 'string' && mode.indexOf('text:') === 0;
+      const boxStyle = isTextStyle ? mode.slice(5) : '';
+      if (dpColorPresetsWrap) dpColorPresetsWrap.hidden = !mode;
+      dpColorPresets.classList.toggle('decor-text-style-presets', isTextStyle);
+      if (dpColorPresetsLabel) dpColorPresetsLabel.textContent = isTextStyle ? '样式预设' : '预设颜色';
+      if (!mode) {
+        dpColorPresets.textContent = '';
+        dpColorPresets.dataset.mode = '';
+        return;
+      }
+      if (dpColorPresets.dataset.mode !== mode) {
+        dpColorPresets.textContent = '';
+        const presets = isTextStyle ? (DECOR_TEXT_STYLE_PRESETS[boxStyle] || []) : DECOR_COLOR_PRESETS;
+        presets.forEach((preset) => {
+          const color = typeof preset === 'string' ? preset : preset.fillColor;
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'decor-color-preset';
+          button.style.setProperty('--decor-preset-color', color);
+          if (isTextStyle) {
+            button.classList.add('decor-text-style-preset');
+            button.dataset.textStylePreset = preset.id;
+            button.style.setProperty('--decor-preset-border', preset.borderColor);
+            button.style.setProperty('--decor-preset-text', preset.color);
+            button.style.setProperty('--decor-preset-border-width', preset.borderWidth + 'px');
+            button.style.setProperty('--decor-preset-border-style', preset.borderStyle);
+            const swatch = document.createElement('span');
+            swatch.className = 'decor-text-style-swatch';
+            const label = document.createElement('span');
+            label.className = 'decor-text-style-name';
+            label.textContent = preset.name;
+            button.appendChild(swatch);
+            button.appendChild(label);
+            button.setAttribute('aria-label', preset.name);
+            button.title = preset.name;
+          } else {
+            button.dataset.decorColor = color;
+            button.setAttribute('aria-label', color);
+            button.title = color;
+          }
+          button.addEventListener('click', () => {
+            if (isTextStyle) {
+              applyDecorTextStylePreset(preset);
+            } else {
+              editDecorationField('fillColor', color);
+              pushDecorHistoryIfEditingNode();
+            }
+          });
+          dpColorPresets.appendChild(button);
+        });
+        dpColorPresets.dataset.mode = mode;
+      }
+      if (isTextStyle) {
+        const presets = DECOR_TEXT_STYLE_PRESETS[boxStyle] || [];
+        const targets = decorNodeTargets();
+        const activeTargets = targets.length ? targets : (node ? [node] : []);
+        dpColorPresets.querySelectorAll('[data-text-style-preset]').forEach((button, index) => {
+          button.classList.toggle('active', !!activeTargets.length
+            && activeTargets.every((item) => decorTextStylePresetActive(presets[index], item)));
+        });
+      } else {
+        const targets = decorNodeTargets();
+        const activeTargets = targets.length ? targets : (node ? [node] : []);
+        dpColorPresets.querySelectorAll('[data-decor-color]').forEach((button) => {
+          button.classList.toggle('active', !!activeTargets.length && activeTargets.every((item) =>
+            cleanDecorColor(button.dataset.decorColor, '') === cleanDecorColor(item.fillColor, '')));
+        });
+      }
+    }
+
+    function onPaste(e) {
+      const active = document.activeElement;
+      const inEditable = !!(active && (
+        active.isContentEditable
+        || active.tagName === 'INPUT'
+        || active.tagName === 'TEXTAREA'
+      ));
+      if (inEditable || editingNodeId !== null || editingEdgeId !== null || textReaderOpen) return;
+      // 阅读/图谱等浮层盖着画布时不粘贴——否则节点会"隐身"落在浮层底下
+      if (pdfReaderOpen || mdReaderOpen || externalOverlayOpen) return;
+      const data = e.clipboardData;
+      if (!data) return;
+      let file = [...(data.files || [])].find((item) => /^image\//.test(item.type || ''));
+      if (!file && data.items) {
+        const item = [...data.items].find((entry) => entry.kind === 'file' && /^image\//.test(entry.type || ''));
+        if (item) file = item.getAsFile();
+      }
+      if (file) {
+        e.preventDefault();
+        addImageDecorationFromFile(file, '粘贴图片失败').catch((err) => {
+          window.alert('粘贴图片失败：' + err.message);
+        });
+        return;
+      }
+      // 复制的是文件（非图片）时不当文本处理
+      if ((data.files && data.files.length) || (data.items && [...data.items].some((entry) => entry.kind === 'file'))) return;
+      // 纯文本：直接落成卡片节点，免去"先建节点再往里粘"
+      const text = data.getData('text/plain');
+      if (!text || !text.trim()) return;
+      if (!canCreate()) return;   // 图案模式不新建内容节点（与 N 键一致）
+      e.preventDefault();
+      createNodeFromPastedText(text);
+    }
+
+    // Ctrl+V 粘贴纯文本（未编辑任何输入框时）→ 在鼠标处/视口中央落一张卡片。
+    // 标题取法：首行是 Markdown 标题 → 用它当标题、全文进正文（显示时 readerDisplayBody 自动去重）；
+    // 首行较短 → 首行当标题、其余进正文；首行太长 → 截一段当标题、全文进正文。单行短文本只有标题。
+    function createNodeFromPastedText(raw) {
+      const full = String(raw).replace(/\r\n?/g, '\n').trim();
+      if (!full) return null;
+      const lines = full.split('\n');
+      const first = lines[0].trim();
+      const heading = /^#{1,6}\s+(.+?)\s*$/.exec(first);
+      let title, body;
+      if (heading) {
+        title = heading[1];
+        body = full;
+      } else if (lines.length === 1 && first.length <= 64) {
+        title = first;
+        body = '';
+      } else if (first.length <= 48) {
+        title = first;
+        body = lines.slice(1).join('\n').replace(/^\n+/, '');
+      } else {
+        title = first.slice(0, 32) + '…';
+        body = full;
+      }
+      const pos = defaultNewNodePosition();
+      const node = { id: newNodeId(), x: Math.round(pos.x), y: Math.round(pos.y), text: title, kind: 'card' };
+      if (body) node.body = body;
+      data.nodes.push(node);
+      indexNodeData(node);
+      const el = createNodeEl(node);   // 内部已按 text/body 渲染标题与常驻正文
+      surface.appendChild(el);
+      nodeMap.set(node.id, el);
+      if (nodeSizeObserver) nodeSizeObserver.observe(el);
+      spawnNodeEl(el);
+      lastCreatedNodeId = node.id;
+      selectNodes([node.id], false);
+      pushHistory();
+      notify();
+      showCanvasToast(body ? '已粘贴为卡片（按 F 可阅读全文）' : '已粘贴为卡片');
+      return node;
+    }
+
+    function hasFileDrag(data) {
+      if (!data) return false;
+      if ([...(data.types || [])].indexOf('Files') >= 0) return true;
+      return !!(data.files && data.files.length) || !!(data.items && [...data.items].some((entry) => entry.kind === 'file'));
+    }
+
+    function isLikelyImageFile(file) {
+      if (!file) return false;
+      if (/^image\//.test(file.type || '')) return true;
+      return /\.(png|jpe?g|webp|gif|bmp)$/i.test(file.name || '');
+    }
+
+    function isLikelyPdfFile(file) {
+      if (!file) return false;
+      return /^application\/pdf$/i.test(file.type || '') || /\.pdf$/i.test(file.name || '');
+    }
+    function isLikelyMdFile(file) {
+      if (!file) return false;
+      return /text\/markdown/i.test(file.type || '') || /\.(md|markdown)$/i.test(file.name || '');
+    }
+    function isLikelyCanvasFile(file) {
+      if (!file) return false;
+      return /\.canvas$/i.test(file.name || '');
+    }
+    function isLikelyAttachmentFile(file) {
+      return isLikelyPdfFile(file) || isLikelyMdFile(file);
+    }
+
+    function canvasFileFromDataTransfer(data) {
+      if (!data) return null;
+      let file = [...(data.files || [])].find(isLikelyCanvasFile);
+      if (!file && data.items) {
+        for (const item of [...data.items]) {
+          if (item.kind !== 'file') continue;
+          const f = item.getAsFile();
+          if (isLikelyCanvasFile(f)) { file = f; break; }
+        }
+      }
+      return file || null;
+    }
+
+    function importedCanvasNodeKey(raw, index) {
+      return raw && raw.id != null ? String(raw.id) : '__node_' + index;
+    }
+
+    function importableCanvasNode(raw) {
+      return !!raw && typeof raw === 'object' && !Array.isArray(raw) && !raw.assetPath;
+    }
+
+    function importedCanvasNodeSize(raw) {
+      const w = Number(raw && raw.width);
+      const h = Number(raw && raw.height);
+      return {
+        w: Number.isFinite(w) && w > 0 ? w : NODE_DEFAULT_HALF_W * 2,
+        h: Number.isFinite(h) && h > 0 ? h : NODE_DEFAULT_HALF_H * 2,
+      };
+    }
+
+    function cloneJsonObject(raw) {
+      return JSON.parse(JSON.stringify(raw || {}));
+    }
+
+    function importCanvasPayloadIntoCurrent(parsed, point, sourceName) {
+      const sourceNodes = Array.isArray(parsed && parsed.nodes) ? parsed.nodes : [];
+      const sourceEdges = Array.isArray(parsed && parsed.edges) ? parsed.edges : [];
+      const importNodes = sourceNodes.filter(importableCanvasNode);
+      const skippedAssets = sourceNodes.length - importNodes.length;
+      if (!importNodes.length) {
+        throw new Error(skippedAssets
+          ? '这张画布里只有图片 / PDF / Markdown 附件节点；拖入 .canvas 时不会复制外部资源。'
+          : '这张画布没有可复制的节点。');
+      }
+
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      importNodes.forEach((raw) => {
+        const x = Number(raw.x) || 0;
+        const y = Number(raw.y) || 0;
+        const s = importedCanvasNodeSize(raw);
+        minX = Math.min(minX, x);
+        minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x + s.w);
+        maxY = Math.max(maxY, y + s.h);
+      });
+      const drop = point || viewportCenterInSurface();
+      const offX = drop.x - (minX + maxX) / 2;
+      const offY = drop.y - (minY + maxY) / 2;
+
+      const idMap = new Map();
+      const newIds = [];
+      importNodes.forEach((raw, index) => {
+        const nid = newNodeId();
+        idMap.set(importedCanvasNodeKey(raw, sourceNodes.indexOf(raw)), nid);
+        const copy = cloneJsonObject(raw);
+        copy.id = nid;
+        copy.kind = copy.kind || 'card';
+        copy.x = Math.round((Number(raw.x) || 0) + offX);
+        copy.y = Math.round((Number(raw.y) || 0) + offY);
+        if (copy.text != null) copy.text = String(copy.text);
+        if (copy.body != null) copy.body = String(copy.body);
+        prepareNewDecorationNode(copy);
+        data.nodes.push(copy);
+        indexNodeData(copy);
+        const el = createNodeEl(copy);
+        surface.appendChild(el);
+        nodeMap.set(nid, el);
+        if (nodeSizeObserver) nodeSizeObserver.observe(el);
+        spawnNodeEl(el);
+        newIds.push(nid);
+      });
+
+      const newEdgeIds = [];
+      sourceEdges.forEach((raw) => {
+        if (!raw || typeof raw !== 'object') return;
+        const from = idMap.get(String(raw.from));
+        const to = idMap.get(String(raw.to));
+        if (!from || !to || from === to) return;
+        const edge = cloneEdge(raw);
+        edge.id = newEdgeId();
+        edge.from = from;
+        edge.to = to;
+        if (Array.isArray(edge.waypoints)) {
+          edge.waypoints = edge.waypoints.map((w) => ({
+            x: (Number(w && w.x) || 0) + offX,
+            y: (Number(w && w.y) || 0) + offY,
+          }));
+        }
+        data.edges.push(edge);
+        const refs = createEdgeEls(edge);
+        edgeMap.set(edge.id, refs);
+        updateEdgePath(edge);
+        spawnEdgeEls(refs);
+        newEdgeIds.push(edge.id);
+      });
+
+      lastCreatedNodeId = newIds[newIds.length - 1] || null;
+      selectNodes(newIds, false);
+      pushHistory();
+      notify();
+      if (skippedAssets) {
+        console.warn('[画布] 拖入 .canvas 时跳过外部资源节点：', skippedAssets, sourceName || '');
+      }
+      return { nodes: newIds.length, edges: newEdgeIds.length, skippedAssets: skippedAssets };
+    }
+
+    async function addCanvasFromFile(file, point) {
+      if (!isLikelyCanvasFile(file)) return false;
+      const raw = await fileToText(file);
+      let parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (err) {
+        throw new Error('这不是有效的 .canvas 文件。');
+      }
+      importCanvasPayloadIntoCurrent(parsed, point, file.name || '');
+      return true;
+    }
+
+    function attachmentFileFromDataTransfer(data) {
+      if (!data) return null;
+      let file = [...(data.files || [])].find(isLikelyAttachmentFile);
+      if (!file && data.items) {
+        for (const item of [...data.items]) {
+          if (item.kind !== 'file') continue;
+          const f = item.getAsFile();
+          if (isLikelyAttachmentFile(f)) { file = f; break; }
+        }
+      }
+      return file || null;
+    }
+
+    function dataTransferItemImageFile(item) {
+      if (!item || item.kind !== 'file') return null;
+      if (/^image\//.test(item.type || '')) return item.getAsFile();
+      const file = item.getAsFile();
+      return isLikelyImageFile(file) ? file : null;
+    }
+
+    function imageFileFromDataTransfer(data) {
+      if (!data) return null;
+      const files = [...(data.files || [])];
+      let file = files.find(isLikelyImageFile);
+      if (!file && data.items) {
+        for (const item of [...data.items]) {
+          file = dataTransferItemImageFile(item);
+          if (file) break;
+        }
+      }
+      return file || null;
+    }
+
+    function onViewportDragOver(e) {
+      if (!hasFileDrag(e.dataTransfer)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+      viewport.classList.add('image-drag-over');
+    }
+
+    function onViewportDragLeave(e) {
+      if (viewport.contains(e.relatedTarget)) return;
+      viewport.classList.remove('image-drag-over');
+    }
+
+    function onViewportDrop(e) {
+      if (!hasFileDrag(e.dataTransfer)) return;
+      e.preventDefault();
+      viewport.classList.remove('image-drag-over');
+      freezeViewportForInteraction();
+      const point = clientToSurface(e.clientX, e.clientY);
+      const canvasFile = canvasFileFromDataTransfer(e.dataTransfer);
+      if (canvasFile) {
+        addCanvasFromFile(canvasFile, point).catch((err) => {
+          window.alert('拖入画布失败：' + err.message);
+        });
+        return;
+      }
+      const attach = attachmentFileFromDataTransfer(e.dataTransfer);
+      if (attach) {
+        addAttachmentFromFile(attach, '拖入附件失败', { point: point, animate: true, transientMovableDecor: true }).catch((err) => {
+          window.alert('拖入附件失败：' + err.message);
+        });
+        return;
+      }
+      const file = imageFileFromDataTransfer(e.dataTransfer);
+      if (!file) return;
+      addImageDecorationFromFile(file, '拖入图片失败', { point: point, animate: true, activateMode: false, transientMovableDecor: true }).catch((err) => {
+        window.alert('拖入图片失败：' + err.message);
+      });
+    }
+
+    function onWindowFileDragOver(e) {
+      if (!hasFileDrag(e.dataTransfer)) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+    }
+
+    function onWindowFileDrop(e) {
+      if (!hasFileDrag(e.dataTransfer)) return;
+      // 防止浏览器把拖入的本地文件打开成新标签页；画布内 drop 会继续冒泡给 onViewportDrop 处理。
+      e.preventDefault();
+      if (!viewport.contains(e.target)) viewport.classList.remove('image-drag-over');
+    }
+
+    function setupDecorPanel() {
+      if (!decorPanel) return;
+      const q = (selector) => decorPanel.querySelector(selector);
+      const qa = (selector) => decorPanel.querySelectorAll(selector);
+      dpEmpty = q('[data-role="decor-selection-empty"]');
+      dpSelection = q('[data-role="decor-selection"]');
+      dpKindLabel = q('[data-role="decor-kind-label"]');
+      dpWidth = q('[data-role="decor-width"]');
+      dpWidthVal = q('[data-role="decor-width-val"]');
+      dpWidthWrap = q('[data-role="decor-width-wrap"]');
+      dpHeight = q('[data-role="decor-height"]');
+      dpHeightVal = q('[data-role="decor-height-val"]');
+      dpHeightWrap = q('[data-role="decor-height-wrap"]');
+      dpFontSize = q('[data-role="decor-font-size"]');
+      dpFontSizeVal = q('[data-role="decor-font-size-val"]');
+      dpFontSizeWrap = q('[data-role="decor-font-size-wrap"]');
+      dpRotation = q('[data-role="decor-rotation"]');
+      dpRotationVal = q('[data-role="decor-rotation-val"]');
+      dpRotationWrap = q('[data-role="decor-rotation-wrap"]');
+      dpOpacity = q('[data-role="decor-opacity"]');
+      dpOpacityVal = q('[data-role="decor-opacity-val"]');
+      dpOpacityWrap = q('[data-role="decor-opacity-wrap"]');
+      dpShapeColors = q('[data-role="decor-shape-colors"]');
+      dpBorder = q('[data-role="decor-border"]');
+      dpBorderState = q('[data-role="decor-border-state"]');
+      dpFill = q('[data-role="decor-fill"]');
+      dpFillState = q('[data-role="decor-fill-state"]');
+      dpTextColor = q('[data-role="decor-text-color"]');
+      dpTextColorState = q('[data-role="decor-text-color-state"]');
+      dpTextColorWrap = q('[data-role="decor-text-color-wrap"]');
+      dpBorderWidth = q('[data-role="decor-border-width"]');
+      dpBorderWidthVal = q('[data-role="decor-border-width-val"]');
+      dpBorderWidthWrap = q('[data-role="decor-border-width-wrap"]');
+      dpBorderStyleWrap = q('[data-role="decor-border-style-wrap"]');
+      dpBorderStyleBtns = qa('[data-role="decor-border-style"] button');
+      dpBorderStyleState = q('[data-role="decor-border-style-state"]');
+      dpBorderWrap = q('[data-role="decor-border-wrap"]');
+      dpFillWrap = q('[data-role="decor-fill-wrap"]');
+      dpFillLabel = q('[data-role="decor-fill-label"]');
+      dpFillModeWrap = q('[data-role="decor-fill-mode-wrap"]');
+      dpFillModeBtns = qa('[data-role="decor-fill-mode"] button');
+      dpFillModeState = q('[data-role="decor-fill-mode-state"]');
+      dpColorPresets = q('[data-role="decor-color-presets"]');
+      dpColorPresetsWrap = q('[data-role="decor-color-presets-wrap"]');
+      dpColorPresetsLabel = q('[data-role="decor-color-presets-label"]');
+      dpGroupPresets = q('[data-role="decor-group-presets"]');
+      dpGroupPresetMode = q('[data-role="decor-group-preset-mode"]');
+      dpGroupPresetHint = q('[data-role="decor-group-preset-hint"]');
+      dpTitleToneWrap = q('[data-role="decor-title-tone-wrap"]');
+      dpTitleToneBtns = qa('[data-role="decor-title-tone"] button');
+      dpTitleToneState = q('[data-role="decor-title-tone-state"]');
+      dpProgressWrap = q('[data-role="decor-progress-wrap"]');
+      dpProgress = q('[data-role="decor-progress"]');
+      dpProgressVal = q('[data-role="decor-progress-val"]');
+      dpLayerBtns = qa('[data-role="decor-layer"] button');
+      dpLayerState = q('[data-role="decor-layer-state"]');
+      dpLayerWrap = q('[data-role="decor-layer-wrap"]');
+      dpStackWrap = q('[data-role="decor-stack-wrap"]');
+      dpStackBtns = qa('[data-role="decor-stack-actions"] button');
+      dpStackHint = q('[data-role="decor-stack-hint"]');
+      dpAddImage = q('[data-role="decor-add-image"]');
+      dpAddAttachment = q('[data-role="decor-add-attachment"]');
+      dpResetFill = q('[data-role="decor-reset-fill"]');
+      dpResetDefaults = q('[data-role="decor-reset-defaults"]');
+      decorPaletteButtons = [...qa('[data-role="decor-palette"] [data-shape-type], [data-role="decor-palette"] [data-text-preset]')];
+      decorPaletteButtons.forEach((button) => {
+        button.addEventListener('click', () => {
+          const isTextPreset = !!button.dataset.textPreset;
+          const current = isTextPreset ? activeDecorTextPreset : activeDecorShapeType;
+          const value = isTextPreset ? button.dataset.textPreset : button.dataset.shapeType;
+          const next = current === value ? null : value;
+          if (next) {
+            activateDecorMode();
+            clearSelection();
+          }
+          if (isTextPreset) setActiveDecorTextPreset(next);
+          else setActiveDecorShapeTool(next);
+        });
+      });
+      setupDecorColorPresets();
+      setupGroupStylePresets();
+      if (dpAddImage) dpAddImage.addEventListener('click', importImageDecoration);
+      if (dpAddAttachment) dpAddAttachment.addEventListener('click', importAttachment);
+      [
+        [dpWidth, 'width', (v) => Math.round(Number(v)), dpWidthVal, (v) => v + 'px'],
+        [dpHeight, 'height', (v) => Math.round(Number(v)), dpHeightVal, (v) => v + 'px'],
+        [dpFontSize, 'fontSize', (v) => Math.round(Number(v)), dpFontSizeVal, (v) => v + 'px'],
+        [dpBorderWidth, 'borderWidth', (v) => Number(v), dpBorderWidthVal, (v) => v + 'px'],
+        [dpRotation, 'rotation', (v) => Math.round(Number(v)), dpRotationVal, (v) => v + '°'],
+        [dpOpacity, 'opacity', (v) => Number(v) / 100, dpOpacityVal, (v) => Math.round(v * 100) + '%'],
+        [dpProgress, 'progress', (v) => Math.round(Number(v)), dpProgressVal, (v) => v + '%'],
+      ].forEach((item) => {
+        const input = item[0];
+        if (!input) return;
+        input.addEventListener('input', () => {
+          const value = item[2](input.value);
+          item[3].textContent = item[4](value);
+          editDecorationField(item[1], value);
+        });
+        input.addEventListener('change', pushDecorHistoryIfEditingNode);
+      });
+      if (dpBorder) {
+        dpBorder.addEventListener('input', () => editDecorationField('borderColor', dpBorder.value));
+        dpBorder.addEventListener('change', pushDecorHistoryIfEditingNode);
+      }
+      if (dpFill) {
+        dpFill.addEventListener('input', () => editDecorationField('fillColor', dpFill.value));
+        dpFill.addEventListener('change', pushDecorHistoryIfEditingNode);
+      }
+      if (dpTextColor) {
+        dpTextColor.addEventListener('input', () => editDecorationField('color', dpTextColor.value));
+        dpTextColor.addEventListener('change', pushDecorHistoryIfEditingNode);
+      }
+      dpBorderStyleBtns.forEach((button) => button.addEventListener('click', () => {
+        editDecorationField('borderStyle', button.dataset.borderStyle);
+        pushDecorHistoryIfEditingNode();
+      }));
+      dpFillModeBtns.forEach((button) => button.addEventListener('click', () => {
+        editDecorationField('fillMode', button.dataset.fillMode);
+        pushDecorHistoryIfEditingNode();
+      }));
+      dpTitleToneBtns.forEach((button) => button.addEventListener('click', () => {
+        const tone = button.dataset.titleTone === 'dark' ? 'dark' : 'light';
+        editDecorationField('titleColor', DECOR_GROUP_TITLE_COLORS[tone]);
+        pushDecorHistoryIfEditingNode();
+      }));
+      if (dpResetFill) dpResetFill.addEventListener('click', resetDecorFillDefault);
+      if (dpResetDefaults) dpResetDefaults.addEventListener('click', resetDecorDefaults);
+      dpLayerBtns.forEach((button) => button.addEventListener('click', () => {
+        if (editDecorationField('layer', button.dataset.layer)) pushHistory();
+      }));
+      dpStackBtns.forEach((button) => button.addEventListener('click', () => {
+        moveSelectedDecorations(button.dataset.stackAction);
+      }));
+      dpDelete = q('[data-role="decor-delete"]');
+      if (dpDelete) dpDelete.addEventListener('click', deleteSelected);
+      refreshDecorPanel();
+    }
+
+    function createEdgeEls(edge) {
+      const path = document.createElementNS(SVG_NS, 'path');
+      path.setAttribute('class', 'canvas-edge');
+      path.dataset.id = edge.id;
+      // 透明粗"命中条"——让用户更容易点中线
+      const hit = document.createElementNS(SVG_NS, 'path');
+      hit.setAttribute('class', 'canvas-edge-hit');
+      hit.dataset.id = edge.id;
+      // hit 放底下，path 在上：视觉上看的是 path，但 hit 比 path 粗更易点中
+      edgesLayer.appendChild(hit);
+      edgesLayer.appendChild(path);
+
+      const labelEl = document.createElement('div');
+      labelEl.className = 'canvas-edge-label';
+      labelEl.dataset.id = edge.id;
+      labelEl.textContent = edge.text || '';
+      if (!edge.text) labelEl.classList.add('empty');
+      if (hiddenMindmapNodeIds.has(edge.from) || hiddenMindmapNodeIds.has(edge.to)) {
+        path.classList.add('mindmap-fold-hidden');
+        hit.classList.add('mindmap-fold-hidden');
+        labelEl.classList.add('mindmap-fold-hidden');
+      }
+      surface.appendChild(labelEl);
+
+      bindEdgeEvents(path, hit, labelEl, edge);
+      const refs = { path: path, hit: hit, labelEl: labelEl };
+      applyEdgeStyle(refs, edge);     // 5-2：粗细 + 箭头
+      return refs;
+    }
+
+    function updateEdgePath(edge) {
+      const refs = edgeMap.get(edge.id);
+      if (!refs) return;
+      const src = findNode(edge.from);
+      const tgt = findNode(edge.to);
+      if (!src || !tgt) return;
+      const bez = edgeGeom(edge, nodeRect(src), nodeRect(tgt));
+      refs.path.setAttribute('d', bez.d);
+      refs.hit.setAttribute('d', bez.d);
+      const mid = measureEdgePathMidpoint(refs.path, bez);
+      edgeMidpointCache.set(edge.id, { d: bez.d, x: mid.x, y: mid.y });
+      refs.labelEl.style.left = mid.x + 'px';
+      refs.labelEl.style.top = mid.y + 'px';
+      edgePathCache.delete(edge.id);   // 几何可能变了 → 让 canvas 层下次重建 Path2D
+      requestEdgesCanvasRender();
+    }
+
+    // 名称与选中标记必须落在屏幕所见的真实曲线上。edgeGeom 的 midX/midY 对折线
+    // 没问题，但平滑曲线有手工拐点时只是控制折线中点，可能明显偏离 SVG path。
+    function measureEdgePathMidpoint(path, fallback) {
+      try {
+        const len = path && path.getTotalLength ? path.getTotalLength() : 0;
+        if (len > 0 && path.getPointAtLength) {
+          const p = path.getPointAtLength(len / 2);
+          if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) return { x: p.x, y: p.y };
+        }
+      } catch (e) {
+        // 非 SVG 环境或路径尚不可测量时回退旧几何值，保持兼容。
+      }
+      return { x: fallback.midX, y: fallback.midY };
+    }
+
+    function cachedEdgeMidpoint(edge, geom) {
+      const mid = edgeMidpointCache.get(edge.id);
+      return mid && mid.d === geom.d ? mid : { x: geom.midX, y: geom.midY };
+    }
+
+    function edgeCanvasRects(edge) {
+      const src = findNode(edge.from);
+      const tgt = findNode(edge.to);
+      if (!src || !tgt) return null;
+      const live = edgeCanvasLiveCoords;
+      const srcLive = live && live.get(edge.from);
+      const tgtLive = live && live.get(edge.to);
+      return {
+        srcRect: srcLive ? rectFromXY(src, srcLive.x, srcLive.y) : nodeRect(src),
+        tgtRect: tgtLive ? rectFromXY(tgt, tgtLive.x, tgtLive.y) : nodeRect(tgt),
+        live: !!(srcLive || tgtLive),
+      };
+    }
+
+    function edgeCanvasPoints(edge, rects) {
+      const wps = Array.isArray(edge.waypoints) ? edge.waypoints : [];
+      if (wps.length) {
+        const a = edgeAnchors(rects.srcRect, rects.tgtRect, wps);
+        return [{ x: a.s.x, y: a.s.y }]
+          .concat(wps.map((w) => ({ x: w.x, y: w.y })))
+          .concat([{ x: a.t.x, y: a.t.y }]);
+      }
+      const sr = rects.srcRect, tr = rects.tgtRect;
+      const sCx = sr.x + sr.w / 2, sCy = sr.y + sr.h / 2;
+      const tCx = tr.x + tr.w / 2, tCy = tr.y + tr.h / 2;
+      const curve = edgeCurveType(edge);
+      if (curve === 'elbow' || curve === 'rounded-elbow' || curve === 'smooth') {
+        return orthogonalRoutePoints(sr, tr, 'auto');
+      }
+      if (curve === 'branch') return branchCurvePoints(sr, tr);
+      if (curve === 'arc') return arcCurvePoints(sr, tr);
+      if (curve === 'organic') return organicCurvePoints(sr, tr);
+      const s = sideOfExit(sCx, sCy, sr.w / 2, sr.h / 2, tCx - sCx, tCy - sCy, sr.r);
+      const t = sideOfExit(tCx, tCy, tr.w / 2, tr.h / 2, sCx - tCx, sCy - tCy, tr.r);
+      if (curve === 'bezier') {
+        const dist = Math.hypot(tCx - sCx, tCy - sCy);
+        const offset = Math.max(30, Math.min(dist * 0.4, 120));
+        const sN = normalForSide(s.side);
+        const tN = normalForSide(t.side);
+        return [
+          { x: s.x, y: s.y },
+          { x: s.x + sN.x * offset, y: s.y + sN.y * offset },
+          { x: t.x + tN.x * offset, y: t.y + tN.y * offset },
+          { x: t.x, y: t.y },
+        ];
+      }
+      if (curve === 's-curve') {
+        const dx = tCx - sCx, dy = tCy - sCy;
+        const horizontal = Math.abs(dx) >= Math.abs(dy);
+        const sx = dx === 0 ? 1 : Math.sign(dx);
+        const sy = dy === 0 ? 1 : Math.sign(dy);
+        const ss = horizontal
+          ? sideOfExit(sCx, sCy, sr.w / 2, sr.h / 2, sx, 0, sr.r)
+          : sideOfExit(sCx, sCy, sr.w / 2, sr.h / 2, 0, sy, sr.r);
+        const tt = horizontal
+          ? sideOfExit(tCx, tCy, tr.w / 2, tr.h / 2, -sx, 0, tr.r)
+          : sideOfExit(tCx, tCy, tr.w / 2, tr.h / 2, 0, -sy, tr.r);
+        const dist = Math.hypot(tt.x - ss.x, tt.y - ss.y);
+        const offset = clampValue(dist * 0.55, 70, 260);
+        const c1 = horizontal ? { x: ss.x + sx * offset, y: ss.y } : { x: ss.x, y: ss.y + sy * offset };
+        const c2 = horizontal ? { x: tt.x - sx * offset, y: tt.y } : { x: tt.x, y: tt.y - sy * offset };
+        return [{ x: ss.x, y: ss.y }, c1, c2, { x: tt.x, y: tt.y }];
+      }
+      return [{ x: s.x, y: s.y }, { x: t.x, y: t.y }];
+    }
+
+    function edgeCanvasBounds(edge, rects, pts) {
+      let minX = Math.min(rects.srcRect.x, rects.tgtRect.x);
+      let minY = Math.min(rects.srcRect.y, rects.tgtRect.y);
+      let maxX = Math.max(rects.srcRect.x + rects.srcRect.w, rects.tgtRect.x + rects.tgtRect.w);
+      let maxY = Math.max(rects.srcRect.y + rects.srcRect.h, rects.tgtRect.y + rects.tgtRect.h);
+      pts.forEach((p) => {
+        minX = Math.min(minX, p.x); minY = Math.min(minY, p.y);
+        maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y);
+      });
+      const pad = Math.max(24, (Number(edge.width) || 1.5) * 8 + (Number(edge.arrowSize) || 12));
+      return { minX: minX - pad, minY: minY - pad, maxX: maxX + pad, maxY: maxY + pad };
+    }
+
+    // 取（或重建）一条连线在 surface 坐标系的 Path2D，静态几何字符串变了才重新 new。
+    function edgeCachedPath2D(edge) {
+      const rects = edgeCanvasRects(edge);
+      if (!rects) return null;
+      const bez = edgeGeom(edge, rects.srcRect, rects.tgtRect);
+      const pts = edgeCanvasPoints(edge, rects);
+      const midpoint = cachedEdgeMidpoint(edge, bez);
+      let c = edgePathCache.get(edge.id);
+      if (rects.live) {
+        return { path: new Path2D(bez.d), geom: bez, midpoint: midpoint, points: pts, bounds: edgeCanvasBounds(edge, rects, pts) };
+      }
+      if (!c || c.d !== bez.d) {
+        c = { d: bez.d, path: new Path2D(bez.d) };
+        edgePathCache.set(edge.id, c);
+      }
+      return { path: c.path, geom: bez, midpoint: midpoint, points: pts, bounds: edgeCanvasBounds(edge, rects, pts) };
+    }
+
+    function requestEdgesCanvasRender() {
+      if (!edgesCtx || !EDGE_CANVAS_ON) return;
+      if (viewport.classList.contains('edges-svg-live')) return;
+      if (edgeCanvasRaf != null) return;
+      edgeCanvasRaf = requestAnimationFrame(() => {
+        edgeCanvasRaf = null;
+        renderEdgesCanvas();
+      });
+    }
+
+    function refreshEdgeVisualStyles() {
+      data.edges.forEach(function (edge) {
+        const refs = edgeMap.get(edge.id);
+        if (refs) applyEdgeStyle(refs, edge);
+      });
+      requestEdgesCanvasRender();
+    }
+
+    document.addEventListener('canvas:edge-visual-refresh', refreshEdgeVisualStyles);
+
+    function applyCanvasEdgeStroke(edge, selected) {
+      const style = edgeVisualLineStyle(edge);
+      const color = edgeStrokeColor(edge);
+      edgesCtx.strokeStyle = color;
+      edgesCtx.lineWidth = (Number(edge.width) || 1.5) + (selected ? 0.35 : 0);
+      edgesCtx.lineCap = 'round';
+      edgesCtx.lineJoin = 'round';
+      edgesCtx.setLineDash(style === 'dashed' ? [8, 7] : (style === 'dotted' ? [1, 7] : []));
+      edgesCtx.globalAlpha = style === 'glow' ? (selected ? 0.98 : 0.85) : (style === 'soft' ? (selected ? 0.78 : 0.56) : 1);
+      edgesCtx.shadowBlur = style === 'glow' ? (selected ? 5 : 4) : 0;
+      edgesCtx.shadowColor = style === 'glow' ? color : 'rgba(0,0,0,0.55)';
+    }
+
+    function drawCanvasArrowhead(from, tip, size) {
+      const dx = tip.x - from.x, dy = tip.y - from.y;
+      const len = Math.hypot(dx, dy);
+      if (len < 0.001) return;
+      const ux = dx / len, uy = dy / len;
+      const nx = -uy, ny = ux;
+      const backX = tip.x - ux * size * 0.92;
+      const backY = tip.y - uy * size * 0.92;
+      const half = size * 0.46;
+      edgesCtx.beginPath();
+      edgesCtx.moveTo(tip.x, tip.y);
+      edgesCtx.lineTo(backX + nx * half, backY + ny * half);
+      edgesCtx.lineTo(backX - nx * half, backY - ny * half);
+      edgesCtx.closePath();
+      edgesCtx.fill();
+    }
+
+    function drawCanvasEdgeArrows(edge, points, selected) {
+      const arrow = edge.arrow || 'none';
+      if (arrow === 'none' || !points || points.length < 2) return;
+      const style = edgeVisualLineStyle(edge);
+      const color = edgeStrokeColor(edge);
+      const size = (Number(edge.arrowSize) || 12) + (selected ? 1 : 0);
+      const last = points.length - 1;
+      edgesCtx.save();
+      edgesCtx.fillStyle = color;
+      edgesCtx.globalAlpha = style === 'glow' ? (selected ? 0.98 : 0.85) : (style === 'soft' ? (selected ? 0.78 : 0.56) : 1);
+      edgesCtx.shadowBlur = style === 'glow' ? (selected ? 5 : 4) : 0;
+      edgesCtx.shadowColor = style === 'glow' ? color : 'rgba(0,0,0,0.55)';
+      if (arrow === 'both' || arrow === 'start') drawCanvasArrowhead(points[1], points[0], size);
+      if (arrow !== 'start') drawCanvasArrowhead(points[last - 1], points[last], size);
+      edgesCtx.restore();
+    }
+
+    function drawCanvasEdgeSelectionMarker(item) {
+      const mid = item && (item.midpoint || item.geom);
+      if (!mid) return;
+      const invScale = 1 / Math.max(curScale || 1, 0.001);
+      const r = 5 * invScale;
+      edgesCtx.save();
+      edgesCtx.setLineDash([]);
+      edgesCtx.globalAlpha = 1;
+      edgesCtx.shadowBlur = 0;
+      edgesCtx.fillStyle = '#ffffff';
+      edgesCtx.strokeStyle = '#111111';
+      edgesCtx.lineWidth = 1.25 * invScale;
+      edgesCtx.beginPath();
+      // 菱形表示“连线名称/选中锚点”；可拖拐点继续使用圆形，避免两者混淆。
+      edgesCtx.moveTo(mid.x, mid.y - r);
+      edgesCtx.lineTo(mid.x + r, mid.y);
+      edgesCtx.lineTo(mid.x, mid.y + r);
+      edgesCtx.lineTo(mid.x - r, mid.y);
+      edgesCtx.closePath();
+      edgesCtx.fill();
+      edgesCtx.stroke();
+      edgesCtx.restore();
+    }
+
+    // 把所有可见连线描到视口大小的 canvas 上（相机变换 baked 进绘制，不随 surface transform）。
+    function renderEdgesCanvas() {
+      if (!edgesCtx || !EDGE_CANVAS_ON) return;
+      if (edgeCanvasRaf != null) {
+        cancelAnimationFrame(edgeCanvasRaf);
+        edgeCanvasRaf = null;
+      }
+      const vw = viewport.clientWidth || 1;
+      const vh = viewport.clientHeight || 1;
+      const dpr = window.devicePixelRatio || 1;
+      const needW = Math.max(1, Math.round(vw * dpr));
+      const needH = Math.max(1, Math.round(vh * dpr));
+      if (edgesCanvas.width !== needW) edgesCanvas.width = needW;
+      if (edgesCanvas.height !== needH) edgesCanvas.height = needH;
+      // 先清，再设相机：p_view = pan + scale · p_surface（再 ×dpr 到设备像素）
+      edgesCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      edgesCtx.clearRect(0, 0, vw, vh);
+      edgesCtx.setTransform(dpr * curScale, 0, 0, dpr * curScale, dpr * curPanX, dpr * curPanY);
+      // 可见范围（surface 坐标），外扩一点容纳曲线鼓出
+      const pad = 80;
+      const x0 = (-curPanX) / curScale - pad, y0 = (-curPanY) / curScale - pad;
+      const x1 = (vw - curPanX) / curScale + pad, y1 = (vh - curPanY) / curScale + pad;
+      for (let i = 0; i < data.edges.length; i++) {
+        const edge = data.edges[i];
+        if (hiddenMindmapNodeIds.has(edge.from) || hiddenMindmapNodeIds.has(edge.to)
+            || hiddenGroupNodeIds.has(edge.from) || hiddenGroupNodeIds.has(edge.to)) continue;
+        const item = edgeCachedPath2D(edge);
+        if (!item) continue;
+        const b = item.bounds;
+        if (b.maxX < x0 || b.minX > x1 || b.maxY < y0 || b.minY > y1) continue;  // 屏外跳过
+        const selected = selectedEdgeIds.has(edge.id);
+        edgesCtx.save();
+        applyCanvasEdgeStroke(edge, selected);
+        edgesCtx.stroke(item.path);
+        edgesCtx.restore();
+        drawCanvasEdgeArrows(edge, item.points, selected);
+        if (selected) drawCanvasEdgeSelectionMarker(item);
+      }
+    }
+
+    // 用临时坐标重画（拖动多个节点时用，避免提前 mutate data.nodes）
+    function updateEdgePathLive(edge, liveCoords) {
+      const refs = edgeMap.get(edge.id);
+      if (!refs) return;
+      const src = findNode(edge.from);
+      const tgt = findNode(edge.to);
+      if (!src || !tgt) return;
+      const srcLive = liveCoords.get(edge.from);
+      const tgtLive = liveCoords.get(edge.to);
+      const srcRect = srcLive ? rectFromXY(src, srcLive.x, srcLive.y) : nodeRect(src);
+      const tgtRect = tgtLive ? rectFromXY(tgt, tgtLive.x, tgtLive.y) : nodeRect(tgt);
+      const bez = edgeGeom(edge, srcRect, tgtRect);
+      refs.path.setAttribute('d', bez.d);
+      refs.hit.setAttribute('d', bez.d);
+      const mid = measureEdgePathMidpoint(refs.path, bez);
+      edgeMidpointCache.set(edge.id, { d: bez.d, x: mid.x, y: mid.y });
+      refs.labelEl.style.left = mid.x + 'px';
+      refs.labelEl.style.top = mid.y + 'px';
+      edgeCanvasLiveCoords = liveCoords;
+      requestEdgesCanvasRender();
+    }
+
+    // ── reconcile（DOM ↔ data 同步）────────────
+    function reconcileAll() {
+      normalizeTextBindings();
+      renderInk();
+      reconcileNodes();
+      reconcileEdges();
+      refreshGroupContainers();
+      refreshMindmapFolding();
+      applySelection();
+      updateEmptyHint();
+      updateCulling();   // 阶段 2：节点增删 / 撤销重做后，按当前视口重算屏外裁剪集
+    }
+
+    function reconcileNodes() {
+      const seen = new Set();
+      data.nodes.forEach((node) => {
+        seen.add(node.id);
+        let el = nodeMap.get(node.id);
+        if (!el) {
+          el = createNodeEl(node);
+          surface.appendChild(el);
+          nodeMap.set(node.id, el);
+          if (nodeSizeObserver) nodeSizeObserver.observe(el);
+        } else {
+          applyTransform(el, node.x, node.y);
+          // C1：同步颜色
+          if (node.color) el.dataset.color = node.color;
+          else el.removeAttribute('data-color');
+          applyNodeStyle(el, node);                     // 5-1：同步形状/颜色/透明度
+          if (isDecorationNode(node)) {
+            renderDecoration(el, node);
+            ensureDecorResizeHandles(el, node);
+          } else {
+            renderTextNodeMeta(el, node);               // 文本/预览节点：同步提示与悬停正文
+            ensureBodyResizeHandles(el, node);           // 复用元素时也补上拖宽热区
+          }
+          // 编辑中的文字节点不要被 reconcile 重写内容（用户正在打字）
+          if (!isDecorationNode(node) && editingNodeId !== node.id) {
+            const text = el.querySelector('.node-text');
+            renderBodyNodeContent(text, node);
+          }
+        }
+      });
+      for (const [id, el] of nodeMap) {
+        if (!seen.has(id)) {
+          disposeAttachment(id);   // 附件被删/撤销移除时，释放 PDF 文档与懒渲染监听
+          if (nodeSizeObserver) nodeSizeObserver.unobserve(el);
+          nodeSizeCache.delete(id);
+          el.remove();
+          nodeMap.delete(id);
+          selectedNodeIds.delete(id);
+        }
+      }
+      syncDecorationStackingOrder();
+    }
+
+    function reconcileEdges() {
+      const seen = new Set();
+      data.edges.forEach((edge) => {
+        seen.add(edge.id);
+        let refs = edgeMap.get(edge.id);
+        if (!refs) {
+          refs = createEdgeEls(edge);
+          edgeMap.set(edge.id, refs);
+        } else {
+          const want = edge.text || '';
+          if (refs.labelEl.textContent !== want) {
+            refs.labelEl.textContent = want;
+            refs.labelEl.classList.toggle('empty', !want);
+          }
+          applyEdgeStyle(refs, edge);          // 5-2：同步粗细/箭头（撤销重做等）
+        }
+        updateEdgePath(edge);
+      });
+      for (const [id, refs] of edgeMap) {
+        if (!seen.has(id)) {
+          removeEdgeMarkers(id);               // 5-2：连带删该线的箭头 marker
+          refs.path.remove();
+          refs.hit.remove();
+          refs.labelEl.remove();
+          edgeMap.delete(id);
+          edgePathCache.delete(id);
+          edgeMidpointCache.delete(id);
+          selectedEdgeIds.delete(id);
+        }
+      }
+      renderEdgesCanvas();   // 阶段①：增删/改样式后重描 canvas 连线层（开关关时空操作）
+    }
+
+    function applySelection() {
+      if (transientMovableDecorId && !selectedNodeIds.has(transientMovableDecorId)) {
+        clearTransientMovableDecor();
+      }
+      if (activeDecorTitleNodeId && !selectedNodeIds.has(activeDecorTitleNodeId)) {
+        activeDecorTitleNodeId = null;
+        if (selToolbar) {
+          selToolbar.classList.remove('decor-title-mode');
+          selToolbar.hidden = true;
+        }
+      }
+      nodeMap.forEach((el, id) => {
+        el.classList.toggle('selected', selectedNodeIds.has(id));
+        el.classList.toggle('transient-movable-decor', id === transientMovableDecorId && selectedNodeIds.has(id));
+      });
+      edgeMap.forEach((refs, id) => {
+        const sel = selectedEdgeIds.has(id);
+        refs.path.classList.toggle('selected', sel);
+        refs.labelEl.classList.toggle('selected', sel);
+      });
+      requestEdgesCanvasRender();
+      renderEdgeHandles();   // 5-3：编辑模式下随选中变化刷新拐点手柄
+      refreshEditPanel();    // 5-4：随选中变化刷新编辑抽屉
+      refreshDecorPanel();   // 图案模式：随选中变化刷新装饰属性面板
+      const contentNodeCount = [...selectedNodeIds].filter((id) => !isDecorationNode(findNode(id))).length;
+      const decorNodeCount = [...selectedNodeIds].filter((id) => isDecorationNode(findNode(id))).length;
+      document.dispatchEvent(new CustomEvent('editor:selectionchange', {
+        detail: {
+          nodes: selectedNodeIds.size,
+          contentNodes: contentNodeCount,
+          decorNodes: decorNodeCount,
+          edges: selectedEdgeIds.size,
+          arrow: !!selectedArrowId
+        }
+      }));
+      if (global.EditorShell && typeof global.EditorShell.openInspector === 'function') {
+        // 只有 ≥2 个内容节点或任何连线时才打开属性检查器；单选节点复用新建面板
+        if (contentNodeCount > 1 || selectedEdgeIds.size) global.EditorShell.openInspector('selection');
+        else if (decorNodeCount) global.EditorShell.openInspector('decor');
+      }
+      // 通知新建面板：选中单个节点时进入节点编辑模式
+      if (contentNodeCount === 1 && selectedEdgeIds.size === 0 && !selectedArrowId) {
+        const singleNode = findNode([...selectedNodeIds].find((id) => !isDecorationNode(findNode(id))));
+        document.dispatchEvent(new CustomEvent('editor:singleselect', {
+          detail: { node: singleNode || null }
+        }));
+      } else if (contentNodeCount === 0 && selectedEdgeIds.size === 0 && !selectedArrowId) {
+        document.dispatchEvent(new CustomEvent('editor:singleselect', {
+          detail: { node: null }
+        }));
+      }
+      scheduleTextDock();
+    }
+
+    // ── 选中（统一入口）──────────────────────
+    function selectNodes(ids, additive) {
+      if (!additive) {
+        selectedNodeIds.clear();
+        selectedEdgeIds.clear();
+      }
+      ids.forEach((id) => selectedNodeIds.add(id));
+      applySelection();
+    }
+    function selectEdges(ids, additive) {
+      if (!additive) {
+        selectedNodeIds.clear();
+        selectedEdgeIds.clear();
+      }
+      ids.forEach((id) => selectedEdgeIds.add(id));
+      applySelection();
+    }
+    function isSelectionToggleEvent(e) {
+      return !!(e && (e.shiftKey || e.ctrlKey || e.metaKey));
+    }
+    function suppressNextSelectionToggleClick(el) {
+      if (el) el.__suppressSelectionToggleClick = true;
+    }
+    function consumeSelectionToggleClick(el, e) {
+      if (isSelectionToggleEvent(e)) {
+        if (el) el.__suppressSelectionToggleClick = false;
+        return true;
+      }
+      if (el && el.__suppressSelectionToggleClick) {
+        el.__suppressSelectionToggleClick = false;
+        return true;
+      }
+      return false;
+    }
+    function toggleNodeSelection(id) {
+      if (selectedNodeIds.has(id)) selectedNodeIds.delete(id);
+      else selectedNodeIds.add(id);
+      applySelection();
+    }
+    function toggleEdgeSelection(id) {
+      if (selectedEdgeIds.has(id)) selectedEdgeIds.delete(id);
+      else selectedEdgeIds.add(id);
+      applySelection();
+    }
+    function clearSelection() {
+      const had = selectedNodeIds.size > 0 || selectedEdgeIds.size > 0;
+      selectedNodeIds.clear();
+      selectedEdgeIds.clear();
+      if (had) applySelection();
+      clearArrowSelection();   // 折线箭头选中也一并清除
+    }
+
+    // ── 节点事件 ──────────────────────────────
+    function bindNodeEvents(el, node) {
+      el.addEventListener('mouseenter', () => {
+        previewMindmapColorBrushTarget(node, el, true);
+        keepMindmapPreviewOpen(node);
+        scheduleMindmapPreview(node);
+        if (isPreviewNode(node)) animatePreviewNodeGeometry(node.id);
+      });
+      el.addEventListener('mouseleave', () => {
+        previewMindmapColorBrushTarget(node, el, false);
+        scheduleMindmapPreviewClose();
+        if (isPreviewNode(node)) animatePreviewNodeGeometry(node.id);
+      });
+      el.addEventListener('mousedown', (e) => {
+        if (e.button !== 0) return;
+        if (mindmapColorBrushState && currentMode() === 'mindmap') {
+          e.preventDefault();
+          e.stopPropagation();
+          applyMindmapColorBrush(node);
+          return;
+        }
+        const selectOnlyCurrentNode = () => {
+          e.stopPropagation();
+          if (!selectedNodeIds.has(node.id) || selectedNodeIds.size !== 1) selectNodes([node.id], false);
+        };
+        if (isPreviewNode(node) && editingNodeId !== node.id) {
+          const previewScrollHost = e.target && e.target.closest && e.target.closest('.preview-node-body');
+          if (previewScrollHost && el.contains(previewScrollHost)
+              && previewScrollHost.scrollHeight > previewScrollHost.clientHeight + 1) {
+            if (isSelectionToggleEvent(e)) {
+              e.preventDefault();
+              e.stopPropagation();
+              suppressNextSelectionToggleClick(el);
+              toggleNodeSelection(node.id);
+              return;
+            }
+            selectOnlyCurrentNode();
+            return;
+          }
+        }
+        // 附件（PDF/MD）：标题栏 / PDF 正文 / MD 空白 = 拖动整块；MD 文字处 = 放行选区不拖；
+        // 原生滚动条 = 放行滚动条拖动。滚轮滚动见 onWheel。
+        if (isAttachmentNode(node)) {
+          if (editingNodeId === node.id) return;
+          if (e.altKey) { e.preventDefault(); e.stopPropagation(); if (canCreate()) startEdgeCreate(node, e); return; }   // Alt+拖：附件起线（preventDefault 防止扫过 MD 正文时选中文字）
+          const onGrip = e.target && e.target.closest && e.target.closest('.attach-head');
+          const selectOnly = () => {
+            e.stopPropagation();
+            if (!selectedNodeIds.has(node.id) || selectedNodeIds.size !== 1) selectNodes([node.id], false);
+          };
+          // 点在正文区原生滚动条上：放行滚动条拖动，只选中、不拖节点。
+          const scrollHost = e.target && e.target.closest && e.target.closest('.attach-body');
+          if (!onGrip && scrollHost && e.target === scrollHost
+              && (e.offsetX > scrollHost.clientWidth || e.offsetY > scrollHost.clientHeight)) {
+            selectOnly();
+            return;
+          }
+          // MD 文字处：不拖动，光标正常，浏览器接管文字选区（空白 / 容器除外）。
+          if (!onGrip && isMdNode(node)) {
+            const t = e.target;
+            const overText = t && t.closest && t.closest('.attach-md-body')
+              && !t.classList.contains('attach-md-body') && !t.classList.contains('attach-body');
+            if (overText) { selectOnly(); return; }   // 不 preventDefault：保留原生选区
+          }
+          if (isSelectionToggleEvent(e)) {
+            e.preventDefault();
+            e.stopPropagation();
+            suppressNextSelectionToggleClick(el);
+            toggleNodeSelection(node.id);
+            return;
+          }
+          // 抓标题栏 / MD 空白 / PDF 正文拖动整块：preventDefault 防止从按下点扫起一片原生文字选区。
+          // （上面 overText/scrollHost 两条已先行 return，故这里不会误伤"在文字上选区"和"拖滚动条"。）
+          const sel0 = global.getSelection && global.getSelection();
+          if (sel0 && sel0.removeAllRanges && sel0.rangeCount) sel0.removeAllRanges();   // 清掉按下前残留的高亮
+          e.preventDefault();
+          e.stopPropagation();
+          startNodeDrag(node, e);
+          return;
+        }
+        if (isTextBoxNode(node) && editingTextBoxId === node.id) return;
+        // 图片在其他模式也可选中/移动；图案 SVG 仍只在图案模式可动。
+        // 与节点重合时点中谁交给 z-index：front 图片在节点之上→选图片，back 图片在节点之下→选节点。
+        // 语义分组是内容组织工具，不是单纯装饰：普通 / 脑图模式也应可选中、拖动与折叠。
+        if (isShapeNode(node) && currentMode() !== 'decor'
+            && !isTransientMovableDecor(node) && !isGroupBoxNode(node)) return;
+        if (editingNodeId === node.id) return;
+        e.stopPropagation();
+        if (isSelectionToggleEvent(e)) {
+          e.preventDefault();
+          suppressNextSelectionToggleClick(el);
+          toggleNodeSelection(node.id);
+          return;
+        }
+        if (e.altKey) {
+          if (!isDecorationNode(node) && canCreate()) startEdgeCreate(node, e);   // 装饰对象不参与连线
+          return;
+        }
+        startNodeDrag(node, e);
+        // 长按（按住不拖）→ 切换删除线；一旦拖动或松手即取消（见 onWindowMouseMove / onWindowMouseUp）
+        stopNodeStrikeLongPressTimer();
+        nodeStrikeLongPressTriggered = false;
+        if (!isDecorationNode(node) && drag && drag.mode === 'node' && !drag.moved) {
+          nodeStrikeLongPressTimer = setTimeout(() => {
+            nodeStrikeLongPressTimer = null;
+            if (!drag || drag.mode !== 'node' || drag.moved) return;
+            if (editingNodeId === node.id) return;
+            nodeStrikeLongPressTriggered = true;
+            toggleNodeStrike(node);
+          }, 480);
+        }
+      });
+      el.addEventListener('click', (e) => {
+        if (consumeSelectionToggleClick(el, e)) {
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+        // 双链 [[名字]] → 画布内跳转（早于外链判断，因为两者样式同源）
+        const wiki = e.target.closest ? e.target.closest('.node-wikilink') : null;
+        if (wiki && el.contains(wiki) && editingNodeId !== node.id) {
+          e.preventDefault();
+          e.stopPropagation();
+          jumpToWikiTarget(wiki.dataset.wikilink);
+          return;
+        }
+        // C2：点击节点内的外部链接 → 打开（编辑态不触发，因为编辑态显示的是源码无 <a>）
+        const link = e.target.closest ? e.target.closest('.node-link') : null;
+        if (link && el.contains(link) && editingNodeId !== node.id) {
+          e.preventDefault();
+          e.stopPropagation();
+          openExternalLink(link.dataset.href, link.dataset.kind);
+          return;
+        }
+        e.stopPropagation();
+      });
+      el.addEventListener('dblclick', (e) => {
+        if (consumeSelectionToggleClick(el, e)) {
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+        if (isPdfNode(node)) {        // 双击 PDF 附件 → 打开放大阅读 + 批注浮层
+          e.stopPropagation();
+          openPdfReader(node);
+          return;
+        }
+        if (isMdNode(node)) {         // 双击 MD 附件 → 打开放大阅读浮层
+          e.stopPropagation();
+          openMdReader(node);
+          return;
+        }
+        if (isTextBoxNode(node)) {
+          e.preventDefault();
+          e.stopPropagation();
+          enterTextBoxEdit(node, false, { x: e.clientX, y: e.clientY });
+          return;
+        }
+        if (isDecorationNode(node)) {
+          e.stopPropagation();
+          return;
+        }
+        // 点链接的双击不应进入编辑（让单击打开链接的体验干净）
+        const link = e.target.closest ? e.target.closest('.node-link') : null;
+        if (link && el.contains(link) && editingNodeId !== node.id) {
+          e.stopPropagation();
+          return;
+        }
+        e.preventDefault();
+        e.stopPropagation();
+        enterNodeEdit(node, false, { x: e.clientX, y: e.clientY });
+      });
+    }
+
+    // ── 连线事件 ──────────────────────────────
+    function bindEdgeEvents(pathEl, hitEl, labelEl, edge) {
+      // allowBend：在线身上按下时，编辑模式下允许"拖线出弯"加拐点
+      const pick = (e, allowBend) => {
+        if (e.button !== 0) return;
+        if (mindmapColorBrushState) {
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+        e.stopPropagation();
+        if (isSelectionToggleEvent(e)) {
+          e.preventDefault();
+          suppressNextSelectionToggleClick(e.currentTarget);
+          toggleEdgeSelection(edge.id);
+          return;
+        }
+        selectEdges([edge.id], false);
+        if (allowBend && currentMode() !== 'decor') startBendPending(edge, e);
+      };
+      hitEl.addEventListener('mousedown', (e) => pick(e, true));
+      pathEl.addEventListener('mousedown', (e) => pick(e, true));
+      labelEl.addEventListener('mousedown', (e) => {
+        if (editingEdgeId === edge.id) return; // 编辑中不抢
+        pick(e, false);
+      });
+      const onEditTrigger = (e) => {
+        if (consumeSelectionToggleClick(e.currentTarget, e)) {
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+        e.stopPropagation();
+        enterEdgeEdit(edge);
+      };
+      hitEl.addEventListener('dblclick', onEditTrigger);
+      pathEl.addEventListener('dblclick', onEditTrigger);
+      labelEl.addEventListener('dblclick', onEditTrigger);
+      // 右键连线 → 选中它 + 弹菜单（stopPropagation 防 surface 弹原生菜单）
+      const onMenu = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!selectedEdgeIds.has(edge.id)) selectEdges([edge.id], false);
+        menuEdgeId = edge.id;
+        showEdgeMenu(e.clientX, e.clientY);
+      };
+      hitEl.addEventListener('contextmenu', onMenu);
+      pathEl.addEventListener('contextmenu', onMenu);
+      labelEl.addEventListener('contextmenu', onMenu);
+    }
+
+    // ── 拖动：节点 / 多选 ────────────────────
+    let mindmapDropSlotEl = null;
+    let mindmapDropParentId = null;
+    let mindmapReparentTargetId = null;
+    let mindmapReparentBadgeEl = null;
+    let mindmapColorBrushState = null;
+    let mindmapColorBrushCursorEl = null;
+    let mindmapColorBrushPreviewId = null;
+
+    function clearMindmapDropPreview() {
+      if (mindmapDropSlotEl) mindmapDropSlotEl.hidden = true;
+      if (mindmapReparentBadgeEl) mindmapReparentBadgeEl.hidden = true;
+      if (mindmapDropParentId) {
+        const parentEl = nodeMap.get(mindmapDropParentId);
+        if (parentEl) parentEl.classList.remove('mindmap-drop-parent');
+      }
+      if (mindmapReparentTargetId) {
+        const targetEl = nodeMap.get(mindmapReparentTargetId);
+        if (targetEl) targetEl.classList.remove('mindmap-reparent-target');
+      }
+      mindmapDropParentId = null;
+      mindmapReparentTargetId = null;
+    }
+
+    function clearMindmapColorBrushPreview() {
+      if (!mindmapColorBrushPreviewId) return;
+      const previewEl = nodeMap.get(mindmapColorBrushPreviewId);
+      if (previewEl) {
+        previewEl.classList.remove('mindmap-color-brush-preview');
+        previewEl.style.removeProperty('--mindmap-brush-preview-bg');
+        previewEl.style.removeProperty('--mindmap-brush-preview-border');
+      }
+      mindmapColorBrushPreviewId = null;
+    }
+
+    function ensureMindmapColorBrushCursor() {
+      if (mindmapColorBrushCursorEl) return mindmapColorBrushCursorEl;
+      const cursor = document.createElement('div');
+      cursor.className = 'mindmap-color-brush-cursor';
+      cursor.hidden = true;
+      cursor.setAttribute('aria-hidden', 'true');
+      cursor.innerHTML = '<svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">'
+        + '<path d="M14.7 4.3 19.7 9.3"/><path d="m7.4 16.6 8.8-8.8a2.1 2.1 0 0 1 3 3l-8.8 8.8"/>'
+        + '<path d="M7.4 16.6c-2.6-.2-4.2.9-4.4 3.4 2.5-.2 3.6-1.8 3.4-4.4Z"/></svg>'
+        + '<span></span>';
+      document.body.appendChild(cursor);
+      mindmapColorBrushCursorEl = cursor;
+      return cursor;
+    }
+
+    function positionMindmapColorBrushCursor(clientX, clientY) {
+      if (!mindmapColorBrushState) return;
+      const cursor = ensureMindmapColorBrushCursor();
+      const rect = viewport.getBoundingClientRect();
+      const inside = clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom;
+      cursor.hidden = !inside;
+      if (inside) cursor.style.transform = 'translate3d(' + (clientX + 13) + 'px,' + (clientY + 13) + 'px,0)';
+    }
+
+    function mindmapColorBrushPalette(node) {
+      if (!node) return null;
+      return {
+        bgColor: normalizeMindmapHex(node.bgColor) || '#ffffff',
+        borderColor: normalizeMindmapHex(node.borderColor) || '#000000',
+        opacity: node.opacity == null ? 1 : clampValue(Number(node.opacity), 0.05, 1),
+      };
+    }
+
+    function dispatchMindmapColorState() {
+      document.dispatchEvent(new CustomEvent('canvas:mindmap-color-state', {
+        detail: getSelectedMindmapColorState(),
+      }));
+    }
+
+    function dispatchMindmapSizeState() {
+      document.dispatchEvent(new CustomEvent('canvas:mindmap-size-state', {
+        detail: getSelectedMindmapSizeState(),
+      }));
+    }
+
+    function dispatchMindmapColorBrushState(active) {
+      document.dispatchEvent(new CustomEvent('canvas:mindmap-color-brush', {
+        detail: {
+          active: !!active,
+          sourceId: active && mindmapColorBrushState ? mindmapColorBrushState.sourceId : '',
+        },
+      }));
+    }
+
+    function cancelMindmapColorBrush(showMessage) {
+      if (!mindmapColorBrushState) return false;
+      const sourceEl = nodeMap.get(mindmapColorBrushState.sourceId);
+      if (sourceEl) sourceEl.classList.remove('mindmap-color-brush-source');
+      clearMindmapColorBrushPreview();
+      mindmapColorBrushState = null;
+      viewport.classList.remove('mindmap-color-brush-active');
+      if (mindmapColorBrushCursorEl) mindmapColorBrushCursorEl.hidden = true;
+      dispatchMindmapColorBrushState(false);
+      if (showMessage) showCanvasToast('已退出配色刷');
+      return true;
+    }
+
+    function startMindmapColorBrush() {
+      if (currentMode() !== 'mindmap') return false;
+      if (mindmapColorBrushState) return cancelMindmapColorBrush(false);
+      if (selectedNodeIds.size !== 1 || selectedEdgeIds.size) return false;
+      const source = findNode([...selectedNodeIds][0]);
+      if (!source || isDecorationNode(source)) return false;
+      const palette = mindmapColorBrushPalette(source);
+      if (!palette) return false;
+      mindmapColorBrushState = { sourceId: source.id, palette: palette };
+      const sourceEl = nodeMap.get(source.id);
+      if (sourceEl) sourceEl.classList.add('mindmap-color-brush-source');
+      const cursor = ensureMindmapColorBrushCursor();
+      cursor.style.setProperty('--mindmap-brush-color', palette.borderColor);
+      viewport.classList.add('mindmap-color-brush-active');
+      positionMindmapColorBrushCursor(lastMouseClientX, lastMouseClientY);
+      dispatchMindmapColorBrushState(true);
+      showCanvasToast('已吸取节点配色，点击另一个节点应用');
+      return true;
+    }
+
+    function previewMindmapColorBrushTarget(node, el, active) {
+      if (!mindmapColorBrushState || !node || !el || isDecorationNode(node)
+          || node.id === mindmapColorBrushState.sourceId) return;
+      if (!active) {
+        if (mindmapColorBrushPreviewId === node.id) clearMindmapColorBrushPreview();
+        return;
+      }
+      clearMindmapColorBrushPreview();
+      const palette = mindmapColorBrushState.palette;
+      el.style.setProperty('--mindmap-brush-preview-bg', hexToRgba(palette.bgColor, palette.opacity) || palette.bgColor);
+      el.style.setProperty('--mindmap-brush-preview-border', palette.borderColor);
+      el.classList.add('mindmap-color-brush-preview');
+      mindmapColorBrushPreviewId = node.id;
+    }
+
+    function applyMindmapColorBrush(node) {
+      if (!mindmapColorBrushState || !node || isDecorationNode(node)) return false;
+      if (node.id === mindmapColorBrushState.sourceId) {
+        showCanvasToast('请选择另一个节点');
+        return true;
+      }
+      const palette = mindmapColorBrushState.palette;
+      node.bgColor = palette.bgColor;
+      node.borderColor = palette.borderColor;
+      node.opacity = palette.opacity;
+      delete node.color;
+      markMindmapNodeColorCustom(node);
+      const el = nodeMap.get(node.id);
+      if (el) {
+        el.removeAttribute('data-color');
+        applyNodeStyle(el, node);
+      }
+      nodeSizeCache.delete(node.id);
+      cancelMindmapColorBrush(false);
+      selectNodes([node.id], false);
+      pushHistory();
+      notify();
+      dispatchMindmapColorState();
+      showCanvasToast('已复制节点配色');
+      return true;
+    }
+
+    function mindmapDragLayoutOptions() {
+      const read = function (key, fallback, min, max) {
+        const value = Number(document.body && document.body.dataset[key]);
+        return Number.isFinite(value) ? clampValue(value, min, max) : fallback;
+      };
+      return {
+        layout: (document.body && document.body.dataset.mindmapLayout) || 'auto',
+        levelGap: read('mindmapLevelGap', 92, 56, 180),
+        branchGap: read('mindmapBranchGap', 32, 14, 96),
+        preserveSides: true,
+        allowSingleSide: true,
+      };
+    }
+
+    function prepareMindmapStructureDrag(node) {
+      if (currentMode() !== 'mindmap' || !node || isDecorationNode(node)) return null;
+      const tree = buildManagedMindmapTree(node);
+      if (!tree.valid) {
+        return {
+          active: true,
+          valid: false,
+          reason: tree.reason,
+          dragIds: new Set([node.id]),
+        };
+      }
+      const isRoot = tree.center.id === node.id;
+      return {
+        active: true,
+        valid: true,
+        tree: tree,
+        rootId: tree.center.id,
+        anchorId: node.id,
+        parentId: isRoot ? null : tree.parentOf.get(node.id),
+        isRoot: isRoot,
+        dragIds: isRoot ? new Set(tree.nodeSet) : mindmapSubtreeNodeIds(tree, node.id),
+      };
+    }
+
+    function mindmapRootGeometryIsDown(tree) {
+      if (!tree || !tree.center) return false;
+      const kids = tree.childrenOf.get(tree.center.id) || [];
+      if (!kids.length) return false;
+      const rootRect = nodeRect(tree.center);
+      const rootX = rootRect.x + rootRect.w / 2;
+      const rootY = rootRect.y + rootRect.h / 2;
+      const depthThreshold = Math.max(54, rootRect.h * 0.68);
+      let totalX = 0;
+      let allDeepBelow = true;
+      kids.forEach(function (id) {
+        const rect = nodeRect(findNode(id));
+        const cx = rect.x + rect.w / 2;
+        const cy = rect.y + rect.h / 2;
+        totalX += cx;
+        if (cy <= rootY + depthThreshold) allDeepBelow = false;
+      });
+      const averageX = totalX / kids.length;
+      return allDeepBelow && Math.abs(averageX - rootX) <= Math.max(90, rootRect.w * 0.85);
+    }
+
+    function mindmapRootChildDirection(tree, child, knownDown) {
+      if (!tree || !tree.center || !child) return 'right';
+      const down = typeof knownDown === 'boolean' ? knownDown : mindmapRootGeometryIsDown(tree);
+      if (down) return 'down';
+      const rootRect = nodeRect(tree.center);
+      const childRect = nodeRect(child);
+      return childRect.x + childRect.w / 2 < rootRect.x + rootRect.w / 2 ? 'left' : 'right';
+    }
+
+    function mindmapRootDropDirection(context, point, options) {
+      const chosen = options.layout;
+      if (chosen === 'radial') return null;
+      if (chosen === 'right' || chosen === 'left' || chosen === 'down') return chosen;
+      const root = findNode(context.rootId);
+      if (!root) return null;
+      const rootRect = nodeRect(root);
+      const rootX = rootRect.x + rootRect.w / 2;
+      const rootY = rootRect.y + rootRect.h / 2;
+      if (chosen === 'auto' && mindmapRootGeometryIsDown(context.tree) && point.y > rootY + 18) return 'down';
+      const deadZone = Math.max(26, rootRect.w * 0.18);
+      if (point.x < rootX - deadZone) return 'left';
+      if (point.x > rootX + deadZone) return 'right';
+      return null;
+    }
+
+    function mindmapDropCandidate(context, point) {
+      if (!context || !context.valid || context.isRoot || !context.parentId) return null;
+      const tree = context.tree;
+      const parent = findNode(context.parentId);
+      const anchor = findNode(context.anchorId);
+      if (!parent || !anchor) return null;
+      const options = mindmapDragLayoutOptions();
+      if (options.layout === 'radial') return null;
+      const parentIsRoot = parent.id === context.rootId;
+      const rootDown = parentIsRoot ? mindmapRootGeometryIsDown(tree) : false;
+      let direction = parentIsRoot
+        ? mindmapRootDropDirection(context, point, options)
+        : mindmapChildDirection(parent, anchor);
+      if (!direction) return null;
+      const parentRect = nodeRect(parent);
+      const parentX = parentRect.x + parentRect.w / 2;
+      const parentY = parentRect.y + parentRect.h / 2;
+      if (!parentIsRoot) {
+        if (direction === 'right' && point.x <= parentX + 12) return null;
+        if (direction === 'left' && point.x >= parentX - 12) return null;
+        if (direction === 'down' && point.y <= parentY + 12) return null;
+      }
+      const allKids = (tree.childrenOf.get(parent.id) || []).filter(function (id) {
+        return id !== context.anchorId;
+      });
+      let targetKids = allKids.slice();
+      if (parentIsRoot && (options.layout === 'auto' || options.layout === 'balanced')) {
+        targetKids = allKids.filter(function (id) {
+          const kid = findNode(id);
+          return kid && mindmapRootChildDirection(tree, kid, rootDown) === direction;
+        });
+      }
+      const horizontal = direction === 'left' || direction === 'right';
+      targetKids.sort(function (a, b) {
+        const ar = nodeRect(findNode(a));
+        const br = nodeRect(findNode(b));
+        return horizontal
+          ? (ar.y + ar.h / 2) - (br.y + br.h / 2)
+          : (ar.x + ar.w / 2) - (br.x + br.w / 2);
+      });
+      const spreadPoint = horizontal ? point.y : point.x;
+      let insertIndex = targetKids.length;
+      for (let i = 0; i < targetKids.length; i++) {
+        const rect = nodeRect(findNode(targetKids[i]));
+        const center = horizontal ? rect.y + rect.h / 2 : rect.x + rect.w / 2;
+        if (spreadPoint < center) { insertIndex = i; break; }
+      }
+      const targetOrder = targetKids.slice();
+      targetOrder.splice(insertIndex, 0, context.anchorId);
+      let fullOrder = targetOrder.slice();
+      if (parentIsRoot && (options.layout === 'auto' || options.layout === 'balanced')) {
+        const groups = { left: [], right: [], down: [] };
+        allKids.forEach(function (id) {
+          const kid = findNode(id);
+          if (!kid) return;
+          groups[mindmapRootChildDirection(tree, kid, rootDown)].push(id);
+        });
+        groups.left.sort(function (a, b) { return nodeRect(findNode(a)).y - nodeRect(findNode(b)).y; });
+        groups.right.sort(function (a, b) { return nodeRect(findNode(a)).y - nodeRect(findNode(b)).y; });
+        groups.down.sort(function (a, b) { return nodeRect(findNode(a)).x - nodeRect(findNode(b)).x; });
+        groups[direction] = targetOrder;
+        fullOrder = groups.left.concat(groups.right, groups.down);
+      }
+      const anchorRect = nodeRect(anchor);
+      let depthCoord;
+      let slotCoord;
+      if (targetKids.length) {
+        let depthTotal = 0;
+        targetKids.forEach(function (id) {
+          const rect = nodeRect(findNode(id));
+          depthTotal += horizontal ? rect.x + rect.w / 2 : rect.y + rect.h / 2;
+        });
+        depthCoord = depthTotal / targetKids.length;
+        if (insertIndex === 0) {
+          const first = nodeRect(findNode(targetKids[0]));
+          slotCoord = horizontal ? first.y - options.branchGap / 2 : first.x - options.branchGap / 2;
+        } else if (insertIndex === targetKids.length) {
+          const last = nodeRect(findNode(targetKids[targetKids.length - 1]));
+          slotCoord = horizontal
+            ? last.y + last.h + options.branchGap / 2
+            : last.x + last.w + options.branchGap / 2;
+        } else {
+          const before = nodeRect(findNode(targetKids[insertIndex - 1]));
+          const after = nodeRect(findNode(targetKids[insertIndex]));
+          slotCoord = horizontal
+            ? ((before.y + before.h) + after.y) / 2
+            : ((before.x + before.w) + after.x) / 2;
+        }
+      } else if (horizontal) {
+        depthCoord = direction === 'right'
+          ? parentRect.x + parentRect.w + options.levelGap + anchorRect.w / 2
+          : parentRect.x - options.levelGap - anchorRect.w / 2;
+        slotCoord = parentY;
+      } else {
+        depthCoord = parentRect.y + parentRect.h + options.levelGap + anchorRect.h / 2;
+        slotCoord = parentX;
+      }
+      return {
+        parentId: parent.id,
+        direction: direction,
+        order: fullOrder,
+        horizontal: horizontal,
+        depthCoord: depthCoord,
+        slotCoord: slotCoord,
+      };
+    }
+
+    function renderMindmapDropCandidate(candidate) {
+      clearMindmapDropPreview();
+      if (!candidate) return;
+      if (!mindmapDropSlotEl) {
+        mindmapDropSlotEl = document.createElement('div');
+        mindmapDropSlotEl.className = 'mindmap-drop-slot';
+        mindmapDropSlotEl.setAttribute('aria-hidden', 'true');
+        surface.appendChild(mindmapDropSlotEl);
+      }
+      mindmapDropSlotEl.hidden = false;
+      mindmapDropSlotEl.classList.toggle('vertical', !candidate.horizontal);
+      if (candidate.horizontal) {
+        mindmapDropSlotEl.style.left = (candidate.depthCoord - 42) + 'px';
+        mindmapDropSlotEl.style.top = (candidate.slotCoord - 1.5) + 'px';
+        mindmapDropSlotEl.style.width = '84px';
+        mindmapDropSlotEl.style.height = '3px';
+      } else {
+        mindmapDropSlotEl.style.left = (candidate.slotCoord - 1.5) + 'px';
+        mindmapDropSlotEl.style.top = (candidate.depthCoord - 26) + 'px';
+        mindmapDropSlotEl.style.width = '3px';
+        mindmapDropSlotEl.style.height = '52px';
+      }
+      mindmapDropParentId = candidate.parentId;
+      const parentEl = nodeMap.get(candidate.parentId);
+      if (parentEl) parentEl.classList.add('mindmap-drop-parent');
+    }
+
+    function mindmapReparentCandidate(context, clientX, clientY) {
+      if (!context || !context.valid || context.isRoot) return null;
+      const options = mindmapDragLayoutOptions();
+      if (options.layout === 'radial' || typeof document.elementsFromPoint !== 'function') return null;
+      const hits = document.elementsFromPoint(clientX, clientY);
+      for (let i = 0; i < hits.length; i++) {
+        const nodeEl = hits[i] && hits[i].closest ? hits[i].closest('.node') : null;
+        if (!nodeEl || !surface.contains(nodeEl)) continue;
+        const targetId = nodeEl.dataset.id;
+        if (!targetId || targetId === context.parentId || context.dragIds.has(targetId)) continue;
+        if (!context.tree.nodeSet.has(targetId)) continue;
+        const target = findNode(targetId);
+        if (!target || isDecorationNode(target)) continue;
+        return { targetId: targetId };
+      }
+      return null;
+    }
+
+    function renderMindmapReparentCandidate(candidate) {
+      clearMindmapDropPreview();
+      if (!candidate) return;
+      const target = findNode(candidate.targetId);
+      const targetEl = nodeMap.get(candidate.targetId);
+      if (!target || !targetEl) return;
+      targetEl.classList.add('mindmap-reparent-target');
+      mindmapReparentTargetId = candidate.targetId;
+      if (!mindmapReparentBadgeEl) {
+        mindmapReparentBadgeEl = document.createElement('div');
+        mindmapReparentBadgeEl.className = 'mindmap-reparent-badge';
+        mindmapReparentBadgeEl.setAttribute('aria-hidden', 'true');
+        mindmapReparentBadgeEl.textContent = '+';
+        surface.appendChild(mindmapReparentBadgeEl);
+      }
+      const rect = nodeRect(target);
+      mindmapReparentBadgeEl.style.left = (rect.x + rect.w - 8) + 'px';
+      mindmapReparentBadgeEl.style.top = (rect.y - 8) + 'px';
+      mindmapReparentBadgeEl.hidden = false;
+    }
+
+    function nodeDragLiveCoords(state, clientX, clientY) {
+      const scale = state.startScale || curScale;
+      const dx = (clientX - state.startClientX) / scale;
+      const dy = (clientY - state.startClientY) / scale;
+      const liveCoords = new Map();
+      state.starts.forEach(function (start, id) {
+        liveCoords.set(id, { x: start.x + dx, y: start.y + dy });
+      });
+      return liveCoords;
+    }
+
+    function restoreMindmapDragStart(state) {
+      state.starts.forEach(function (start, id) {
+        const el = nodeMap.get(id);
+        if (el) applyTransform(el, start.x, start.y);
+      });
+      edgeCanvasLiveCoords = null;
+      (state.affectedEdges || edgesIncidentTo(new Set(state.starts.keys()))).forEach(updateEdgePath);
+      requestEdgesCanvasRender();
+      syncBoundTextBoxes();
+      redrawMinimap();
+    }
+
+    function matchingMindmapPresetId(node, depth) {
+      if (!node || depth < 1) return '';
+      const currentId = (document.body && document.body.dataset.mindmapPreset) || 'paper';
+      const storedId = node.mindmapStylePreset;
+      if (node.mindmapSizeMode === 'auto') {
+        return MINDMAP_STYLE_PRESETS[storedId] ? storedId : currentId;
+      }
+      const ids = [];
+      if (MINDMAP_STYLE_PRESETS[storedId]) ids.push(storedId);
+      if (ids.indexOf(currentId) < 0) ids.push(currentId);
+      Object.keys(MINDMAP_STYLE_PRESETS).forEach(function (id) {
+        if (ids.indexOf(id) < 0) ids.push(id);
+      });
+      for (let i = 0; i < ids.length; i++) {
+        const preset = MINDMAP_STYLE_PRESETS[ids[i]];
+        const level = depth === 1 ? preset.branch : preset.leaf;
+        const hasScale = Number.isFinite(Number(node.scale));
+        const hasWidth = Number.isFinite(Number(node.width));
+        if (!hasScale && !hasWidth) continue;
+        const scaleMatches = !hasScale || Math.abs(Number(node.scale) - Number(level.scale)) < 0.025;
+        const widthMatches = !hasWidth || Math.abs(Number(node.width) - Number(level.nodeWidth)) < 3;
+        if (scaleMatches && widthMatches) return ids[i];
+      }
+      return '';
+    }
+
+    function normalizeMindmapHex(value) {
+      const raw = String(value || '').trim().toLowerCase();
+      return /^#[0-9a-f]{6}$/.test(raw) ? raw : '';
+    }
+
+    function mindmapStyleRole(depth) {
+      return depth === 0 ? 'center' : (depth === 1 ? 'branch' : 'leaf');
+    }
+
+    function mindmapPresetPriority(node) {
+      const ids = [];
+      const stored = node && node.mindmapStylePreset;
+      const current = (document.body && document.body.dataset.mindmapPreset) || 'paper';
+      if (MINDMAP_STYLE_PRESETS[stored]) ids.push(stored);
+      if (MINDMAP_STYLE_PRESETS[current] && ids.indexOf(current) < 0) ids.push(current);
+      Object.keys(MINDMAP_STYLE_PRESETS).forEach(function (id) {
+        if (ids.indexOf(id) < 0) ids.push(id);
+      });
+      return ids;
+    }
+
+    function mindmapNodeMatchesPresetPalette(node, preset, depth) {
+      if (!node || !preset) return false;
+      const border = normalizeMindmapHex(node.borderColor);
+      const bg = normalizeMindmapHex(node.bgColor);
+      const opacity = node.opacity == null ? 1 : Number(node.opacity);
+      if (depth === 0) {
+        return border === normalizeMindmapHex(preset.center.borderColor)
+          && bg === normalizeMindmapHex(preset.center.bgColor)
+          && Math.abs(opacity - Number(preset.center.opacity)) < 0.025;
+      }
+      const level = depth === 1 ? preset.branch : preset.leaf;
+      const paletteHit = (preset.colors || []).some(function (color) {
+        return normalizeMindmapHex(color) === border;
+      });
+      if (!paletteHit || !border) return false;
+      return bg === normalizeMindmapHex(mixMindmapHex(border, '#ffffff', level.bgMix))
+        && Math.abs(opacity - Number(level.opacity)) < 0.025;
+    }
+
+    function readMindmapColorIntent(node, depth) {
+      const ids = mindmapPresetPriority(node);
+      const presetId = ids[0] || 'paper';
+      if (!node) return { follow: false, presetId: presetId };
+      if (node.mindmapColorMode === 'custom') return { follow: false, presetId: presetId };
+      if (node.mindmapColorMode === 'auto') return { follow: true, presetId: presetId };
+      for (let i = 0; i < ids.length; i++) {
+        if (mindmapNodeMatchesPresetPalette(node, MINDMAP_STYLE_PRESETS[ids[i]], depth)) {
+          return { follow: true, presetId: ids[i], inferred: true };
+        }
+      }
+      return { follow: false, presetId: presetId, inferred: true };
+    }
+
+    function captureMindmapColorIntents(tree, ids) {
+      const intents = new Map();
+      ids.forEach(function (id) {
+        const node = findNode(id);
+        const depth = tree.depth.get(id);
+        if (node && Number.isFinite(depth)) intents.set(id, readMindmapColorIntent(node, depth));
+      });
+      return intents;
+    }
+
+    function writeMindmapColorMeta(node, presetId, branchColor, depth, mode) {
+      if (!node) return;
+      node.mindmapStylePreset = MINDMAP_STYLE_PRESETS[presetId] ? presetId : 'paper';
+      node.mindmapColorMode = mode === 'custom' ? 'custom' : 'auto';
+      node.mindmapStyleRole = mindmapStyleRole(depth);
+      const color = normalizeMindmapHex(branchColor);
+      if (color) node.mindmapBranchColor = color;
+      else delete node.mindmapBranchColor;
+    }
+
+    function markMindmapNodeColorCustom(node) {
+      if (!node) return;
+      const presetId = MINDMAP_STYLE_PRESETS[node.mindmapStylePreset]
+        ? node.mindmapStylePreset
+        : ((document.body && document.body.dataset.mindmapPreset) || 'paper');
+      node.mindmapStylePreset = MINDMAP_STYLE_PRESETS[presetId] ? presetId : 'paper';
+      node.mindmapColorMode = 'custom';
+      delete node.mindmapBranchColor;
+    }
+
+    function writeMindmapNodePalette(node, palette, presetId, branchColor, depth, mode) {
+      if (!node || isDecorationNode(node) || !palette) return;
+      node.bgColor = palette.bgColor;
+      node.borderColor = palette.borderColor;
+      node.opacity = palette.opacity;
+      delete node.color;
+      writeMindmapColorMeta(node, presetId, branchColor, depth, mode || 'auto');
+      const el = nodeMap.get(node.id);
+      if (el) {
+        el.removeAttribute('data-color');
+        applyNodeStyle(el, node);
+      }
+      nodeSizeCache.delete(node.id);
+    }
+
+    function mindmapTopBranchId(tree, id) {
+      if (!tree || !tree.center || !tree.parentOf || !id || id === tree.center.id) return null;
+      let branchId = id;
+      let parentId = tree.parentOf.get(branchId);
+      while (parentId && parentId !== tree.center.id) {
+        branchId = parentId;
+        parentId = tree.parentOf.get(branchId);
+      }
+      return parentId === tree.center.id ? branchId : null;
+    }
+
+    function mindmapBranchColor(tree, id, preset, excludedId) {
+      const topId = mindmapTopBranchId(tree, id);
+      if (!topId) return normalizeMindmapHex(preset.center.borderColor) || preset.colors[0];
+      const top = findNode(topId);
+      const incoming = data.edges.find(function (edge) {
+        return edge.from === tree.center.id && edge.to === topId;
+      });
+      const stored = normalizeMindmapHex(top && top.mindmapBranchColor);
+      const edgeColor = normalizeMindmapHex(incoming && incoming.color);
+      const border = normalizeMindmapHex(top && top.borderColor);
+      if (topId !== excludedId && stored) return stored;
+      if (edgeColor) return edgeColor;
+      if (border) return border;
+      const rootKids = tree.childrenOf.get(tree.center.id) || [];
+      const idx = Math.max(0, rootKids.indexOf(topId));
+      return preset.colors[idx % preset.colors.length];
+    }
+
+    function unusedMindmapRootColor(tree, anchorId, preset) {
+      const used = new Set();
+      (tree.childrenOf.get(tree.center.id) || []).forEach(function (id) {
+        if (id === anchorId) return;
+        used.add(normalizeMindmapHex(mindmapBranchColor(tree, id, preset, anchorId)));
+      });
+      for (let i = 0; i < preset.colors.length; i++) {
+        const color = normalizeMindmapHex(preset.colors[i]);
+        if (!used.has(color)) return color;
+      }
+      const kids = tree.childrenOf.get(tree.center.id) || [];
+      return preset.colors[Math.max(0, kids.indexOf(anchorId)) % preset.colors.length];
+    }
+
+    function recolorReparentedMindmapBranch(oldTree, newTree, movedIds, intents, target, anchor, presetId) {
+      const preset = mindmapPreset(presetId);
+      const branchColor = target.id === newTree.center.id
+        ? unusedMindmapRootColor(newTree, anchor.id, preset)
+        : mindmapBranchColor(newTree, target.id, preset);
+      movedIds.forEach(function (id) {
+        const intent = intents.get(id);
+        const node = findNode(id);
+        const depth = newTree.depth.get(id);
+        if (!node || !Number.isFinite(depth)) return;
+        if (!intent || !intent.follow) {
+          if (node.mindmapColorMode === 'custom') node.mindmapStyleRole = mindmapStyleRole(depth);
+          return;
+        }
+        const level = depth === 1 ? preset.branch : preset.leaf;
+        writeMindmapNodePalette(node, {
+          bgColor: mixMindmapHex(branchColor, '#ffffff', level.bgMix),
+          borderColor: branchColor,
+          opacity: level.opacity,
+        }, presetId, branchColor, depth, 'auto');
+      });
+      data.edges.forEach(function (edge) {
+        if (!movedIds.has(edge.to) || newTree.parentOf.get(edge.to) !== edge.from) return;
+        edge.color = branchColor;
+        const refs = edgeMap.get(edge.id);
+        if (refs) applyEdgeStyle(refs, edge);
+        updateEdgePath(edge);
+      });
+      return branchColor;
+    }
+
+    function mindmapBranchBounds(tree, topId, local, rootCenter) {
+      const ids = mindmapSubtreeNodeIds(tree, topId);
+      const bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+      ids.forEach(function (id) {
+        const point = local.get(id);
+        const node = findNode(id);
+        if (!point || !node) return;
+        const rect = nodeRect(node);
+        const cx = rootCenter.x + point.cx;
+        const cy = rootCenter.y + point.cy;
+        bounds.minX = Math.min(bounds.minX, cx - rect.w / 2);
+        bounds.maxX = Math.max(bounds.maxX, cx + rect.w / 2);
+        bounds.minY = Math.min(bounds.minY, cy - rect.h / 2);
+        bounds.maxY = Math.max(bounds.maxY, cy + rect.h / 2);
+      });
+      return bounds;
+    }
+
+    function mindmapBoundsOverlap(a, b, gap) {
+      if (!a || !b || !Number.isFinite(a.minX) || !Number.isFinite(b.minX)) return false;
+      return a.minX < b.maxX + gap && a.maxX + gap > b.minX
+        && a.minY < b.maxY + gap && a.maxY + gap > b.minY;
+    }
+
+    function localMindmapTopBranchLayout(newTree, affectedTops, options) {
+      if (!newTree || !affectedTops || !affectedTops.size) return null;
+      const rootRect = nodeRect(newTree.center);
+      const rootCenter = { x: rootRect.x + rootRect.w / 2, y: rootRect.y + rootRect.h / 2 };
+      const local = new Map();
+      newTree.nodeSet.forEach(function (id) {
+        const rect = nodeRect(findNode(id));
+        local.set(id, {
+          cx: rect.x + rect.w / 2 - rootCenter.x,
+          cy: rect.y + rect.h / 2 - rootCenter.y,
+        });
+      });
+      const rootDown = mindmapRootGeometryIsDown(newTree);
+      affectedTops.forEach(function (topId) {
+        const top = findNode(topId);
+        const subtree = mindmapSubtreeTree(newTree, topId);
+        subtree.orderOverrides = newTree.orderOverrides || null;
+        let direction = options.layout;
+        if (direction !== 'right' && direction !== 'left' && direction !== 'down') {
+          direction = mindmapRootChildDirection(newTree, top, rootDown);
+        }
+        const branchLocal = layoutMindmapTree(subtree, direction, options);
+        const origin = branchLocal.get(topId);
+        const anchor = local.get(topId);
+        if (!origin || !anchor) return;
+        branchLocal.forEach(function (point, id) {
+          local.set(id, {
+            cx: anchor.cx + point.cx - origin.cx,
+            cy: anchor.cy + point.cy - origin.cy,
+          });
+        });
+      });
+      const rootKids = (newTree.childrenOf.get(newTree.center.id) || []).slice();
+      const bounds = new Map();
+      rootKids.forEach(function (id) {
+        bounds.set(id, mindmapBranchBounds(newTree, id, local, rootCenter));
+      });
+      const gap = Math.max(8, Number(options.branchGap) * 0.32 || 10);
+      const affected = [...affectedTops];
+      for (let i = 0; i < affected.length; i++) {
+        for (let j = 0; j < rootKids.length; j++) {
+          const otherId = rootKids[j];
+          if (otherId === affected[i]) continue;
+          if (affectedTops.has(otherId) && affected.indexOf(otherId) < i) continue;
+          if (mindmapBoundsOverlap(bounds.get(affected[i]), bounds.get(otherId), gap)) return null;
+        }
+      }
+      return local;
+    }
+
+    function localMindmapReparentLayout(newTree, oldParentId, targetId, options) {
+      if (!newTree || targetId === newTree.center.id) return null;
+      if (options && options.layout === 'radial') return null;
+      const targetTop = mindmapTopBranchId(newTree, targetId);
+      if (!targetTop) return null;
+      const affectedTops = new Set([targetTop]);
+      if (oldParentId !== newTree.center.id) {
+        const oldTop = mindmapTopBranchId(newTree, oldParentId);
+        if (oldTop) affectedTops.add(oldTop);
+      }
+      return localMindmapTopBranchLayout(newTree, affectedTops, options);
+    }
+
+    function getSelectedMindmapColorState() {
+      const states = [];
+      const presetIds = new Set();
+      let matchable = 0;
+      selectedNodeIds.forEach(function (id) {
+        const node = findNode(id);
+        if (!node || isDecorationNode(node)) return;
+        const tree = buildManagedMindmapTree(node);
+        if (!tree.valid || !tree.depth.has(id)) {
+          states.push('unsupported');
+          return;
+        }
+        const depth = tree.depth.get(id) || 0;
+        if (MINDMAP_STYLE_PRESETS[node.mindmapStylePreset]) presetIds.add(node.mindmapStylePreset);
+        if (depth === 0) {
+          states.push('center');
+          return;
+        }
+        matchable += 1;
+        states.push(readMindmapColorIntent(node, depth).follow ? 'auto' : 'custom');
+      });
+      if (!states.length) return { mode: 'none', count: 0, matchable: 0, presetId: '' };
+      const first = states[0];
+      const mode = states.every(function (state) { return state === first; }) ? first : 'mixed';
+      return { mode: mode, count: states.length, matchable: matchable, presetId: presetIds.size === 1 ? [...presetIds][0] : '' };
+    }
+
+    function getSelectedMindmapSizeState() {
+      const node = [...selectedNodeIds].map(findNode).find(function (candidate) {
+        return candidate && !isDecorationNode(candidate);
+      });
+      if (!node) return { centerSize: null, branchSize: null, leafSize: null, nodeSize: null, custom: 0 };
+      const tree = buildManagedMindmapTree(node);
+      if (!tree.valid) return { centerSize: null, branchSize: null, leafSize: null, nodeSize: null, custom: 0 };
+      let centerSize = null;
+      let branchSize = null;
+      let leafSize = null;
+      let custom = 0;
+      tree.nodeSet.forEach(function (id) {
+        const current = findNode(id);
+        const depth = tree.depth.get(id) || 0;
+        if (!current) return;
+        if (current.mindmapSizeMode === 'custom') custom += 1;
+        const presetId = MINDMAP_STYLE_PRESETS[current.mindmapStylePreset]
+          ? current.mindmapStylePreset
+          : ((document.body && document.body.dataset.mindmapPreset) || 'paper');
+        const level = mindmapLevelForDepth(mindmapPreset(presetId), depth);
+        const stored = Number(current.mindmapSizeFactor);
+        const inferred = Number(current.scale) > 0 && Number(level.scale) > 0
+          ? Number(current.scale) / Number(level.scale)
+          : 1;
+        const percent = Math.round(clampValue(Number.isFinite(stored) && stored > 0 ? stored : inferred, 0.65, 1.55) * 100);
+        if (depth === 0) centerSize = percent;
+        else if (depth === 1 && branchSize == null) branchSize = percent;
+        else if (depth >= 2 && leafSize == null) leafSize = percent;
+      });
+      return {
+        centerSize: centerSize,
+        branchSize: branchSize,
+        leafSize: leafSize,
+        nodeSize: branchSize == null ? leafSize : branchSize,
+        custom: custom,
+      };
+    }
+
+    function matchSelectedMindmapParentColor() {
+      if (currentMode() !== 'mindmap' || selectedNodeIds.size === 0) return false;
+      if (editingNodeId !== null) commitNodeEdit();
+      if (editingEdgeId !== null) commitEdgeEdit();
+      if (textReaderEditing) finishTextReaderEdit();
+      let changed = 0;
+      selectedNodeIds.forEach(function (id) {
+        const node = findNode(id);
+        if (!node || isDecorationNode(node)) return;
+        const tree = buildManagedMindmapTree(node);
+        if (!tree.valid || id === tree.center.id) return;
+        const depth = tree.depth.get(id) || 1;
+        const intent = readMindmapColorIntent(node, depth);
+        const presetId = MINDMAP_STYLE_PRESETS[node.mindmapStylePreset]
+          ? node.mindmapStylePreset
+          : (intent.presetId || (document.body && document.body.dataset.mindmapPreset) || 'paper');
+        const preset = mindmapPreset(presetId);
+        const branchColor = mindmapBranchColor(tree, id, preset);
+        const level = depth === 1 ? preset.branch : preset.leaf;
+        writeMindmapNodePalette(node, {
+          bgColor: mixMindmapHex(branchColor, '#ffffff', level.bgMix),
+          borderColor: branchColor,
+          opacity: level.opacity,
+        }, presetId, branchColor, depth, 'auto');
+        const parentId = tree.parentOf.get(id);
+        const incoming = data.edges.find(function (edge) {
+          return edge.from === parentId && edge.to === id;
+        });
+        if (incoming) {
+          incoming.color = branchColor;
+          const refs = edgeMap.get(incoming.id);
+          if (refs) applyEdgeStyle(refs, incoming);
+          updateEdgePath(incoming);
+        }
+        changed += 1;
+      });
+      if (!changed) return false;
+      pushHistory();
+      notify();
+      dispatchMindmapColorState();
+      showCanvasToast(changed === 1 ? '已匹配父分支配色' : '已统一所选节点配色');
+      return true;
+    }
+
+    function adjustReparentedMindmapSizes(oldTree, newTree, movedIds) {
+      let anchorPresetId = '';
+      movedIds.forEach(function (id) {
+        const node = findNode(id);
+        const oldDepth = oldTree.depth.get(id);
+        const newDepth = newTree.depth.get(id);
+        if (!node || !Number.isFinite(oldDepth) || !Number.isFinite(newDepth) || oldDepth === newDepth) return;
+        const presetId = matchingMindmapPresetId(node, oldDepth);
+        if (id === oldTree.dragAnchorId && presetId) anchorPresetId = presetId;
+        if (!presetId) return;
+        const preset = MINDMAP_STYLE_PRESETS[presetId];
+        const oldLevel = oldDepth === 1 ? preset.branch : preset.leaf;
+        const newLevel = newDepth === 1 ? preset.branch : preset.leaf;
+        if (node.mindmapSizeMode === 'auto') {
+          const factor = Number(node.mindmapSizeFactor) > 0
+            && mindmapStyleRole(oldDepth) === mindmapStyleRole(newDepth)
+            ? Number(node.mindmapSizeFactor)
+            : mindmapSizeFactorFromDataset(newDepth);
+          writeMindmapNodeSize(node, presetId, newDepth, factor, true);
+          return;
+        }
+        let changed = false;
+        if (Math.abs(Number(node.scale) - Number(oldLevel.scale)) < 0.025) {
+          node.scale = newLevel.scale;
+          changed = true;
+        }
+        if (Math.abs(Number(node.width) - Number(oldLevel.nodeWidth)) < 3) {
+          node.width = newLevel.nodeWidth;
+          changed = true;
+        }
+        if (changed) {
+          nodeSizeCache.delete(node.id);
+          const el = nodeMap.get(node.id);
+          if (el) applyNodeStyle(el, node);
+        }
+      });
+      return anchorPresetId;
+    }
+
+    function mindmapRootBranchDirection(tree, id) {
+      if (!tree || !tree.parentOf || id === tree.center.id) return null;
+      let branchId = id;
+      let parentId = tree.parentOf.get(branchId);
+      while (parentId && parentId !== tree.center.id) {
+        branchId = parentId;
+        parentId = tree.parentOf.get(branchId);
+      }
+      const branch = findNode(branchId);
+      return branch ? mindmapRootChildDirection(tree, branch, mindmapRootGeometryIsDown(tree)) : null;
+    }
+
+    function managedMindmapLayout(tree, options) {
+      if (options.layout === 'radial') {
+        return { kind: 'radial', local: layoutMindmapRadial(tree, options) };
+      }
+      if (options.layout === 'right' || options.layout === 'left' || options.layout === 'down') {
+        return { kind: options.layout, local: layoutMindmapTree(tree, options.layout, options) };
+      }
+      if (options.layout === 'auto' && mindmapRootGeometryIsDown(tree)) {
+        return { kind: 'down', local: layoutMindmapTree(tree, 'down', options) };
+      }
+      return { kind: 'balanced', local: layoutMindmapBalanced(tree, options) };
+    }
+
+    function styleReparentedMindmapEdge(edge, target, anchor, newTree, presetId, inheritedColor) {
+      if (!edge || !target || !anchor) return;
+      const id = presetId || (document.body && document.body.dataset.mindmapPreset) || 'paper';
+      const preset = mindmapPreset(id);
+      const depth = newTree.depth.get(anchor.id) || 1;
+      const level = depth === 1 ? preset.branch : preset.leaf;
+      const targetParentId = newTree.parentOf.get(target.id);
+      const incoming = targetParentId ? data.edges.find(function (candidate) {
+        return candidate.from === targetParentId && candidate.to === target.id;
+      }) : null;
+      const branchColor = normalizeMindmapHex(inheritedColor) || (target.id === newTree.center.id
+        ? (anchor.borderColor || level.color || preset.colors[0])
+        : ((incoming && incoming.color) || target.borderColor || anchor.borderColor || preset.colors[0]));
+      const curveRaw = document.body && document.body.dataset.mindmapCurve;
+      const lineStyleRaw = document.body && document.body.dataset.mindmapLineStyle;
+      writeMindmapEdgeStyle(edge, {
+        color: branchColor,
+        width: Number(level.width) || Number(edge.width) || 1.8,
+        curve: EDGE_CURVES.indexOf(curveRaw) >= 0 ? curveRaw : (level.curve || edgeCurveType(edge)),
+        lineStyle: EDGE_LINE_STYLES.indexOf(lineStyleRaw) >= 0 ? lineStyleRaw : (level.lineStyle || edgeLineStyle(edge)),
+      }, true);
+    }
+
+    function finishMindmapReparent(state, context, candidate, liveCoords) {
+      const anchor = findNode(context.anchorId);
+      const target = findNode(candidate.targetId);
+      const oldParent = findNode(context.parentId);
+      const parentEdge = data.edges.find(function (edge) {
+        return edge.from === context.parentId && edge.to === context.anchorId;
+      });
+      if (!anchor || !target || !oldParent || !parentEdge) return false;
+      const oldEdge = {
+        from: parentEdge.from,
+        to: parentEdge.to,
+        waypoints: Array.isArray(parentEdge.waypoints) ? parentEdge.waypoints.map(function (w) { return { x: w.x, y: w.y }; }) : null,
+      };
+      const targetWasCollapsed = !!target.mindmapCollapsed;
+      const oldBranchDirection = mindmapRootBranchDirection(context.tree, anchor.id);
+      const colorIntents = captureMindmapColorIntents(context.tree, context.dragIds);
+      liveCoords.forEach(function (pos, id) {
+        const node = findNode(id);
+        if (!node) return;
+        node.x = pos.x;
+        node.y = pos.y;
+      });
+      parentEdge.from = target.id;
+      parentEdge.to = anchor.id;
+      delete parentEdge.waypoints;
+      if (target.mindmapCollapsed) delete target.mindmapCollapsed;
+      const nextTree = buildManagedMindmapTree(findNode(context.rootId));
+      if (!nextTree.valid) {
+        parentEdge.from = oldEdge.from;
+        parentEdge.to = oldEdge.to;
+        if (oldEdge.waypoints) parentEdge.waypoints = oldEdge.waypoints;
+        if (targetWasCollapsed) target.mindmapCollapsed = true;
+        state.starts.forEach(function (start, id) {
+          const node = findNode(id);
+          if (node) { node.x = start.x; node.y = start.y; }
+        });
+        restoreMindmapDragStart(state);
+        showCanvasToast('这次移动会产生无效结构');
+        return true;
+      }
+      context.tree.dragAnchorId = anchor.id;
+      const sizePresetId = adjustReparentedMindmapSizes(context.tree, nextTree, context.dragIds);
+      const anchorIntent = colorIntents.get(anchor.id);
+      const presetId = sizePresetId
+        || (anchorIntent && anchorIntent.presetId)
+        || (document.body && document.body.dataset.mindmapPreset)
+        || 'paper';
+      const inheritedColor = recolorReparentedMindmapBranch(
+        context.tree,
+        nextTree,
+        context.dragIds,
+        colorIntents,
+        target,
+        anchor,
+        presetId,
+      );
+      styleReparentedMindmapEdge(parentEdge, target, anchor, nextTree, presetId, inheritedColor);
+      const targetKids = (nextTree.childrenOf.get(target.id) || []).filter(function (id) { return id !== anchor.id; });
+      const childDirection = target.id === nextTree.center.id
+        ? (oldBranchDirection || 'right')
+        : (mindmapRootBranchDirection(nextTree, target.id) || 'right');
+      const horizontal = childDirection !== 'down';
+      targetKids.sort(function (a, b) {
+        const ar = nodeRect(findNode(a));
+        const br = nodeRect(findNode(b));
+        return horizontal
+          ? (ar.y + ar.h / 2) - (br.y + br.h / 2)
+          : (ar.x + ar.w / 2) - (br.x + br.w / 2);
+      });
+      targetKids.push(anchor.id);
+      nextTree.orderOverrides = new Map([[target.id, targetKids]]);
+      if (target.id === nextTree.center.id && (oldBranchDirection === 'left' || oldBranchDirection === 'right')) {
+        nextTree.sideOverrides = new Map([[anchor.id, oldBranchDirection === 'left' ? -1 : 1]]);
+      }
+      markMindmapRoot(nextTree);
+      edgeCanvasLiveCoords = null;
+      const options = mindmapDragLayoutOptions();
+      const local = localMindmapReparentLayout(nextTree, oldParent.id, target.id, options);
+      const layout = local ? { kind: 'local', local: local } : managedMindmapLayout(nextTree, options);
+      applyMindmapPositions(nextTree, layout.local, true, { duration: 260 });
+      dispatchMindmapColorState();
+      showCanvasToast('已移到「' + (target.text || '未命名') + '」下');
+      return true;
+    }
+
+    function finishMindmapStructureDrag(state, e) {
+      const context = state.mindmap;
+      clearMindmapDropPreview();
+      if (!context || !context.active) return false;
+      if (!state.moved) return true;
+      if (!context.valid) {
+        restoreMindmapDragStart(state);
+        showCanvasToast('这组节点含有交叉连接，暂不能自动排序');
+        return true;
+      }
+      const liveCoords = nodeDragLiveCoords(state, e.clientX, e.clientY);
+      if (context.isRoot) {
+        liveCoords.forEach(function (pos, id) {
+          const node = findNode(id);
+          if (!node) return;
+          node.x = pos.x;
+          node.y = pos.y;
+          const el = nodeMap.get(id);
+          if (el) applyTransform(el, pos.x, pos.y);
+        });
+        syncBoundTextBoxes(new Set(context.tree.nodeSet));
+        markMindmapRoot(context.tree);
+        edgeCanvasLiveCoords = null;
+        (state.affectedEdges || edgesIncidentTo(new Set(state.starts.keys()))).forEach(updateEdgePath);
+        pushHistory();
+        notify();
+        return true;
+      }
+      const reparentCandidate = mindmapReparentCandidate(context, e.clientX, e.clientY);
+      if (reparentCandidate) return finishMindmapReparent(state, context, reparentCandidate, liveCoords);
+      const point = clientToSurface(e.clientX, e.clientY);
+      const candidate = mindmapDropCandidate(context, point);
+      if (!candidate) {
+        restoreMindmapDragStart(state);
+        showCanvasToast(mindmapDragLayoutOptions().layout === 'radial'
+          ? '放射布局暂不支持拖动排序'
+          : '没有落入可排序的位置');
+        return true;
+      }
+      liveCoords.forEach(function (pos, id) {
+        const node = findNode(id);
+        if (!node) return;
+        node.x = pos.x;
+        node.y = pos.y;
+      });
+      markMindmapRoot(context.tree);
+      edgeCanvasLiveCoords = null;
+      const options = mindmapDragLayoutOptions();
+      let layoutTree;
+      let local;
+      if (candidate.parentId === context.rootId) {
+        layoutTree = context.tree;
+        layoutTree.orderOverrides = new Map([[candidate.parentId, candidate.order]]);
+        if (candidate.direction === 'down' || options.layout === 'down') local = layoutMindmapTree(layoutTree, 'down', options);
+        else if (options.layout === 'right' || options.layout === 'left') local = layoutMindmapTree(layoutTree, options.layout, options);
+        else local = layoutMindmapBalanced(layoutTree, options);
+      } else {
+        layoutTree = mindmapSubtreeTree(context.tree, candidate.parentId);
+        layoutTree.orderOverrides = new Map([[candidate.parentId, candidate.order]]);
+        local = layoutMindmapTree(layoutTree, candidate.direction, options);
+      }
+      applyMindmapPositions(layoutTree, local, true, { duration: 260 });
+      return true;
+    }
+
+    function startNodeDrag(node, e) {
+      hideFrameActionButton();
+      if (currentMode() === 'mindmap') {
+        finishMindmapGlide();
+        clearMindmapDropPreview();
+      }
+      if (isSelectionToggleEvent(e)) {
+        // Shift/Ctrl+mousedown 只切换选择，不发起拖动
+        suppressNextSelectionToggleClick(nodeMap.get(node.id));
+        toggleNodeSelection(node.id);
+        return;
+      }
+
+      let idsBeingDragged;
+      let collapseOnMouseUp = false;
+      const mindmapDrag = prepareMindmapStructureDrag(node);
+      const groupMembers = isGroupBoxNode(node) ? semanticGroupMembers(node) : [];
+
+      if (groupMembers.length) {
+        if (!selectedNodeIds.has(node.id) || selectedNodeIds.size !== 1) selectNodes([node.id], false);
+        idsBeingDragged = new Set([node.id]);
+        groupMembers.forEach(function (member) { idsBeingDragged.add(member.id); });
+      } else if (mindmapDrag) {
+        if (!selectedNodeIds.has(node.id) || selectedNodeIds.size !== 1) selectNodes([node.id], false);
+        idsBeingDragged = new Set(mindmapDrag.dragIds);
+      } else if (selectedNodeIds.has(node.id) && selectedNodeIds.size > 1) {
+        const textPair = isTextBoxNode(node) ? selectedTextBindingPair() : null;
+        if (textPair && textPair.box.id === node.id) {
+          // “一个节点 + 一个文本框”是建立跟随关系的选择语义；拖文本框只调相对位置，
+          // 不能把目标节点也一起拖走。未发生拖动时仍按普通点击折叠为单选。
+          idsBeingDragged = new Set([node.id]);
+        } else {
+          // 其他多选状态保持整组拖动。
+          idsBeingDragged = new Set(selectedNodeIds);
+        }
+        collapseOnMouseUp = true;
+      } else {
+        selectNodes([node.id], false);
+        idsBeingDragged = new Set([node.id]);
+      }
+
+      // 记录每个被拖节点的起始位置
+      const starts = new Map();
+      let minX = Infinity;
+      let minY = Infinity;
+      idsBeingDragged.forEach((id) => {
+        const n = findNode(id);
+        if (!n) return;
+        starts.set(id, { x: n.x, y: n.y });
+        if (n.x < minX) minX = n.x;
+        if (n.y < minY) minY = n.y;
+      });
+      const dragNodeIds = new Set(starts.keys());
+      const affectedEdges = edgesIncidentTo(dragNodeIds);
+      const followingTextBoxIds = new Set();
+      data.nodes.forEach(function (candidate) {
+        if (isTextBoxNode(candidate) && candidate.textBindTarget && dragNodeIds.has(candidate.textBindTarget)
+            && !dragNodeIds.has(candidate.id)) followingTextBoxIds.add(candidate.id);
+      });
+
+      drag = {
+        mode: 'node',
+        anchorId: node.id,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        latestClientX: e.clientX,
+        latestClientY: e.clientY,
+        startScale: curScale,
+        starts: starts,
+        affectedEdges: affectedEdges,
+        minStartX: minX === Infinity ? 0 : minX,
+        minStartY: minY === Infinity ? 0 : minY,
+        moved: false,
+        collapseOnMouseUp: collapseOnMouseUp,
+        mindmap: mindmapDrag,
+        followingTextBoxIds: followingTextBoxIds,
+      };
+
+      setEdgesSvgLive(true);
+
+      starts.forEach((_, id) => {
+        const elN = nodeMap.get(id);
+        if (!elN) return;
+        elN.classList.add('dragging');
+        if (mindmapDrag && id !== node.id) elN.classList.add('mindmap-subtree-dragging');
+      });
+      followingTextBoxIds.forEach(function (id) {
+        const elN = nodeMap.get(id);
+        if (elN) elN.classList.add('dragging');
+      });
+      if (mindmapDrag) {
+        const anchorEl = nodeMap.get(node.id);
+        if (anchorEl) anchorEl.classList.add('mindmap-drag-anchor');
+      }
+    }
+
+    function startDecorResize(node, dir, e) {
+      if (e.button !== 0 || !isDecorationNode(node)) return;
+      if (currentMode() !== 'decor' && !isTextBoxNode(node)) return;
+      if (isGroupBoxNode(node) && (dir === 'n' || dir === 'ne' || dir === 'nw')) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (!selectedNodeIds.has(node.id) || selectedNodeIds.size !== 1 || selectedEdgeIds.size) {
+        selectNodes([node.id], false);
+      }
+      const width = Math.max(20, Number(node.width) || 240);
+      const height = Math.max(8, Number(node.height) || 120);
+      drag = {
+        mode: 'decor-resize',
+        nodeId: node.id,
+        dir: dir,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        latestClientX: e.clientX,
+        latestClientY: e.clientY,
+        startScale: curScale,
+        startX: Number(node.x) || 0,
+        startY: Number(node.y) || 0,
+        startW: width,
+        startH: height,
+        rotation: Number(node.rotation) || 0,
+        moved: false,
+      };
+      const el = nodeMap.get(node.id);
+      if (el) el.classList.add('resizing');
+    }
+
+    function applyDecorResizeDrag(clientX, clientY) {
+      if (!drag || drag.mode !== 'decor-resize') return;
+      const node = findNode(drag.nodeId);
+      if (!isDecorationNode(node)) return;
+      const scale = drag.startScale || curScale;
+      const dx = (clientX - drag.startClientX) / scale;
+      const dy = (clientY - drag.startClientY) / scale;
+      const rad = drag.rotation * Math.PI / 180;
+      const cos = Math.cos(rad);
+      const sin = Math.sin(rad);
+      const localDx = cos * dx + sin * dy;
+      const localDy = -sin * dx + cos * dy;
+      const east = drag.dir.indexOf('e') >= 0;
+      const west = drag.dir.indexOf('w') >= 0;
+      const south = drag.dir.indexOf('s') >= 0;
+      const north = drag.dir.indexOf('n') >= 0;
+      const nextW = cleanDecorNumber(
+        east ? drag.startW + localDx : (west ? drag.startW - localDx : drag.startW),
+        drag.startW,
+        20,
+        DECOR_MAX_SIZE,
+        true,
+      );
+      const nextH = cleanDecorNumber(
+        south ? drag.startH + localDy : (north ? drag.startH - localDy : drag.startH),
+        drag.startH,
+        8,
+        DECOR_MAX_SIZE,
+        true,
+      );
+      const sx = east ? 1 : (west ? -1 : 0);
+      const sy = south ? 1 : (north ? -1 : 0);
+      const shiftLocalX = sx * (nextW - drag.startW) / 2;
+      const shiftLocalY = sy * (nextH - drag.startH) / 2;
+      const shiftX = cos * shiftLocalX - sin * shiftLocalY;
+      const shiftY = sin * shiftLocalX + cos * shiftLocalY;
+      const centerX = drag.startX + drag.startW / 2 + shiftX;
+      const centerY = drag.startY + drag.startH / 2 + shiftY;
+      node.width = nextW;
+      node.height = nextH;
+      node.x = centerX - nextW / 2;
+      node.y = centerY - nextH / 2;
+      const el = nodeMap.get(node.id);
+      if (el) {
+        applyTransform(el, node.x, node.y);
+        renderEditedDecoration(node);
+      }
+      refreshDecorPanel();
+      redrawMinimap();
+    }
+
+    function startEdgeCreate(node, e) {
+      const p = clientToSurface(e.clientX, e.clientY);
+      let fromIds = [node.id];
+      if (selectedNodeIds.has(node.id) && selectedNodeIds.size > 1) {
+        fromIds = [...selectedNodeIds].filter((id) => {
+          const n = findNode(id);
+          return n && isLinkable(n);
+        });
+        if (!fromIds.includes(node.id)) fromIds.unshift(node.id);
+      }
+      const previewDefaults = currentMode() === 'normal' ? readEdgeDefaults() : {};
+      drag = {
+        mode: 'edge-create',
+        fromId: node.id,
+        fromIds: fromIds,
+        previewCurve: edgeCurveType(previewDefaults),
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        currentX: p.x,
+        currentY: p.y,
+        moved: false,
+      };
+      ensurePreviewPath();
+      updatePreviewPath();
+    }
+
+    function startFrameSelect(e) {
+      hideFrameActionButton();
+      hideTemplateSaveButton();
+      const p = clientToSurface(e.clientX, e.clientY);
+      drag = {
+        mode: 'frame-select',
+        forTemplate: drawTool === 'lasso',   // 套索发起的框选：松手后浮「保存到模板？」并切回选择
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        startX: p.x,
+        startY: p.y,
+        currentX: p.x,
+        currentY: p.y,
+        moved: false,
+        additive: isSelectionToggleEvent(e),
+        baselineNodes: new Set(selectedNodeIds),
+        baselineEdges: new Set(selectedEdgeIds),
+      };
+      // 框选矩形元素在第一次真实移动时才创建，避免单击残影
+    }
+
+    // Z 轮：空格 + 拖动 → 平移画布（不缓动，要跟手）
+    function startPan(e) {
+      drag = {
+        mode: 'pan',
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        startPanX: targetPanX,
+        startPanY: targetPanY,
+        velX: null, velY: null,                 // 平移测速（松手惯性用）
+        lastMoveX: e.clientX, lastMoveY: e.clientY, lastMoveT: performance.now(),
+      };
+      spaceUsedForPan = true;   // W 轮：标记本次空格已用于平移 → 松开时不触发定位
+      viewport.classList.add('panning');
+    }
+
+    function startInkStroke(e) {
+      if (!inkLayer) return;
+      const p = clientToSurface(e.clientX, e.clientY);
+      const d = readToolDefaults('pen');
+      const pointerType = inkPointerType(e);
+      // 压感只看「是不是真手写设备」（笔/触摸），不再用落笔第一个点的压力值一票否决。
+      // 首点压力常是 0（轻搭、力度没就绪）或 1（重戳饱和），过去这会让整笔退成等宽粗线、时灵时不灵；
+      // 0/1 交给逐点 pointerPressure 归一（0→中性 0.5、>1 截到 1）。鼠标 pointerType==='mouse' 仍走等宽。
+      const hasRealPressure = (pointerType === 'pen' || pointerType === 'touch')
+        && typeof e.pressure === 'number';
+      const supportsVariableWidth = !d.hl;
+      const usePressure = supportsVariableWidth && d.pressure && penPressureOn() && hasRealPressure;
+      const useCalligraphy = supportsVariableWidth && d.calligraphy;   // 书法笔锋：方向定粗细，任何设备可用；倾斜检测到再叠加
+      if (usePressure) {
+        p.p = pointerPressure(e);
+      }
+      if (useCalligraphy) {
+        const t0 = inkPointTilt(e);
+        if (t0 > 0) p.tilt = t0;
+      }
+      const stroke = {
+        id: newInkId(),
+        points: [p],
+        color: d.color,
+        width: d.width,
+        opacity: d.opacity,
+        smoothing: d.smoothing,
+        stabilizer: d.stabilizer,
+      };
+      if (d.hl) stroke.hl = true;
+      if (usePressure) {
+        stroke.pressure = true;                  // 压感笔画：变宽填充轮廓
+        stroke.pressureVersion = 2;              // 只让新版显式压感进填充路径，旧坏数据按普通线重绘
+        if (d.pressureCurve && d.pressureCurve !== 'normal') stroke.pressureCurve = d.pressureCurve;  // 缺省线性不写盘
+      }
+      else if (supportsVariableWidth && d.taper && !useCalligraphy) stroke.taper = true;     // 否则沿用「笔锋渐细」设置
+      if (useCalligraphy) {
+        stroke.calligraphy = true;
+        stroke.nibAngle = d.nibAngle;            // 书法笔锋 + 笔尖角度（可叠加压感曲线）
+      }
+      const path = appendInkStroke(stroke);
+      drag = {
+        mode: 'ink-stroke',
+        stroke: stroke,
+        path: path,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        moved: false,
+        stabilizer: d.stabilizer,
+        lastInkPoint: p,
+        lastInkTime: Number.isFinite(e.timeStamp) ? e.timeStamp : performance.now(),
+        lastInkPressure: p.p,
+      };
+    }
+
+    function eraseAtClient(clientX, clientY) {
+      const ink = ensureInkData();
+      const p = clientToSurface(clientX, clientY);
+      const threshold = Math.max(8, 14 / curScale);
+      const beforeStrokes = ink.strokes.length;
+      const beforeArrows = ink.arrows.length;
+      ink.strokes = ink.strokes.filter((stroke) => !strokeHit(stroke, p, threshold));
+      ink.arrows = ink.arrows.filter((arrow) => !arrowHit(arrow, p, threshold));
+      if (ink.strokes.length !== beforeStrokes || ink.arrows.length !== beforeArrows) {
+        eraserChanged = true;
+        renderInk();
+        notify();
+      }
+    }
+
+    // 局部擦圈半径：屏幕像素固定 → 除以缩放得画布坐标半径（屏幕上看着恒定）
+    function eraserRadiusSurface() {
+      return ERASER_AREA_RADIUS_PX / Math.max(0.25, curScale);
+    }
+    // 外框快速排除：橡皮圈离这一笔的包围盒太远就跳过，省得逐点算
+    function strokeBBoxNear(stroke, p, r) {
+      const pts = stroke.points || [];
+      if (!pts.length) return false;
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (let i = 0; i < pts.length; i++) {
+        const pt = pts[i];
+        if (pt.x < minX) minX = pt.x; if (pt.x > maxX) maxX = pt.x;
+        if (pt.y < minY) minY = pt.y; if (pt.y > maxY) maxY = pt.y;
+      }
+      const pad = r + (stroke.width || 3);
+      return p.x >= minX - pad && p.x <= maxX + pad && p.y >= minY - pad && p.y <= maxY + pad;
+    }
+    // 由原笔画 + 一截存活的点复制出新碎片（颜色/粗细/压感/压感曲线/每点压力全继承，新 id）
+    function makeStrokeFragment(stroke, runPoints) {
+      const frag = Object.assign({}, stroke);
+      frag.id = newInkId();
+      frag.points = runPoints.map(clonePoint);
+      return frag;
+    }
+    // 把一笔按橡皮圈切开：返回存活碎片数组。整笔没碰到→[stroke]（原对象，便于上层跳过）；整笔擦光→[]
+    function splitStrokeByEraser(stroke, p, r) {
+      const pts = stroke.points || [];
+      if (!pts.length) return [stroke];
+      const r2 = r * r;
+      let anyHit = false;
+      const keep = new Array(pts.length);
+      for (let i = 0; i < pts.length; i++) {
+        const dx = pts[i].x - p.x, dy = pts[i].y - p.y;
+        const survive = (dx * dx + dy * dy) > r2;
+        keep[i] = survive;
+        if (!survive) anyHit = true;
+      }
+      if (!anyHit) return [stroke];
+      const runs = [];
+      let run = [];
+      for (let i = 0; i < pts.length; i++) {
+        if (keep[i]) run.push(pts[i]);
+        else if (run.length) { runs.push(run); run = []; }
+      }
+      if (run.length) runs.push(run);
+      const out = [];
+      for (let i = 0; i < runs.length; i++) {
+        if (runs[i].length >= ERASER_MIN_FRAG_POINTS) out.push(makeStrokeFragment(stroke, runs[i]));
+      }
+      return out;
+    }
+    // 局部擦：只挖掉橡皮圈内的一段，其余断成独立碎片保留。箭头无法切段 → 仍按整条擦（已与用户确认）。
+    function eraseAreaAtClient(clientX, clientY) {
+      const ink = ensureInkData();
+      const p = clientToSurface(clientX, clientY);
+      const r = eraserRadiusSurface();
+      let changed = false;
+      const next = [];
+      for (let i = 0; i < ink.strokes.length; i++) {
+        const stroke = ink.strokes[i];
+        if (!strokeBBoxNear(stroke, p, r)) { next.push(stroke); continue; }
+        const frags = splitStrokeByEraser(stroke, p, r);
+        if (frags.length === 1 && frags[0] === stroke) { next.push(stroke); continue; }
+        changed = true;
+        for (let j = 0; j < frags.length; j++) next.push(frags[j]);
+      }
+      if (changed) ink.strokes = next;
+      const beforeArrows = ink.arrows.length;
+      ink.arrows = ink.arrows.filter((arrow) => !arrowHit(arrow, p, r));
+      if (ink.arrows.length !== beforeArrows) changed = true;
+      if (changed) {
+        eraserChanged = true;
+        renderInk();
+        notify();
+      }
+    }
+    // 按当前橡皮模式分发
+    function eraseAtCurrent(clientX, clientY) {
+      if (eraserMode === 'area') eraseAreaAtClient(clientX, clientY);
+      else eraseAtClient(clientX, clientY);
+    }
+    // 局部擦时给画布套一个圆圈光标（屏幕像素固定，正好等于擦除圈）；其余情况清掉内联光标交回 CSS
+    function updateEraserCursor() {
+      if (!viewport) return;
+      if (drawTool === 'eraser' && eraserMode === 'area') {
+        const d = ERASER_AREA_RADIUS_PX * 2;
+        const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="' + d + '" height="' + d + '">'
+          + '<circle cx="' + ERASER_AREA_RADIUS_PX + '" cy="' + ERASER_AREA_RADIUS_PX + '" r="' + (ERASER_AREA_RADIUS_PX - 1)
+          + '" fill="rgba(0,0,0,0.05)" stroke="rgba(0,0,0,0.55)" stroke-width="1"/></svg>';
+        viewport.style.cursor = 'url("data:image/svg+xml,' + encodeURIComponent(svg) + '") '
+          + ERASER_AREA_RADIUS_PX + ' ' + ERASER_AREA_RADIUS_PX + ', crosshair';
+      } else {
+        viewport.style.cursor = '';
+      }
+    }
+
+    function startInkEraser(e) {
+      eraserChanged = false;
+      drag = {
+        mode: 'ink-erase',
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        moved: false,
+      };
+      eraseAtCurrent(e.clientX, e.clientY);
+    }
+
+    function arrowControl(start, end, bendSign, bendFactor) {
+      const mid = { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 };
+      const dx = end.x - start.x;
+      const dy = end.y - start.y;
+      const len = Math.max(1, Math.hypot(dx, dy));
+      const factor = Number.isFinite(bendFactor) ? bendFactor : 0.18;
+      const bend = Math.min(160, len * factor);
+      const sign = bendSign === -1 ? -1 : 1;
+      return { x: mid.x - dy / len * bend * sign, y: mid.y + dx / len * bend * sign };
+    }
+
+    function startFreeArrow(e, bendSign) {
+      if (!inkLayer) return;
+      const p = clientToSurface(e.clientX, e.clientY);
+      const d = readToolDefaults('arrow');
+      const arrow = {
+        id: newInkId(),
+        start: p,
+        end: p,
+        control: arrowControl(p, p, bendSign, d.bend),
+        color: d.color,
+        width: d.width,
+        opacity: 1,
+      };
+      const path = appendFreeArrow(arrow);
+      drag = {
+        mode: 'free-arrow',
+        arrow: arrow,
+        path: path,
+        bendSign: bendSign === -1 ? -1 : 1,
+        bendFactor: d.bend,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        moved: false,
+      };
+    }
+
+    // 直线箭头：以直线创建（无拐点）；进入编辑模式后可加无限转折点
+    function startPolyArrowCreate(e) {
+      if (!inkLayer) return;
+      ensureInkDefs();
+      const p = clientToSurface(e.clientX, e.clientY);
+      const d = readToolDefaults('arrow-line');
+      const arrow = {
+        id: newInkId(),
+        kind: 'poly',
+        start: { x: p.x, y: p.y },
+        end: { x: p.x, y: p.y },
+        waypoints: [],
+        color: d.color,
+        width: d.width,
+        opacity: 1,
+        curve: d.curve,
+        seed: Math.round(Math.random() * 100000) / 100,
+      };
+      // 创建期间只挂可见路径，不挂命中条（命中条等提交后由 renderInk 统一生成，取消时无残留）
+      const path = document.createElementNS(SVG_NS, 'path');
+      path.setAttribute('class', 'canvas-free-arrow canvas-free-arrow-poly');
+      path.setAttribute('marker-end', 'url(#ink-arrow-marker)');
+      path.style.stroke = arrow.color;
+      path.style.strokeWidth = arrow.width;
+      path.setAttribute('d', arrowPath(arrow));
+      inkLayer.appendChild(path);
+      drag = {
+        mode: 'poly-arrow-create',
+        arrow: arrow,
+        path: path,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        moved: false,
+      };
+    }
+
+    // ── 直线箭头：选中 / 拐点（编辑模式，复用连线 waypoint 思路）──────────
+    function findArrow(id) {
+      const arr = data.ink && Array.isArray(data.ink.arrows) ? data.ink.arrows : [];
+      for (let i = 0; i < arr.length; i++) if (arr[i].id === id) return arr[i];
+      return null;
+    }
+    function clearArrowHandles() {
+      arrowHandleEls.forEach((el) => el.remove());
+      arrowHandleEls = [];
+    }
+    function renderArrowHandles() {
+      clearArrowHandles();
+      if (!inkLayer || currentMode() === 'decor' || !selectedArrowId) return;
+      const id = selectedArrowId;
+      const arrow = findArrow(id);
+      if (!arrow) return;
+      // 端点手柄（可拖动整条箭头的两端）。注意：闭包只捕获 id + 索引，操作时用 findArrow 取活体——
+      // ensureInkData 每次都会重克隆 data.ink，直接捕获 arrow 对象会变陈旧（删拐点曾因此失效）
+      [['start', arrow.start], ['end', arrow.end]].forEach((pair) => {
+        const pt = pair[1];
+        const c = document.createElementNS(SVG_NS, 'circle');
+        c.setAttribute('class', 'arrow-endpoint');
+        c.setAttribute('cx', pt.x);
+        c.setAttribute('cy', pt.y);
+        c.setAttribute('r', 5);
+        c.addEventListener('mousedown', (e) => startArrowEndpointDrag(id, pair[0], e));
+        inkLayer.appendChild(c);
+        arrowHandleEls.push(c);
+      });
+      // 拐点手柄（复用连线的 .edge-waypoint 外观）
+      (arrow.waypoints || []).forEach((w, i) => {
+        const c = document.createElementNS(SVG_NS, 'circle');
+        c.setAttribute('class', 'edge-waypoint');
+        c.setAttribute('cx', w.x);
+        c.setAttribute('cy', w.y);
+        c.setAttribute('r', 5);
+        c.addEventListener('mousedown', (e) => startArrowWaypointDrag(id, i, e));
+        c.addEventListener('dblclick', (e) => { e.stopPropagation(); deleteArrowWaypoint(id, i); });
+        inkLayer.appendChild(c);
+        arrowHandleEls.push(c);
+      });
+    }
+    function applyArrowSelection() {
+      if (!inkLayer) return;
+      Array.prototype.forEach.call(inkLayer.querySelectorAll('.canvas-free-arrow'), (el) => {
+        el.classList.toggle('selected', !!selectedArrowId && el.dataset.id === selectedArrowId);
+      });
+      renderArrowHandles();
+      document.dispatchEvent(new CustomEvent('editor:selectionchange', {
+        detail: {
+          nodes: selectedNodeIds.size,
+          contentNodes: [...selectedNodeIds].filter((nodeId) => !isDecorationNode(findNode(nodeId))).length,
+          decorNodes: [...selectedNodeIds].filter((nodeId) => isDecorationNode(findNode(nodeId))).length,
+          edges: selectedEdgeIds.size,
+          arrow: !!selectedArrowId
+        }
+      }));
+    }
+    function selectPolyArrow(id) {
+      if (selectedNodeIds.size || selectedEdgeIds.size) {
+        selectedNodeIds.clear();
+        selectedEdgeIds.clear();
+        applySelection();
+      }
+      selectedArrowId = id;
+      applyArrowSelection();
+    }
+    function clearArrowSelection() {
+      if (!selectedArrowId) return;
+      selectedArrowId = null;
+      applyArrowSelection();
+    }
+    // 实时更新一条折线箭头的可见路径 + 命中条 + 手柄（拖拽时用，避免整层重建）
+    function updatePolyArrow(arrow) {
+      if (!inkLayer) return;
+      const d = arrowPath(arrow);
+      Array.prototype.forEach.call(
+        inkLayer.querySelectorAll('.canvas-free-arrow, .canvas-free-arrow-hit'),
+        (el) => { if (el.dataset.id === arrow.id) el.setAttribute('d', d); }
+      );
+      renderArrowHandles();
+    }
+    function onPolyArrowMouseDown(id, e) {
+      if (currentMode() === 'decor') return;
+      if (drawTool !== 'select') return;      // 左侧绘图工具激活时让位给创建，不抢选中
+      if (e.button !== 0) return;
+      e.stopPropagation();
+      e.preventDefault();
+      if (selectedArrowId !== id) selectPolyArrow(id);
+      const arrow = findArrow(id);
+      if (!arrow) return;
+      const p = clientToSurface(e.clientX, e.clientY);
+      const pts = polyArrowPoints(arrow);
+      // 拖线身 → 在最近段插入新拐点（pts[0]=起点，段号即 waypoints 插入位）
+      drag = {
+        mode: 'arrow-waypoint',
+        arrowId: id,
+        wpIndex: null,
+        segIndex: nearestSegment(pts, p.x, p.y),
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        moved: false,
+      };
+    }
+    function startArrowWaypointDrag(id, index, e) {
+      if (e.button !== 0) return;
+      e.stopPropagation();
+      if (selectedArrowId !== id) selectPolyArrow(id);
+      drag = {
+        mode: 'arrow-waypoint',
+        arrowId: id,
+        wpIndex: index,
+        segIndex: index,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        moved: false,
+      };
+    }
+    function startArrowEndpointDrag(id, which, e) {
+      if (e.button !== 0) return;
+      e.stopPropagation();
+      if (selectedArrowId !== id) selectPolyArrow(id);
+      drag = {
+        mode: 'arrow-endpoint',
+        arrowId: id,
+        end: which,                 // 'start' | 'end'
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        moved: false,
+      };
+    }
+    function deleteArrowWaypoint(id, index) {
+      const arrow = findArrow(id);   // 取活体；不可用渲染时捕获的旧对象（ensureInkData 已重克隆）
+      if (!arrow || !Array.isArray(arrow.waypoints)) return;
+      arrow.waypoints.splice(index, 1);
+      pushHistory();
+      renderInk();                   // 整层从活体重建，彻底消除 DOM/数据不一致
+      notify();
+    }
+    function deleteSelectedArrow() {
+      if (!selectedArrowId) return;
+      const ink = ensureInkData();
+      ink.arrows = ink.arrows.filter((a) => a.id !== selectedArrowId);
+      selectedArrowId = null;
+      pushHistory();
+      renderInk();
+      notify();
+    }
+
+    function createHandTextAt(e) {
+      const p = clientToSurface(e.clientX, e.clientY);
+      const node = createNode(p.x - NODE_DEFAULT_HALF_W, p.y - NODE_DEFAULT_HALF_H, '', {
+        startEditing: true,
+        handText: true,
+      });
+      selectNodes([node.id], false);
+    }
+
+    function addTextBoxAt(point, text, options) {
+      const opts = options || {};
+      const label = String(text == null ? '' : text);
+      const wide = label.length > 3;
+      const node = {
+        id: newNodeId(),
+        kind: 'textBox',
+        text: label,
+        width: opts.width || (wide ? 150 : 118),
+        height: opts.height || 54,
+        fontSize: opts.fontSize || (wide ? 24 : 34),
+        fontPreset: 'hand',
+        color: opts.color || '#1a1a1a',
+        opacity: opts.opacity == null ? 1 : opts.opacity,
+        fontWeight: Math.max(400, Math.min(800, Number(opts.fontWeight) || 400)),
+        textAlign: opts.textAlign === 'left' || opts.textAlign === 'right' ? opts.textAlign : 'center',
+        rotation: 0,
+        layer: 'front',
+      };
+      const p = point || viewportCenterInSurface();
+      node.x = Math.round(p.x - node.width / 2);
+      node.y = Math.round(p.y - node.height / 2);
+      prepareNewDecorationNode(node);
+      data.nodes.push(node);
+      indexNodeData(node);
+      const el = createNodeEl(node);
+      surface.appendChild(el);
+      nodeMap.set(node.id, el);
+      if (nodeSizeObserver) nodeSizeObserver.observe(el);
+      el.classList.add('decor-inserted');
+      el.addEventListener('animationend', () => el.classList.remove('decor-inserted'), { once: true });
+      selectNodes([node.id], false);
+      applySelection();
+      lastCreatedNodeId = node.id;
+      redrawMinimap();
+      if (opts.startEditing) {
+        enterTextBoxEdit(node, true);
+      } else {
+        pushHistory();
+        notify();
+      }
+      return node;
+    }
+
+    function createTextBoxAt(e) {
+      const p = clientToSurface(e.clientX, e.clientY);
+      const d = readToolDefaults('text');
+      addTextBoxAt(p, '', {
+        startEditing: true,
+        fontSize: d.fontSize,
+        color: d.color,
+        opacity: d.opacity,
+        fontWeight: d.fontWeight,
+        textAlign: d.textAlign,
+      });
+    }
+
+    function handleDrawToolMouseDown(e) {
+      if (drawTool === 'select') return false;
+      if (drawTool === 'lasso') return false;   // 套索当成选择类工具：不起笔、不抢指针，交给框选链路
+      if (e.button !== 0) return false;
+      if (drawToolbar && (e.target === drawToolbar || drawToolbar.contains(e.target))) return false;
+      if (e.target.closest && e.target.closest('.tool-config-pop, .search-bar, .viewport-hud-bl, .help-fab, .settings-fab, .settings-pop')) {
+        return false;
+      }
+      // 文本工具下旧文本框的命中优先级高于空白新建。已在编辑的同一文本框
+      // 必须完全放行，让浏览器处理光标/选区；删除按钮和尺寸手柄也不抢。
+      let hitTextBox = null;
+      if (drawTool === 'text' && e.target.closest
+          && !e.target.closest('.node-remove, .decor-resize-handle')) {
+        const hitEl = e.target.closest('.node[data-kind="textBox"]');
+        if (hitEl && surface.contains(hitEl)) hitTextBox = findNode(hitEl.dataset.id);
+      }
+      if (hitTextBox && editingTextBoxId === hitTextBox.id) return false;
+      // 绘图统一走 Pointer Events（笔/数位板/触摸/鼠标都经 pointerdown 起笔，见 onViewportPointerDownCapture）。
+      // 合成鼠标 mousedown 只吞掉（防止退回框选 / 平移），不重复起笔。无 Pointer Events 支持时退回老的鼠标绘图。
+      if (e.type === 'mousedown' && window.PointerEvent) {
+        e.preventDefault();
+        e.stopPropagation();
+        return true;
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      if (hitTextBox) {
+        enterTextBoxEdit(hitTextBox, false, { x: e.clientX, y: e.clientY });
+        scheduleTextDock();
+        return true;
+      }
+      // 连续文本工具下，点空白处退出就地编辑的这次 pointerdown 只负责提交。
+      // 不能再把同一次按下继续解释为“新建文本框”；下一次点击才是新建意图。
+      const wasEditingTextBox = editingTextBoxId !== null;
+      if (editingNodeId !== null) commitNodeEdit();
+      if (editingEdgeId !== null) commitEdgeEdit();
+      if (editingTextBoxId !== null) commitTextBoxEdit();
+      clearSelection();
+      if (drawTool === 'text' && wasEditingTextBox) {
+        scheduleTextDock();
+        return true;
+      }
+      if (drawTool === 'pen') startInkStroke(e);
+      else if (drawTool === 'eraser') startInkEraser(e);
+      else if (drawTool === 'text') createTextBoxAt(e);
+      else if (drawTool === 'arrow') startFreeArrow(e, 1);
+      else if (drawTool === 'arrow-cw') startFreeArrow(e, -1);
+      else if (drawTool === 'arrow-line') startPolyArrowCreate(e);
+      else {
+        const shapeType = sketchShapeTypeFromTool(drawTool);
+        if (shapeType) startSketchShapeCreate(e, shapeType);
+      }
+      return true;
+    }
+
+    function ensurePreviewPath() {
+      const count = drag && drag.mode === 'edge-create'
+        ? Math.max(1, (drag.fromIds || [drag.fromId]).length)
+        : 1;
+      while (previewPaths.length < count) {
+        const path = document.createElementNS(SVG_NS, 'path');
+        path.setAttribute('class', 'canvas-edge-preview');
+        edgesLayer.appendChild(path);
+        previewPaths.push(path);
+      }
+      while (previewPaths.length > count) {
+        const path = previewPaths.pop();
+        if (path) path.remove();
+      }
+      previewPath = previewPaths[0] || null;
+    }
+
+    function clearPreviewPath() {
+      previewPaths.forEach((path) => path.remove());
+      previewPaths = [];
+      previewPath = null;
+    }
+
+    function updatePreviewPath() {
+      if (!drag || drag.mode !== 'edge-create') return;
+      ensurePreviewPath();
+      const ids = drag.fromIds || [drag.fromId];
+      ids.forEach((id, index) => {
+        const src = findNode(id);
+        const path = previewPaths[index];
+        if (!src || !path) return;
+        const targetRect = { x: drag.currentX - 0.5, y: drag.currentY - 0.5, w: 1, h: 1 };
+        const previewEdge = { curve: drag.previewCurve || 'bezier' };
+        path.setAttribute('d', edgeGeom(previewEdge, nodeRect(src), targetRect).d);
+      });
+    }
+
+    function ensureFrameEl() {
+      if (frameEl) return;
+      frameEl = document.createElement('div');
+      frameEl.className = 'canvas-frame-select';
+      surface.appendChild(frameEl);
+    }
+
+    function clearFrameEl() {
+      if (frameEl) {
+        frameEl.remove();
+        frameEl = null;
+      }
+    }
+
+    function updateFrameEl() {
+      if (!frameEl || !drag || (drag.mode !== 'frame-select' && drag.mode !== 'color-block-create')) return;
+      const x = Math.min(drag.startX, drag.currentX);
+      const y = Math.min(drag.startY, drag.currentY);
+      const w = Math.abs(drag.currentX - drag.startX);
+      const h = Math.abs(drag.currentY - drag.startY);
+      frameEl.classList.toggle('solid-block-preview', drag.mode === 'color-block-create');
+      frameEl.style.left = x + 'px';
+      frameEl.style.top = y + 'px';
+      frameEl.style.width = w + 'px';
+      frameEl.style.height = h + 'px';
+    }
+
+    function dragRectFromState(d) {
+      return {
+        x: Math.min(d.startX, d.currentX),
+        y: Math.min(d.startY, d.currentY),
+        w: Math.abs(d.currentX - d.startX),
+        h: Math.abs(d.currentY - d.startY),
+      };
+    }
+
+    function hideFrameActionButton() {
+      if (frameActionBtn) frameActionBtn.hidden = true;
+      if (frameIndexBtn) {
+        frameIndexBtn.hidden = true;
+        frameIndexBtn.classList.remove('visible', 'fading');
+      }
+      if (frameIndexHideTimer) { clearTimeout(frameIndexHideTimer); frameIndexHideTimer = null; }
+    }
+
+    function showFrameActionButton(rect, clientPoint, memberIds) {
+      const members = (memberIds || []).slice();
+      if (!frameActionBtn) {
+        frameActionBtn = document.createElement('button');
+        frameActionBtn.type = 'button';
+        frameActionBtn.className = 'frame-action-btn';
+        document.body.appendChild(frameActionBtn);
+      }
+      const btnLabel = members.length ? '+ 分组' : '+ 盒子';
+      frameActionBtn.textContent = global.RelatumI18n ? global.RelatumI18n.t(btnLabel) : btnLabel;
+      const p = clientPoint || surfaceToClient(rect.x + rect.w, rect.y);
+      frameActionBtn.style.left = Math.min(window.innerWidth - 92, Math.max(8, p.x + 8)) + 'px';
+      frameActionBtn.style.top = Math.min(window.innerHeight - 42, Math.max(8, p.y + 8)) + 'px';
+      frameActionBtn.hidden = false;
+      const hintText = members.length
+        ? '建立分组后可命名、折叠并整体移动'
+        : '可以把空白选区变成一个盒子';
+      showOnboardingHint('box', global.RelatumI18n ? global.RelatumI18n.t(hintText) : hintText, 4800);
+      frameActionBtn.onclick = () => {
+        hideFrameActionButton();
+        createGroupBoxFromRect(rect, members);
+      };
+    }
+
+    // 框选到的「可进目录」节点 id：排除图案/图片（isIndexableNode），也排除已是索引节点的，
+    // 避免一键生成时把别的索引当条目连进来。
+    function indexableSelectionIds() {
+      const out = [];
+      selectedNodeIds.forEach(function (id) {
+        const n = findNode(id);
+        if (!n || !isIndexableNode(n) || isIndexNode(n)) return;
+        out.push(id);
+      });
+      return out;
+    }
+
+    // 框选生成索引：默认关闭，齿轮里打开后才浮按钮（与 editor.js 同名键）
+    function genIndexEnabled() {
+      try { return localStorage.getItem('canvas:genIndexEnabled') === '1'; } catch (e) { return false; }
+    }
+
+    // 框选创建盒子/分组：默认开启，齿轮里关闭后不再浮「+ 盒子」「+ 分组」按钮（与 editor.js 同名键）
+    function boxCreateEnabled() {
+      try { return localStorage.getItem('canvas:boxCreateEnabled') !== '0'; } catch (e) { return true; }
+    }
+
+    // 没点就慢慢淡出，不打扰（区别于 hideFrameActionButton 的即时收起）
+    function fadeOutIndexButton() {
+      if (!frameIndexBtn || frameIndexBtn.hidden) return;
+      frameIndexBtn.classList.add('fading');
+      frameIndexBtn.classList.remove('visible');
+      if (frameIndexHideTimer) clearTimeout(frameIndexHideTimer);
+      frameIndexHideTimer = setTimeout(function () {
+        if (frameIndexBtn) { frameIndexBtn.hidden = true; frameIndexBtn.classList.remove('fading'); }
+        frameIndexHideTimer = null;
+      }, 820);
+    }
+
+    function showIndexActionButton(rect, clientPoint) {
+      if (!frameIndexBtn) {
+        frameIndexBtn = document.createElement('button');
+        frameIndexBtn.type = 'button';
+        frameIndexBtn.className = 'frame-action-btn frame-index-btn';
+        frameIndexBtn.title = '生成索引';
+        frameIndexBtn.setAttribute('aria-label', '生成索引');
+        // 纯图标：一枚「目录/列表」线条图标，无文字
+        frameIndexBtn.innerHTML = '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" '
+          + 'stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M3 4h10M3 8h10M3 12h6"/></svg>';
+        document.body.appendChild(frameIndexBtn);
+      }
+      const p = clientPoint || surfaceToClient(rect.x + rect.w, rect.y);
+      frameIndexBtn.style.left = Math.min(window.innerWidth - 44, Math.max(8, p.x + 10)) + 'px';
+      frameIndexBtn.style.top = Math.min(window.innerHeight - 44, Math.max(8, p.y + 10)) + 'px';
+      frameIndexBtn.hidden = false;
+      frameIndexBtn.classList.remove('fading');
+      requestAnimationFrame(function () { if (frameIndexBtn) frameIndexBtn.classList.add('visible'); });
+      const ids = indexableSelectionIds();   // 点按时即固定选区，避免后续选择变化
+      frameIndexBtn.onclick = function () {
+        hideFrameActionButton();
+        createIndexFromNodes(ids);
+      };
+      // 没点就慢慢淡出：先停留一会儿再启动慢淡出
+      if (frameIndexHideTimer) clearTimeout(frameIndexHideTimer);
+      frameIndexHideTimer = setTimeout(fadeOutIndexButton, 2600);
+    }
+
+    // 一键生成索引：在选区左侧建一张索引节点，连向每个选中节点形成一级目录。
+    // arrow:'end' 让 buildIndexTree 认作「索引→条目」方向且不回头；节点间若本就相连，
+    // 会沿用既有连线自然落成下级（与索引节点既有行为一致）。
+    function createIndexFromNodes(ids) {
+      const kids = (ids || []).map(findNode).filter(function (n) {
+        return n && isIndexableNode(n) && !isIndexNode(n);
+      });
+      if (!kids.length) return;
+      let minX = Infinity, minY = Infinity, maxY = -Infinity;
+      kids.forEach(function (n) {
+        const el = nodeMap.get(n.id);
+        const h = el ? el.offsetHeight : 40;
+        minX = Math.min(minX, Number(n.x) || 0);
+        minY = Math.min(minY, Number(n.y) || 0);
+        maxY = Math.max(maxY, (Number(n.y) || 0) + h);
+      });
+      const INDEX_W = 230, GAP = 56, EST_H = 92;
+      const idxNode = {
+        id: newNodeId(),
+        kind: 'index',
+        x: minX - INDEX_W - GAP,
+        y: (minY + maxY) / 2 - EST_H / 2,
+        text: '',
+      };
+      data.nodes.push(idxNode);
+      indexNodeData(idxNode);
+      const el = createNodeEl(idxNode);
+      surface.appendChild(el);
+      nodeMap.set(idxNode.id, el);
+      spawnNodeEl(el);
+      kids.forEach(function (kid) {
+        const edge = { id: newEdgeId(), from: idxNode.id, to: kid.id, text: '', arrow: 'end', lineStyle: 'dotted' };
+        data.edges.push(edge);
+        const refs = createEdgeEls(edge);
+        edgeMap.set(edge.id, refs);
+        updateEdgePath(edge);
+      });
+      selectNodes([idxNode.id], false);
+      centerOnNode(idxNode.id);
+      pushHistory();
+      notify();
+      showOnboardingHint('genindexDone', '按 <kbd>F</kbd> 看目录；双击「索引」后面可以给它命名', 5200);
+    }
+
+    // ── 套索 → 保存到模板 ──────────────────────────────────────────────
+    // 纯结构模板：正文/文字框 + 三类基础装饰可复用；图片/PDF/MD 和其他历史图案不收取。
+    function isTemplateEligibleNode(n) {
+      if (!n) return false;
+      if (!isShapeNode(n)) {
+        return n.kind !== 'image' && n.kind !== 'pdf' && n.kind !== 'md';
+      }
+      return n.shapeType === 'group-box'
+        || n.shapeType === 'color-block'
+        || n.shapeType === 'dashed-box'
+        || n.shapeType === 'corner-frame'
+        || n.shapeType === 'bracket'
+        || n.shapeType === 'divider'
+        || n.shapeType === 'question'
+        || n.shapeType === 'sketch-rounded-rect'
+        || n.shapeType === 'sketch-diamond'
+        || n.shapeType === 'sketch-ellipse';
+    }
+    function templateEligibleSelectionIds() {
+      const out = [];
+      selectedNodeIds.forEach(function (id) {
+        const n = findNode(id);
+        if (isTemplateEligibleNode(n)) out.push(id);
+      });
+      return out;
+    }
+
+    function hideTemplateSaveButton() {
+      if (frameTemplateBtn) {
+        frameTemplateBtn.hidden = true;
+        frameTemplateBtn.classList.remove('visible', 'fading');
+      }
+      if (frameTemplateHideTimer) { clearTimeout(frameTemplateHideTimer); frameTemplateHideTimer = null; }
+      closeTemplateNaming();
+    }
+
+    function showTemplateSaveButton(rect, clientPoint, ids) {
+      if (!frameTemplateBtn) {
+        frameTemplateBtn = document.createElement('button');
+        frameTemplateBtn.type = 'button';
+        frameTemplateBtn.className = 'frame-action-btn frame-template-btn';
+        document.body.appendChild(frameTemplateBtn);
+      }
+      frameTemplateBtn.textContent = '保存到模板？';
+      const p = clientPoint || surfaceToClient(rect.x + rect.w, rect.y);
+      frameTemplateBtn.style.left = Math.min(window.innerWidth - 120, Math.max(8, p.x + 8)) + 'px';
+      frameTemplateBtn.style.top = Math.min(window.innerHeight - 42, Math.max(8, p.y + 8)) + 'px';
+      frameTemplateBtn.hidden = false;
+      frameTemplateBtn.classList.remove('fading');
+      requestAnimationFrame(function () { if (frameTemplateBtn) frameTemplateBtn.classList.add('visible'); });
+      const captured = (ids || []).slice();   // 点按时固定选区，避免后续选择变化
+      frameTemplateBtn.onclick = function () {
+        if (frameTemplateHideTimer) { clearTimeout(frameTemplateHideTimer); frameTemplateHideTimer = null; }
+        const at = {
+          x: parseFloat(frameTemplateBtn.style.left) || p.x,
+          y: parseFloat(frameTemplateBtn.style.top) || p.y,
+        };
+        frameTemplateBtn.hidden = true;
+        frameTemplateBtn.classList.remove('visible');
+        beginTemplateNaming(at, captured);
+      };
+      // 没点就慢慢淡出，不打扰（与「生成索引」同节奏）
+      if (frameTemplateHideTimer) clearTimeout(frameTemplateHideTimer);
+      frameTemplateHideTimer = setTimeout(function () {
+        if (!frameTemplateBtn || frameTemplateBtn.hidden) return;
+        frameTemplateBtn.classList.add('fading');
+        frameTemplateBtn.classList.remove('visible');
+        frameTemplateHideTimer = setTimeout(function () {
+          if (frameTemplateBtn) { frameTemplateBtn.hidden = true; frameTemplateBtn.classList.remove('fading'); }
+          frameTemplateHideTimer = null;
+        }, 820);
+      }, 3200);
+    }
+
+    function closeTemplateNaming() {
+      if (frameTemplateNameBox) { frameTemplateNameBox.remove(); frameTemplateNameBox = null; }
+    }
+
+    function beginTemplateNaming(at, ids) {
+      closeTemplateNaming();
+      const box = document.createElement('div');
+      box.className = 'frame-template-name';
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.value = '模板';
+      input.maxLength = 40;
+      input.setAttribute('aria-label', '模板名称');
+      const ok = document.createElement('button');
+      ok.type = 'button';
+      ok.title = '保存模板';
+      ok.setAttribute('aria-label', '保存模板');
+      ok.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.4 8.6 6.5 11.7 12.7 4.7"/></svg>';
+      box.appendChild(input);
+      box.appendChild(ok);
+      document.body.appendChild(box);
+      frameTemplateNameBox = box;
+      box.style.left = Math.min(window.innerWidth - 192, Math.max(8, (at && at.x) || 60)) + 'px';
+      box.style.top = Math.min(window.innerHeight - 52, Math.max(8, (at && at.y) || 60)) + 'px';
+      let done = false;
+      const confirm = function () {
+        if (done) return;
+        done = true;
+        const name = (input.value || '').trim() || '模板';
+        closeTemplateNaming();
+        saveSelectionAsTemplate(ids, name);
+      };
+      const cancel = function () {
+        if (done) return;
+        done = true;
+        closeTemplateNaming();
+      };
+      ok.addEventListener('mousedown', function (e) { e.preventDefault(); });   // 保住输入框焦点
+      ok.addEventListener('click', confirm);
+      input.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') { e.preventDefault(); confirm(); }
+        else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+        e.stopPropagation();   // 别让画布快捷键吞掉打字
+      });
+      input.addEventListener('blur', function () { setTimeout(cancel, 140); });  // 点 ✓ 时 confirm 先跑
+      setTimeout(function () { input.focus(); input.select(); }, 0);
+    }
+
+    function newTemplateId() {
+      return 'tpl_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 5);
+    }
+
+    // 把一组选中节点 + 两端都在内的连线，裁成「相对左上角归一化」的模板载荷（保真，保留全部样式字段）。
+    function extractTemplatePayload(ids) {
+      const picked = [];
+      (ids || []).forEach(function (id) {
+        const n = findNode(id);
+        if (isTemplateEligibleNode(n)) picked.push(n);
+      });
+      if (!picked.length) return null;
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      picked.forEach(function (n) {
+        const el = nodeMap.get(n.id);
+        const w = el ? el.offsetWidth : 160;
+        const h = el ? el.offsetHeight : 40;
+        const x = Number(n.x) || 0, y = Number(n.y) || 0;
+        minX = Math.min(minX, x); minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x + w); maxY = Math.max(maxY, y + h);
+      });
+      if (!isFinite(minX)) return null;
+      const pickedIds = new Set(picked.map(function (n) { return n.id; }));
+      const nodes = picked.map(function (n) {
+        const c = JSON.parse(JSON.stringify(n));
+        c.x = Math.round((Number(n.x) || 0) - minX);
+        c.y = Math.round((Number(n.y) || 0) - minY);
+        delete c.assetPath;   // 纯结构模板：不带任何素材引用
+        delete c.review;      // 间隔重复进度属于具体节点，不随模板复制
+        if (isTextBoxNode(c) && c.textBindTarget && !pickedIds.has(c.textBindTarget)) clearTextBinding(c);
+        return c;
+      });
+      const edges = [];
+      data.edges.forEach(function (e) {
+        if (!pickedIds.has(e.from) || !pickedIds.has(e.to)) return;   // 只收两端都在圈内的连线
+        const c = JSON.parse(JSON.stringify(e));
+        if (Array.isArray(c.waypoints)) {
+          c.waypoints = c.waypoints.map(function (p) {
+            return { x: Math.round((Number(p.x) || 0) - minX), y: Math.round((Number(p.y) || 0) - minY) };
+          });
+        }
+        edges.push(c);
+      });
+      return { nodes: nodes, edges: edges, w: Math.round(maxX - minX), h: Math.round(maxY - minY) };
+    }
+
+    function saveSelectionAsTemplate(ids, name) {
+      const payload = extractTemplatePayload(ids);
+      if (!payload) { showCanvasToast('套索里没有可保存到模板的内容'); return; }
+      const tpl = {
+        id: newTemplateId(),
+        name: name || '模板',
+        createdAt: new Date().toISOString(),
+        w: payload.w, h: payload.h,
+        nodes: payload.nodes, edges: payload.edges,
+      };
+      // 读最新模板库 → 追加 → 整库写回（与下拉/删除共用同一份磁盘数据，不留内存缓存以防失同步）
+      fetch('/api/templates', { cache: 'no-store' })
+        .then(function (r) { return r.ok ? r.json() : { templates: [] }; })
+        .catch(function () { return { templates: [] }; })
+        .then(function (lib) {
+          const list = (lib && Array.isArray(lib.templates)) ? lib.templates : [];
+          list.push(tpl);
+          return fetch('/api/templates-save', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ templates: list }),
+          });
+        })
+        .then(function (r) {
+          if (r && r.ok) {
+            showCanvasToast('已存为模板「' + tpl.name + '」 · ' + payload.nodes.length + ' 个元素');
+            // 通知顶栏「模板」按钮轻轻一跳，把目光引到模板存进去的地方（每次都触发，给到落点反馈）
+            try {
+              window.dispatchEvent(new CustomEvent('canvas:template-saved', {
+                detail: { name: tpl.name, count: payload.nodes.length },
+              }));
+            } catch (_) {}
+          } else {
+            showCanvasToast('保存模板失败了，请重试');
+          }
+        })
+        .catch(function () { showCanvasToast('保存模板失败了，请重试'); });
+    }
+
+    function nodeIdsInFrame(rect, options) {
+      const forTemplate = !!(options && options.forTemplate);
+      const out = [];
+      data.nodes.forEach((n) => {
+        if (forTemplate) {
+          if (!isTemplateEligibleNode(n)) return;
+        } else {
+          if (currentMode() === 'decor' && !isDecorationNode(n)) return;
+          if (currentMode() !== 'decor' && isShapeNode(n)) return;   // 图案仍限图案模式；图片可随框选选中
+        }
+        const el = nodeMap.get(n.id);
+        const w = el ? el.offsetWidth : 160;
+        const h = el ? el.offsetHeight : 36;
+        const overlaps = n.x < rect.x + rect.w
+          && n.x + w > rect.x
+          && n.y < rect.y + rect.h
+          && n.y + h > rect.y;
+        if (overlaps) out.push(n.id);
+      });
+      return out;
+    }
+
+    // ── 全局 mousemove / mouseup ─────────────
+    function onWindowMouseMove(e) {
+      // X 轮 fix：始终更新最后鼠标位置（N 键建节点用）
+      lastMouseClientX = e.clientX;
+      lastMouseClientY = e.clientY;
+      positionMindmapColorBrushCursor(e.clientX, e.clientY);
+
+      if (!drag) return;
+      // 指针笔画进行中：忽略并发的合成鼠标事件，只让 pointermove 驱动（防双重处理）
+      if (drag.viaPointer && e.type.indexOf('pointer') !== 0) return;
+      const dx = e.clientX - drag.startClientX;
+      const dy = e.clientY - drag.startClientY;
+      if (!drag.moved && Math.hypot(dx, dy) > DRAG_THRESHOLD) {
+        drag.moved = true;
+        stopNodeStrikeLongPressTimer();   // 拖动即放弃长按删除线
+        if (drag.fromDecorTitle) {
+          stopDecorTitleLongPressTimer();
+          if (!decorTitleLongPressTriggered) hideSelToolbar();
+        }
+      }
+
+      if (drag.mode === 'ink-stroke') {
+        appendInkPointsFromPointerEvent(e);
+      } else if (drag.mode === 'ink-erase') {
+        eraseAtCurrent(e.clientX, e.clientY);
+      } else if (drag.mode === 'free-arrow') {
+        const p = clientToSurface(e.clientX, e.clientY);
+        drag.arrow.end = p;
+        drag.arrow.control = arrowControl(drag.arrow.start, drag.arrow.end, drag.bendSign, drag.bendFactor);
+        if (drag.path) drag.path.setAttribute('d', arrowPath(drag.arrow));
+      } else if (drag.mode === 'poly-arrow-create') {
+        const p = clientToSurface(e.clientX, e.clientY);
+        drag.arrow.end = { x: p.x, y: p.y };
+        if (drag.path) drag.path.setAttribute('d', arrowPath(drag.arrow));
+      } else if (drag.mode === 'arrow-waypoint') {
+        if (!drag.moved) return;                         // 没拖过 = 纯点选，不加拐点
+        const arrow = findArrow(drag.arrowId);
+        if (!arrow) return;
+        const p = clientToSurface(e.clientX, e.clientY);
+        if (!Array.isArray(arrow.waypoints)) arrow.waypoints = [];
+        if (drag.wpIndex === null) {
+          arrow.waypoints.splice(drag.segIndex, 0, { x: p.x, y: p.y });
+          drag.wpIndex = drag.segIndex;
+        } else {
+          arrow.waypoints[drag.wpIndex] = { x: p.x, y: p.y };
+        }
+        updatePolyArrow(arrow);
+      } else if (drag.mode === 'arrow-endpoint') {
+        if (!drag.moved) return;
+        const arrow = findArrow(drag.arrowId);
+        if (!arrow) return;
+        const p = clientToSurface(e.clientX, e.clientY);
+        if (drag.end === 'start') arrow.start = { x: p.x, y: p.y };
+        else arrow.end = { x: p.x, y: p.y };
+        updatePolyArrow(arrow);
+      } else if (drag.mode === 'sketch-shape-create') {
+        if (!drag.moved) return;
+        const dragEl = nodeMap.get(drag.nodeId);
+        if (dragEl) dragEl.classList.remove('decor-pending');
+        updateSketchShapeDrag(e.clientX, e.clientY);
+      } else if (drag.mode === 'decor-text-preset-create') {
+        if (!drag.moved) return;
+        const dragEl = nodeMap.get(drag.nodeId);
+        if (dragEl) dragEl.classList.remove('decor-pending');
+        updateDecorTextPresetDrag(e.clientX, e.clientY);
+      } else if (drag.mode === 'node') {
+        drag.latestClientX = e.clientX;
+        drag.latestClientY = e.clientY;
+        if (!drag.moved) return;
+        if (dragRaf == null) {
+          dragRaf = requestAnimationFrame(() => {
+            dragRaf = null;
+            if (!drag || drag.mode !== 'node') return;
+            const liveCoords = nodeDragLiveCoords(drag, drag.latestClientX, drag.latestClientY);
+            applyTextBoxSoftSnap(drag, liveCoords);
+            syncBoundTextBoxes(new Set(liveCoords.keys()), liveCoords);
+            liveCoords.forEach((pos, id) => {
+              const elN = nodeMap.get(id);
+              if (elN) applyTransform(elN, pos.x, pos.y);
+            });
+            (drag.affectedEdges || data.edges).forEach((edge) => {
+              if (liveCoords.has(edge.from) || liveCoords.has(edge.to)) {
+                updateEdgePathLive(edge, liveCoords);
+              }
+            });
+            updateMinimapDraggedNodes(liveCoords);   // 阶段 4：拖动节点时小地图增量跟随
+            if (drag.mindmap && drag.mindmap.valid && !drag.mindmap.isRoot) {
+              const reparentCandidate = mindmapReparentCandidate(
+                drag.mindmap,
+                drag.latestClientX,
+                drag.latestClientY,
+              );
+              if (reparentCandidate) renderMindmapReparentCandidate(reparentCandidate);
+              else {
+                renderMindmapDropCandidate(mindmapDropCandidate(
+                  drag.mindmap,
+                  clientToSurface(drag.latestClientX, drag.latestClientY),
+                ));
+              }
+            }
+          });
+        }
+      } else if (drag.mode === 'decor-resize') {
+        drag.latestClientX = e.clientX;
+        drag.latestClientY = e.clientY;
+        if (!drag.moved) return;
+        if (dragRaf == null) {
+          dragRaf = requestAnimationFrame(() => {
+            dragRaf = null;
+            if (!drag || drag.mode !== 'decor-resize') return;
+            applyDecorResizeDrag(drag.latestClientX, drag.latestClientY);
+          });
+        }
+      } else if (drag.mode === 'body-resize') {
+        drag.latestClientX = e.clientX;
+        drag.latestClientY = e.clientY;
+        if (!drag.moved) return;
+        if (dragRaf == null) {
+          dragRaf = requestAnimationFrame(() => {
+            dragRaf = null;
+            if (!drag || drag.mode !== 'body-resize') return;
+            applyBodyResizeDrag(drag.latestClientX, drag.latestClientY);
+          });
+        }
+      } else if (drag.mode === 'pan') {
+        // Z 轮：平移立即跟手——直接同步 cur 和 target，不走缓动
+        const dxPan = e.clientX - drag.startClientX;
+        const dyPan = e.clientY - drag.startClientY;
+        targetPanX = drag.startPanX + dxPan;
+        targetPanY = drag.startPanY + dyPan;
+        curPanX = targetPanX;
+        curPanY = targetPanY;
+        // 平滑累计速度（px/ms），供松手延续为惯性（EMA，与 graph-view 同思路）
+        const nowP = performance.now();
+        if (drag.lastMoveT != null) {
+          const ddt = nowP - drag.lastMoveT;
+          if (ddt > 0) {
+            const ivx = (e.clientX - drag.lastMoveX) / ddt;
+            const ivy = (e.clientY - drag.lastMoveY) / ddt;
+            drag.velX = drag.velX == null ? ivx : drag.velX * 0.4 + ivx * 0.6;
+            drag.velY = drag.velY == null ? ivy : drag.velY * 0.4 + ivy * 0.6;
+          }
+        }
+        drag.lastMoveX = e.clientX; drag.lastMoveY = e.clientY; drag.lastMoveT = nowP;
+        if (animRaf != null) { cancelAnimationFrame(animRaf); animRaf = null; viewportTickTs = 0; }
+        applyViewport();
+        rememberViewport();
+      } else if (drag.mode === 'edge-create') {
+        const p = clientToSurface(e.clientX, e.clientY);
+        drag.currentX = p.x;
+        drag.currentY = p.y;
+        if (dragRaf == null) {
+          dragRaf = requestAnimationFrame(() => {
+            dragRaf = null;
+            updatePreviewPath();
+          });
+        }
+      } else if (drag.mode === 'waypoint') {
+        if (!drag.moved) return;                         // 没拖过 = 纯点选，不加拐点
+        const edge = data.edges.find((x) => x.id === drag.edgeId);
+        if (!edge) return;
+        const p = clientToSurface(e.clientX, e.clientY);
+        if (!Array.isArray(edge.waypoints)) edge.waypoints = [];
+        if (drag.wpIndex === null) {
+          // 第一次真正移动 → 在最近段插入新拐点
+          edge.waypoints.splice(drag.segIndex, 0, { x: p.x, y: p.y });
+          drag.wpIndex = drag.segIndex;
+        } else {
+          edge.waypoints[drag.wpIndex] = { x: p.x, y: p.y };
+        }
+        updateEdgePath(edge);
+        renderEdgeHandles();
+      } else if (drag.mode === 'frame-select') {
+        const p = clientToSurface(e.clientX, e.clientY);
+        drag.currentX = p.x;
+        drag.currentY = p.y;
+        if (drag.moved) ensureFrameEl();
+        if (dragRaf == null) {
+          dragRaf = requestAnimationFrame(() => {
+            dragRaf = null;
+            if (!drag || drag.mode !== 'frame-select') return;
+            updateFrameEl();
+            const rect = {
+              x: Math.min(drag.startX, drag.currentX),
+              y: Math.min(drag.startY, drag.currentY),
+              w: Math.abs(drag.currentX - drag.startX),
+              h: Math.abs(drag.currentY - drag.startY),
+            };
+            const inFrame = nodeIdsInFrame(rect, { forTemplate: drag.forTemplate });
+            selectedNodeIds.clear();
+            selectedEdgeIds.clear();
+            if (drag.additive) {
+              drag.baselineNodes.forEach((id) => selectedNodeIds.add(id));
+              drag.baselineEdges.forEach((id) => selectedEdgeIds.add(id));
+            }
+            inFrame.forEach((id) => selectedNodeIds.add(id));
+            applySelection();
+          });
+        }
+      } else if (drag.mode === 'color-block-create') {
+        const p = clientToSurface(e.clientX, e.clientY);
+        drag.currentX = p.x;
+        drag.currentY = p.y;
+        if (drag.moved) ensureFrameEl();
+        if (dragRaf == null) {
+          dragRaf = requestAnimationFrame(() => {
+            dragRaf = null;
+            if (!drag || drag.mode !== 'color-block-create') return;
+            updateFrameEl();
+          });
+        }
+      }
+    }
+
+    function onWindowMouseUp(e) {
+      stopNodeStrikeLongPressTimer();   // 松手即放弃未触发的长按删除线
+      if (!drag) return;
+      // 指针笔画进行中：忽略并发的合成鼠标 mouseup，由 pointerup 收尾（防双重处理）
+      if (drag.viaPointer && e.type.indexOf('pointer') !== 0) return;
+      if (dragRaf != null) {
+        cancelAnimationFrame(dragRaf);
+        dragRaf = null;
+      }
+
+      if (drag.mode === 'ink-stroke') {
+        appendInkPointsFromPointerEvent(e);
+        const pts = drag.stroke.points || [];
+        if (pts.length >= 2 && drag.moved) {
+          ensureInkData().strokes.push(drag.stroke);
+          pushHistory();
+          renderInk();
+          notify();
+        } else if (drag.path) {
+          drag.path.remove();
+        }
+      } else if (drag.mode === 'ink-erase') {
+        if (eraserChanged) {
+          pushHistory();
+          notify();
+        }
+        eraserChanged = false;
+      } else if (drag.mode === 'free-arrow') {
+        const len = Math.hypot(drag.arrow.end.x - drag.arrow.start.x, drag.arrow.end.y - drag.arrow.start.y);
+        if (drag.moved && len >= 12) {
+          ensureInkData().arrows.push(drag.arrow);
+          pushHistory();
+          renderInk();
+          notify();
+        } else if (drag.path) {
+          drag.path.remove();
+        }
+      } else if (drag.mode === 'poly-arrow-create') {
+        const len = Math.hypot(drag.arrow.end.x - drag.arrow.start.x, drag.arrow.end.y - drag.arrow.start.y);
+        if (drag.moved && len >= 12) {
+          ensureInkData().arrows.push(drag.arrow);
+          pushHistory();
+          renderInk();
+          notify();
+        } else if (drag.path) {
+          drag.path.remove();
+        }
+      } else if (drag.mode === 'arrow-waypoint' || drag.mode === 'arrow-endpoint') {
+        if (drag.moved) {       // 真正改动了才入历史；纯点选只保留选中
+          pushHistory();
+          notify();
+        }
+      } else if (drag.mode === 'sketch-shape-create') {
+        if (drag.moved) {
+          updateSketchShapeDrag(e.clientX, e.clientY);
+          if (!(currentMode() === 'decor' && activeDecorShapeType)) setDrawTool('select');
+          pushHistory();
+          notify();
+        } else {
+          cancelSketchShapeCreate();
+        }
+      } else if (drag.mode === 'decor-text-preset-create') {
+        if (drag.moved) {
+          updateDecorTextPresetDrag(e.clientX, e.clientY);
+          finishDecorTextPresetCreate();
+        } else if ((activeDecorTextPreset === 'emphasis-card' || activeDecorTextPreset === 'note-bubble')
+                   && !drag.hadPriorSelection) {
+          // 重点便签 / 旁注框保留单击创建（但已有选中时优先取消选中）
+          finishDecorTextPresetCreate();
+        } else {
+          cancelDecorTextPresetCreate();
+        }
+      } else if (drag.mode === 'node') {
+        if (drag.fromDecorTitle && drag.moved) suppressDecorTitleClick = true;
+        if (drag.mindmap) {
+          finishMindmapStructureDrag(drag, e);
+        } else if (drag.moved) {
+          // Z 轮：client delta → surface delta 除以 scale
+          const scale = drag.startScale || curScale;
+          const mdx = (e.clientX - drag.startClientX) / scale;
+          const mdy = (e.clientY - drag.startClientY) / scale;
+          const effDX = mdx;   // 四向无界：不再夹到 ≥0
+          const effDY = mdy;
+          drag.starts.forEach((start, id) => {
+            const n = findNode(id);
+            if (!n) return;
+            const snapped = drag.textSnapResult && drag.textSnapResult.nodeId === id ? drag.textSnapResult : null;
+            n.x = snapped ? snapped.x : start.x + effDX;
+            n.y = snapped ? snapped.y : start.y + effDY;
+            const elN = nodeMap.get(id);
+            if (elN) applyTransform(elN, n.x, n.y);
+          });
+          const draggedBox = findNode(drag.anchorId);
+          if (isTextBoxNode(draggedBox) && textBindingTarget(draggedBox)) refreshTextBindingOffset(draggedBox);
+          syncBoundTextBoxes(new Set(drag.starts.keys()));
+          (drag.affectedEdges || edgesIncidentTo(new Set(drag.starts.keys()))).forEach(updateEdgePath);
+          pushHistory();
+          notify();
+        } else if (drag.collapseOnMouseUp) {
+          // 多选状态点了选区里的节点但没拖：折叠到单选
+          selectNodes([drag.anchorId], false);
+        }
+        // 最终 transform 与连线必须在 dragging 的“无 transform 过渡”状态下同步提交。
+        // 若先移除 dragging，节点会重新启用 180ms transform 动画，而连线已经跳到终点，
+        // 松手后便会出现节点漂移、连线暂时脱节。
+        drag.starts.forEach((_, id) => {
+          const elN = nodeMap.get(id);
+          if (elN) elN.classList.remove('dragging', 'mindmap-subtree-dragging', 'mindmap-drag-anchor');
+        });
+        if (drag.followingTextBoxIds) drag.followingTextBoxIds.forEach(function (id) {
+          const elN = nodeMap.get(id);
+          if (elN) elN.classList.remove('dragging');
+        });
+        hideTextSnapGuides();
+      } else if (drag.mode === 'decor-resize') {
+        const node = findNode(drag.nodeId);
+        const el = node ? nodeMap.get(node.id) : null;
+        if (el) el.classList.remove('resizing');
+        if (drag.moved) {
+          applyDecorResizeDrag(e.clientX, e.clientY);
+          if (isPdfNode(node)) recrispPdfNode(node);   // 按新尺寸重栅格化可见页，恢复清晰
+          if (isGroupBoxNode(node)) refreshSemanticGroupMembershipFromBounds(node);
+          pushHistory();
+          notify();
+        }
+      } else if (drag.mode === 'body-resize') {
+        const node = findNode(drag.nodeId);
+        const el = node ? nodeMap.get(node.id) : null;
+        if (drag.moved) {
+          applyBodyResizeDrag(drag.latestClientX, drag.latestClientY);
+        }
+        if (el) el.classList.remove('resizing-x', 'resizing-y', 'body-height-active');
+        if (drag.moved) {
+          if (isMindmapWidthNode(node)) {
+            node.mindmapSizeMode = 'custom';
+            if (el) applyNodeStyle(el, node);
+            repairMindmapNodeSpacing(node, { history: false, notify: false });
+            dispatchMindmapSizeState();
+          }
+          pushHistory();
+          notify();
+        }
+      } else if (drag.mode === 'pan') {
+        viewport.classList.remove('panning');
+        startPanInertia(drag);   // W 轮：松手延续惯性，优雅滑停
+      } else if (drag.mode === 'edge-create') {
+        const targetEl = document.elementFromPoint(e.clientX, e.clientY);
+        const nodeEl = targetEl ? targetEl.closest('.node') : null;
+        const targetId = nodeEl ? nodeEl.dataset.id : null;
+        const targetNode = targetId ? findNode(targetId) : null;
+        const made = [];
+        if (targetId && targetNode && isLinkable(targetNode)) {
+          const fromIds = drag.fromIds || [drag.fromId];
+          fromIds.forEach((fromId) => {
+            if (!fromId || fromId === targetId) return;
+            const sourceNode = findNode(fromId);
+            if (!sourceNode || !isLinkable(sourceNode)) return;
+            // 防同向重复
+            const exists = data.edges.some(
+              (ed) => ed.from === fromId && ed.to === targetId,
+            );
+            if (exists) return;
+            const edge = {
+              id: newEdgeId(),
+              from: fromId,
+              to: targetId,
+              text: '',
+            };
+            applyProEdgeDefaults(edge);        // 5-2：专业模式套用连线默认样式
+            data.edges.push(edge);
+            const refs = createEdgeEls(edge);
+            edgeMap.set(edge.id, refs);
+            updateEdgePath(edge);
+            spawnEdgeEls(refs);                 // 连线淡入
+            made.push(edge.id);
+          });
+          if (made.length) {
+            // Alt 拖线属于连续创作：保留发起前的节点选择，不自动选中新线，
+            // 避免刚创建成功就把右栏切换到连线属性检查器。用户仍可随后点线编辑。
+            pushHistory();
+            notify();
+            hideOnboardingHint();
+            showOnboardingHint('outline', '按 <kbd>Tab</kbd> 创建子节点，按 <kbd>Enter</kbd> 创建同级节点', 5200);
+          }
+        }
+        clearPreviewPath();
+      } else if (drag.mode === 'waypoint') {
+        // 拖动过 + 确实加/移了拐点 → 入历史；纯点选不留痕
+        if (drag.moved && drag.wpIndex !== null) {
+          pushHistory();
+          notify();
+        }
+      } else if (drag.mode === 'frame-select') {
+        const rect = dragRectFromState(drag);
+        const forTemplate = drag.forTemplate;
+        clearFrameEl();
+        if (forTemplate) {
+          // 套索：圈到东西就浮「保存到模板？」；不论存不存，这次操作结束都切回「选择」工具
+          const ids = templateEligibleSelectionIds();
+          if (ids.length) {
+            showTemplateSaveButton(rect, { x: e.clientX, y: e.clientY }, ids);
+          } else {
+            clearSelection();
+          }
+          setDrawTool('select');
+        } else {
+          const groupMemberIds = [...selectedNodeIds].filter(function (id) {
+            const node = findNode(id);
+            return node && !isDecorationNode(node);
+          });
+          const frameCanBecomeGroupBox = drag.moved
+            && rect.w >= GROUP_BOX_MIN_WIDTH && rect.h >= GROUP_BOX_MIN_HEIGHT;
+          const emptyFrame = frameCanBecomeGroupBox
+            && selectedNodeIds.size === 0 && selectedEdgeIds.size === 0;
+          // 没拖动 且 没按 shift → 视为空白点击，清选
+          if (!drag.moved && !drag.additive) {
+            clearSelection();
+          } else if (boxCreateEnabled() && (emptyFrame || (frameCanBecomeGroupBox && groupMemberIds.length))) {
+            showFrameActionButton(rect, { x: e.clientX, y: e.clientY }, groupMemberIds);
+            if (genIndexEnabled() && indexableSelectionIds().length >= 2) {
+              showIndexActionButton(rect, { x: e.clientX - 48, y: e.clientY });
+            }
+          }
+        }
+      } else if (drag.mode === 'color-block-create') {
+        const rect = dragRectFromState(drag);
+        clearFrameEl();
+        suppressNextContextMenu = true;
+        if (!drag.moved) {
+          setDrawTool('select');
+        } else if (rect.w >= 24 && rect.h >= 20) {
+          createColorBlockFromRect(rect);
+        }
+      }
+
+      // 结构拖放若启动了脑图滑行，SVG 增量层要一直保留到 finishMindmapGlide；
+      // 普通拖动 / 中心整体移动 / 无效落点则在此立即重建 Canvas 并切回。
+      if (drag && drag.mode === 'node' && !mindmapGlideState) {
+        edgeCanvasLiveCoords = null;
+        renderEdgesCanvas();
+        setEdgesSvgLive(false);
+      }
+      drag = null;
+      hideTextSnapGuides();
+    }
+
+    // ── 节点文字编辑 ───────────────────────
+    function enterNodeEdit(node, isNew, caretPoint) {
+      if (isDecorationNode(node)) return;
+      if (editingNodeId !== null && editingNodeId !== node.id) commitNodeEdit();
+      if (editingEdgeId !== null) commitEdgeEdit();
+
+      editingNodeId = node.id;
+      const field = editsBodyInline(node) ? 'body' : 'text';
+      editingOriginalText = node[field] || '';
+      editingOriginalMarks = isCodeNode(node) ? []
+        : richMarks(node, field).map(function (mark) { return Object.assign({}, mark); });
+      editingIsNew = !!isNew;
+
+      const el = nodeMap.get(node.id);
+      if (!el) return;
+      el.classList.add('editing');
+      selectNodes([node.id], false);
+
+      const text = el.querySelector('.node-text');
+      // 普通文字使用结构化富文本 DOM：编辑面只显示真实文字，不暴露 {hl:...} 等定界符。
+      // 代码节点仍是严格纯文本源码编辑器。
+      if (isCodeNode(node)) {
+        text.textContent = editingOriginalText;
+        text.contentEditable = 'plaintext-only';
+      } else {
+        setRichEditable(text, editingOriginalText, editingOriginalMarks);
+        text.contentEditable = 'true';
+      }
+      text.focus();
+      if (caretPoint && placeEditableCaretFromPoint(text, caretPoint.x, caretPoint.y)) {
+        if (!isCodeNode(node)) applyMarkHighlight(text);   // 代码节点不识别 Markdown 标记
+        return;
+      }
+      const range = document.createRange();
+      range.selectNodeContents(text);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      if (!isCodeNode(node)) applyMarkHighlight(text);   // 代码节点不识别 Markdown 标记
+    }
+
+    // Figma 风格：选中节点时按字母键 → 进编辑 + 用首字符替换原内容（X 轮）
+    // 原内容若有损失，Ctrl+Z 能恢复（commitNodeEdit 时会 pushHistory）
+    function enterNodeEditWithChar(node, ch) {
+      if (isDecorationNode(node)) return;
+      if (editingNodeId !== null && editingNodeId !== node.id) commitNodeEdit();
+      if (editingEdgeId !== null) commitEdgeEdit();
+
+      editingNodeId = node.id;
+      editingOriginalText = editsBodyInline(node) ? (node.body || '') : (node.text || '');
+      editingOriginalMarks = [];
+      editingIsNew = false;
+
+      const el = nodeMap.get(node.id);
+      if (!el) return;
+      el.classList.add('editing');
+      selectNodes([node.id], false);
+
+      const textEl = el.querySelector('.node-text');
+      textEl.textContent = ch;
+      if (!isCodeNode(node)) prepareRichEditable(textEl);
+      textEl.contentEditable = isCodeNode(node) ? 'plaintext-only' : 'true';
+      textEl.focus();
+      // 光标落在字符之后（末尾）
+      const range = document.createRange();
+      range.selectNodeContents(textEl);
+      range.collapse(false);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      if (!isCodeNode(node)) applyMarkHighlight(textEl);   // 代码节点不识别 Markdown 标记
+      edgesIncidentTo(new Set([node.id])).forEach(updateEdgePath);
+    }
+
+    // 代码节点的 Tab / Shift+Tab：对当前行或选中多行增减两个空格，保留原始换行与缩进。
+    function transformCodeIndent(text, start, end, outdent) {
+      const effectiveEnd = end > start && text.charAt(end - 1) === '\n' ? end - 1 : end;
+      const first = text.lastIndexOf('\n', Math.max(0, start - 1)) + 1;
+      let last = text.indexOf('\n', effectiveEnd);
+      if (last < 0) last = text.length;
+      const changes = [];
+      let pos = first;
+      while (pos <= last) {
+        if (outdent) {
+          const m = /^(?: {1,2}|\t)/.exec(text.slice(pos));
+          if (m) changes.push({ pos: pos, remove: m[0].length, insert: '' });
+        } else {
+          changes.push({ pos: pos, remove: 0, insert: '  ' });
+        }
+        const nl = text.indexOf('\n', pos);
+        if (nl < 0 || nl >= last) break;
+        pos = nl + 1;
+      }
+      let next = text;
+      for (let i = changes.length - 1; i >= 0; i--) {
+        const ch = changes[i];
+        next = next.slice(0, ch.pos) + ch.insert + next.slice(ch.pos + ch.remove);
+      }
+      function mapOffset(off) {
+        let mapped = off;
+        changes.forEach(function (ch) {
+          if (ch.remove === 0) {
+            if (off >= ch.pos) mapped += ch.insert.length;
+          } else if (off >= ch.pos + ch.remove) {
+            mapped -= ch.remove;
+          } else if (off > ch.pos) {
+            mapped -= off - ch.pos;
+          }
+        });
+        return mapped;
+      }
+      return { text: next, start: mapOffset(start), end: mapOffset(end) };
+    }
+    function indentCodeTextarea(ta, outdent) {
+      const res = transformCodeIndent(ta.value, ta.selectionStart || 0, ta.selectionEnd || 0, outdent);
+      ta.value = res.text;
+      ta.setSelectionRange(res.start, res.end);
+      ta.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    function indentCodeEditable(el, outdent) {
+      const sel = window.getSelection();
+      if (!sel || !sel.rangeCount) return;
+      const range = sel.getRangeAt(0);
+      if (!el.contains(range.startContainer) || !el.contains(range.endContainer)) return;
+      const start = ceCharOffset(el, range.startContainer, range.startOffset);
+      const end = ceCharOffset(el, range.endContainer, range.endOffset);
+      const res = transformCodeIndent(el.textContent || '', start, end, outdent);
+      el.textContent = res.text;
+      setNodeSelection(el, res.start, res.end);
+      onEditingInput();
+    }
+
+    // ── Y2 轮：编辑态标记符号高亮（CSS Custom Highlight API）──
+    // 不碰 DOM，只给标记符号的字符区间"刷"浅灰色 → 原生 IME/光标/撤销全保留。
+    // 浏览器不支持（无 CSS.highlights / Highlight）时整段静默跳过，编辑照常。
+    const HL_NAME = 'md-mark';
+    const supportsHighlight = (typeof CSS !== 'undefined'
+      && CSS.highlights && typeof Highlight !== 'undefined');
+
+    function applyMarkHighlight(textEl) {
+      if (!supportsHighlight || !textEl) return;
+      const md = global.MarkdownMini;
+      if (!md || !md.markIntervals) return;
+      const text = textEl.textContent || '';
+      const intervals = md.markIntervals(text);
+      if (intervals.length === 0) { CSS.highlights.delete(HL_NAME); return; }
+
+      // 全局字符偏移 → 文本节点的映射（plaintext-only 通常单文本节点，但遍历更稳）
+      const segs = [];
+      const walker = document.createTreeWalker(textEl, NodeFilter.SHOW_TEXT, null);
+      let n, base = 0;
+      while ((n = walker.nextNode())) {
+        segs.push({ node: n, start: base, end: base + n.nodeValue.length });
+        base += n.nodeValue.length;
+      }
+      const ranges = [];
+      intervals.forEach(function (iv) {
+        const s = iv[0], e = iv[1];
+        const r = document.createRange();
+        let okS = false, okE = false;
+        for (let i = 0; i < segs.length; i++) {
+          const seg = segs[i];
+          if (!okS && s >= seg.start && s < seg.end) {
+            r.setStart(seg.node, s - seg.start); okS = true;
+          }
+          if (okS && e > seg.start && e <= seg.end) {
+            r.setEnd(seg.node, e - seg.start); okE = true; break;
+          }
+        }
+        if (okS && okE) ranges.push(r);
+      });
+      if (ranges.length === 0) { CSS.highlights.delete(HL_NAME); return; }
+      CSS.highlights.set(HL_NAME, new Highlight(...ranges));
+    }
+
+    function clearMarkHighlight() {
+      if (!supportsHighlight) return;
+      CSS.highlights.delete(HL_NAME);
+    }
+
+    // 编辑期间打字会改变节点尺寸；监听 input → 同步刷新所有相邻连线 + 标记高亮
+    function onEditingInput() {
+      if (editingNodeId === null) return;
+      const el = nodeMap.get(editingNodeId);
+      const node = findNode(editingNodeId);
+      // 合成中（拼音未上屏）不刷高亮——避免在临时拼音上误标；compositionend 会补刷
+      if (el && !imeComposing && !isCodeNode(node)) applyMarkHighlight(el.querySelector('.node-text'));
+      edgesIncidentTo(new Set([editingNodeId])).forEach(updateEdgePath);
+    }
+
+    // 中文输入法合成开始/结束（事件在 surface 上委托接收）
+    function onCompositionStart() {
+      if (editingNodeId !== null) imeComposing = true;
+    }
+    function onCompositionEnd() {
+      if (editingNodeId === null) { imeComposing = false; return; }
+      imeComposing = false;
+      const el = nodeMap.get(editingNodeId);
+      const node = findNode(editingNodeId);
+      if (el && !isCodeNode(node)) applyMarkHighlight(el.querySelector('.node-text'));
+      edgesIncidentTo(new Set([editingNodeId])).forEach(updateEdgePath);
+    }
+
+    function commitNodeEdit() {
+      if (editingNodeId === null) return;
+      const id = editingNodeId;
+      const wasNew = editingIsNew;
+      const oldText = editingOriginalText;
+      const oldMarks = editingOriginalMarks;
+      editingNodeId = null;
+      editingIsNew = false;
+      editingOriginalText = '';
+      editingOriginalMarks = [];
+      scheduleTextDock();
+
+      const node = findNode(id);
+      const el = nodeMap.get(id);
+      if (!node || !el) return;
+      const textEl = el.querySelector('.node-text');
+      // 代码保留首尾空白与缩进；普通标题多行仍只 trim 首尾。
+      const draft = isCodeNode(node)
+        ? { text: textEl.textContent || '', marks: [] }
+        : canonicalRichDraft(readRichEditable(textEl));
+      const rawText = draft.text;
+      const leading = isCodeNode(node) ? 0 : (rawText.match(/^\s*/) || [''])[0].length;
+      const trailing = isCodeNode(node) ? 0 : (rawText.match(/\s*$/) || [''])[0].length;
+      const newText = isCodeNode(node) ? rawText : rawText.slice(leading, Math.max(leading, rawText.length - trailing));
+      const newMarks = isCodeNode(node) || !RichText ? []
+        : RichText.slice(rawText, draft.marks, leading, rawText.length - trailing);
+      const marksChanged = JSON.stringify(newMarks) !== JSON.stringify(oldMarks);
+
+      clearMarkHighlight();        // Y2：退出编辑清掉标记高亮
+      hideSelToolbar();            // 退出编辑收起选中工具栏
+      textEl.contentEditable = 'false';
+      el.classList.remove('editing');
+
+      if (isCodeNode(node)) {
+        if (newText) node.body = newText; else delete node.body;
+        delete node.bodyMarks;
+        node.text = codeTitleFromBody(newText, node.language);
+        delete node.textMarks;
+        delete textEl.dataset.source;
+        renderCodeNodeText(textEl, newText, node.language);
+        renderTextNodeMeta(el, node);
+        edgesIncidentTo(new Set([id])).forEach(updateEdgePath);
+        if (newText !== oldText || wasNew) {
+          pushHistory();
+          notify();
+        }
+        return;
+      }
+
+      if (isStickyNode(node)) {
+        // 便签：正文存 node.body，派生一个标题进 node.text 供搜索/导出文件名用；
+        // 空便签保留为空色块（不写"未命名"），只有 Esc 主动取消才删（cancelNodeEdit）。
+        if (newText) node.body = newText; else delete node.body;
+        storeRichMarks(node, 'body', newMarks);
+        syncStickyTitleFromBody(node, newText);
+        delete textEl.dataset.source;
+        renderNodeText(textEl, newText, newMarks);
+        renderTextNodeMeta(el, node);
+        edgesIncidentTo(new Set([id])).forEach(updateEdgePath);
+        if (newText !== oldText || marksChanged || wasNew) {
+          pushHistory();
+          notify();
+        }
+        return;
+      }
+
+      if (wasNew && newText === '') {
+        // 新节点没打字也保留——统一用英文 Untitled，占位与界面语言无关。
+        // （Esc 主动取消仍然删，那条路径在 cancelNodeEdit 里）
+        node.text = 'Untitled';
+        delete node.textMarks;
+        delete textEl.dataset.source;
+        renderNodeText(textEl, 'Untitled');
+        if (isPreviewNode(node)) renderTextNodeMeta(el, node);
+        nodeSizeCache.delete(id);
+        if (isMindmapWidthNode(node)) repairMindmapNodeSpacing(node, { history: false, notify: false });
+        edgesIncidentTo(new Set([id])).forEach(updateEdgePath);
+        pushHistory();
+        notify();
+        return;
+      }
+      if (newText !== oldText) {
+        node.text = newText;
+        storeRichMarks(node, 'text', newMarks);
+        // 强制重渲染（清掉 dataset.source 缓存，避免命中"内容没变就不画"的优化）
+        delete textEl.dataset.source;
+        renderNodeText(textEl, newText, newMarks);
+        if (isPreviewNode(node)) renderTextNodeMeta(el, node);
+        nodeSizeCache.delete(id);
+        if (isMindmapWidthNode(node)) repairMindmapNodeSpacing(node, { history: false, notify: false });
+        edgesIncidentTo(new Set([id])).forEach(updateEdgePath);
+        pushHistory();
+        notify();
+      } else if (marksChanged) {
+        storeRichMarks(node, 'text', newMarks);
+        delete textEl.dataset.source;
+        renderNodeText(textEl, newText, newMarks);
+        if (isPreviewNode(node)) renderTextNodeMeta(el, node);
+        nodeSizeCache.delete(id);
+        if (isMindmapWidthNode(node)) repairMindmapNodeSpacing(node, { history: false, notify: false });
+        edgesIncidentTo(new Set([id])).forEach(updateEdgePath);
+        pushHistory();
+        notify();
+      } else {
+        // 内容没变也要把结构化富文本重新渲染回显示态。
+        delete textEl.dataset.source;
+        renderNodeText(textEl, oldText, oldMarks);
+        if (isPreviewNode(node)) renderTextNodeMeta(el, node);
+        nodeSizeCache.delete(id);
+        if (isMindmapWidthNode(node)) repairMindmapNodeSpacing(node, { history: false, notify: false });
+        edgesIncidentTo(new Set([id])).forEach(updateEdgePath);
+      }
+    }
+
+    function cancelNodeEdit() {
+      if (editingNodeId === null) return;
+      const id = editingNodeId;
+      const wasNew = editingIsNew;
+      const oldText = editingOriginalText;
+      const oldMarks = editingOriginalMarks;
+      editingNodeId = null;
+      editingIsNew = false;
+      editingOriginalText = '';
+      editingOriginalMarks = [];
+      scheduleTextDock();
+
+      clearMarkHighlight();        // Y2：退出编辑清掉标记高亮
+      hideSelToolbar();            // 退出编辑收起选中工具栏
+      if (wasNew) {
+        // 新节点被 Esc 取消 → 同时回滚附带 edge
+        removeNodeAndIncidentEdges(id);
+        notify();
+        return;
+      }
+      const el = nodeMap.get(id);
+      if (el) {
+        const textEl = el.querySelector('.node-text');
+        textEl.contentEditable = 'false';
+        el.classList.remove('editing');
+        // 恢复成原 Markdown / 代码的渲染结果
+        delete textEl.dataset.source;
+        const node = findNode(id);
+        if (isCodeNode(node)) renderCodeNodeText(textEl, oldText, node.language);
+        else renderNodeText(textEl, oldText, oldMarks);
+        textEl.blur();
+        edgesIncidentTo(new Set([id])).forEach(updateEdgePath);
+      }
+    }
+
+    // 删除节点 + 它的所有相邻 edge（用于"新节点回滚"，不进 history）
+    function removeNodeAndIncidentEdges(id) {
+      const incidentIds = data.edges
+        .filter(function (e) { return e.from === id || e.to === id; })
+        .map(function (e) { return e.id; });
+      incidentIds.forEach(removeEdgeRaw);
+      removeNodeRaw(id);
+      applySelection();
+    }
+
+    // ── 连线文字编辑 ───────────────────────
+    function enterEdgeEdit(edge) {
+      if (editingNodeId !== null) commitNodeEdit();
+      if (editingEdgeId !== null && editingEdgeId !== edge.id) commitEdgeEdit();
+
+      editingEdgeId = edge.id;
+      editingOriginalText = edge.text || '';
+
+      const refs = edgeMap.get(edge.id);
+      if (!refs) return;
+      const labelEl = refs.labelEl;
+      labelEl.classList.add('editing');
+      labelEl.classList.remove('empty');
+      selectEdges([edge.id], false);
+
+      labelEl.contentEditable = 'true';
+      labelEl.focus();
+      const range = document.createRange();
+      range.selectNodeContents(labelEl);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+
+    function commitEdgeEdit() {
+      if (editingEdgeId === null) return;
+      const id = editingEdgeId;
+      const oldText = editingOriginalText;
+      editingEdgeId = null;
+      editingOriginalText = '';
+
+      const edge = findEdge(id);
+      const refs = edgeMap.get(id);
+      if (!edge || !refs) return;
+      const labelEl = refs.labelEl;
+      const newText = (labelEl.textContent || '').trim();
+      labelEl.textContent = newText;
+      labelEl.contentEditable = 'false';
+      labelEl.classList.remove('editing');
+      labelEl.classList.toggle('empty', !newText);
+
+      if (newText !== oldText) {
+        edge.text = newText;
+        pushHistory();
+        notify();
+      }
+    }
+
+    function cancelEdgeEdit() {
+      if (editingEdgeId === null) return;
+      const id = editingEdgeId;
+      const oldText = editingOriginalText;
+      editingEdgeId = null;
+      editingOriginalText = '';
+
+      const refs = edgeMap.get(id);
+      if (!refs) return;
+      const labelEl = refs.labelEl;
+      labelEl.textContent = oldText;
+      labelEl.contentEditable = 'false';
+      labelEl.classList.remove('editing');
+      labelEl.classList.toggle('empty', !oldText);
+      labelEl.blur();
+    }
+
+    // ── 删除（不进 history 的原始操作）──────
+    function removeNodeRaw(id) {
+      // 删除跟随目标时，文本框留在最后位置并解除关系；删除文本框本身则清掉会话吸附记忆。
+      data.nodes.forEach(function (candidate) {
+        if (isTextBoxNode(candidate) && candidate.textBindTarget === id) clearTextBinding(candidate);
+      });
+      disposeAttachment(id);   // 附件节点：释放 PDF.js 文档 + 懒渲染监听 + MD 批注定时器（删除闭环，防内存堆积）
+      // 正文节点批注暂不物理删除：节点删除可撤销，提前清掉会让 Ctrl+Z 恢复节点却丢批注。
+      // 未被节点引用的批注条目由“清理未用附件”统一识别并在用户确认后永久裁剪。
+      const idx = data.nodes.findIndex((n) => n.id === id);
+      if (idx >= 0) {
+        const removed = data.nodes.splice(idx, 1)[0];
+        unindexNodeData(removed);
+      }
+      const el = nodeMap.get(id);
+      if (el) {
+        if (nodeSizeObserver) nodeSizeObserver.unobserve(el);   // 否则观察器持引用，删了也回收不掉
+        el.remove();
+      }
+      nodeSizeCache.delete(id);
+      nodeMap.delete(id);
+      selectedNodeIds.delete(id);
+      if (bodyResetJobs.has(id)) { clearTimeout(bodyResetJobs.get(id)); bodyResetJobs.delete(id); }
+    }
+
+    function removeEdgeRaw(id) {
+      const idx = data.edges.findIndex((e) => e.id === id);
+      if (idx >= 0) data.edges.splice(idx, 1);
+      removeEdgeMarkers(id);
+      const refs = edgeMap.get(id);
+      if (refs) {
+        refs.path.remove();
+        refs.hit.remove();
+        refs.labelEl.remove();
+      }
+      edgeMap.delete(id);
+      edgePathCache.delete(id);
+      edgeMidpointCache.delete(id);
+      selectedEdgeIds.delete(id);
+      requestEdgesCanvasRender();
+    }
+
+    function deleteSelected() {
+      if (selectedNodeIds.size === 0 && selectedEdgeIds.size === 0) return;
+      // 与被删节点相关的边也一并删
+      const nodesToDelete = new Set(selectedNodeIds);
+      const edgesToDelete = new Set(selectedEdgeIds);
+      data.edges.forEach((e) => {
+        if (nodesToDelete.has(e.from) || nodesToDelete.has(e.to)) {
+          edgesToDelete.add(e.id);
+        }
+      });
+      // 离场动画：在真正移除前，给每个被删元素叠一个淡出缩小的幽灵
+      if (!prefersReducedMotion()) {
+        nodesToDelete.forEach((id) => { const el = nodeMap.get(id); if (el) ghostRemove(el, true); });
+        edgesToDelete.forEach((id) => { const refs = edgeMap.get(id); if (refs) ghostRemove(refs.path, false); });
+      }
+      edgesToDelete.forEach(removeEdgeRaw);
+      nodesToDelete.forEach(removeNodeRaw);
+      applySelection();
+      pushHistory();
+      notify();
+    }
+
+    function removeArchivedNodes(ids) {
+      const nodesToRemove = new Set((Array.isArray(ids) ? ids : [])
+        .map(function (id) { return String(id || ''); })
+        .filter(function (id) { return !!id && !!findNode(id); }));
+      if (nodesToRemove.size === 0) return { ok: true, removedNodes: 0, removedEdges: 0 };
+
+      function pruneLoadedAnnotations() {
+        if (!nodeAnnotData || !nodeAnnotData.nodes || typeof nodeAnnotData.nodes !== 'object') return;
+        nodesToRemove.forEach(function (id) { delete nodeAnnotData.nodes[id]; });
+      }
+      if (nodeAnnotLoaded) pruneLoadedAnnotations();
+      else if (nodeAnnotLoadPromise) {
+        nodeAnnotLoadPromise.then(pruneLoadedAnnotations).catch(function () {});
+      }
+
+      if (editingNodeId !== null && nodesToRemove.has(editingNodeId)) commitNodeEdit();
+      if (editingEdgeId !== null) commitEdgeEdit();
+
+      const edgesToRemove = new Set();
+      data.edges.forEach(function (edge) {
+        if (nodesToRemove.has(edge.from) || nodesToRemove.has(edge.to)) edgesToRemove.add(edge.id);
+      });
+
+      if (!prefersReducedMotion()) {
+        nodesToRemove.forEach(function (id) {
+          const el = nodeMap.get(id);
+          if (el) ghostRemove(el, true);
+        });
+        edgesToRemove.forEach(function (id) {
+          const refs = edgeMap.get(id);
+          if (refs) ghostRemove(refs.path, false);
+        });
+      }
+
+      edgesToRemove.forEach(removeEdgeRaw);
+      nodesToRemove.forEach(removeNodeRaw);
+      applySelection();
+      notify(); // 归档已写盘，不进撤销栈；只同步外层内存、搜索、小地图与空画布提示。
+      return {
+        ok: true,
+        removedNodes: nodesToRemove.size,
+        removedEdges: edgesToRemove.size,
+      };
+    }
+
+    // ── C1 轮：节点颜色 ─────────────────────
+    // 给所有选中节点设颜色（color 为空字符串/null = 恢复默认白底）
+    // 右键 6 色点 → 便签的果冻底色映射（便签始终有色，没有"无色"概念）。
+    const STICKY_PALETTE = STICKY_SWATCHES.map((item) => item.hex);
+    const STICKY_NAMED = {
+      blue: '#b4d4ff', green: '#b2e9cd', yellow: '#ffe69e',
+      red: '#ffb1c0', purple: '#d0bcff', gray: '#e3e1db',
+    };
+    function normalizeHexColor(value) {
+      const raw = String(value || '').trim();
+      if (!/^#[0-9a-f]{6}$/i.test(raw)) return '';
+      return raw.toLowerCase();
+    }
+    function selectedNodesAllSticky() {
+      if (selectedNodeIds.size === 0) return false;
+      let ok = true;
+      selectedNodeIds.forEach((id) => {
+        if (!isStickyNode(findNode(id))) ok = false;
+      });
+      return ok;
+    }
+    function commonSelectedStickyColor() {
+      let common = null, mixed = false;
+      selectedNodeIds.forEach((id) => {
+        const n = findNode(id);
+        const c = normalizeHexColor(n && n.bgColor);
+        if (common === null) common = c;
+        else if (common !== c) mixed = true;
+      });
+      return { color: common || '', mixed: mixed };
+    }
+    function setNodeColor(color, opts) {
+      opts = opts || {};
+      if (selectedNodeIds.size === 0) return;
+      selectedNodeIds.forEach((id) => {
+        const n = findNode(id);
+        if (!n) return;
+        const el = nodeMap.get(id);
+        if (isStickyNode(n)) {
+          // 便签：色点改的是果冻底色（存 hex）；点"默认（无色）"= 重掷一个随机果冻色。
+          const direct = normalizeHexColor(color);
+          n.bgColor = opts.random
+            ? randomStickyColor(n.bgColor)
+            : (direct || (color ? (STICKY_NAMED[color] || randomStickyColor(n.bgColor)) : randomStickyColor(n.bgColor)));
+          delete n.color;
+          if (n.mindmapColorMode || n.mindmapStylePreset) markMindmapNodeColorCustom(n);
+          if (el) {
+            el.removeAttribute('data-color');
+            applyNodeStyle(el, n);
+          }
+          return;
+        }
+        if (color) n.color = color;
+        else delete n.color;
+        if (n.mindmapColorMode || n.mindmapStylePreset) markMindmapNodeColorCustom(n);
+        if (el) {
+          if (color) el.dataset.color = color;
+          else el.removeAttribute('data-color');
+        }
+      });
+      pushHistory();
+      notify();
+    }
+
+    function ensureStickyPaletteMenu() {
+      if (!nodeMenu) return;
+      const row = nodeMenu.querySelector('[data-role="node-menu-sticky-colors"]');
+      if (!row) return;
+      if (row.dataset.ready !== '1') {
+        STICKY_SWATCHES.forEach((item) => {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'color-dot sticky-color-dot';
+          button.dataset.stickyColor = item.hex;
+          button.dataset.stickyKey = item.key;
+          button.style.setProperty('--dot-color', item.hex);
+          row.appendChild(button);
+        });
+        row.dataset.ready = '1';
+      }
+      const english = document.body && document.body.dataset.toolbarLanguage === 'en';
+      row.querySelectorAll('[data-sticky-key]').forEach((button) => {
+        const item = STICKY_SWATCHES.find((swatch) => swatch.key === button.dataset.stickyKey);
+        if (!item) return;
+        const label = english ? item.en : item.zh;
+        button.title = label;
+        button.setAttribute('aria-label', label);
+      });
+    }
+
+    // ── C1 轮：节点右键菜单 ─────────────────
+    function showNodeMenu(clientX, clientY) {
+      if (!nodeMenu) return;
+      ensureStickyPaletteMenu();
+      nodeMenu.classList.remove('decor-color-mode');
+      const stickyMode = selectedNodesAllSticky();
+      const normalColors = nodeMenu.querySelector('[data-role="node-menu-normal-colors"]');
+      const stickyColors = nodeMenu.querySelector('[data-role="node-menu-sticky-colors"]');
+      const randomButton = nodeMenu.querySelector('[data-action="sticky-random"]');
+      nodeMenu.classList.toggle('sticky-mode', stickyMode);
+      if (normalColors) normalColors.hidden = stickyMode;
+      if (stickyColors) stickyColors.hidden = !stickyMode;
+      if (randomButton) randomButton.hidden = !stickyMode;
+      if (stickyMode) {
+        const status = commonSelectedStickyColor();
+        nodeMenu.querySelectorAll('[data-sticky-color]').forEach((d) => {
+          const c = normalizeHexColor(d.getAttribute('data-sticky-color'));
+          d.classList.toggle('active', !status.mixed && c && c === status.color);
+        });
+      } else {
+        // 高亮"当前颜色"：选中节点若同色，给对应色点加 active
+        let common = null, mixed = false;
+        selectedNodeIds.forEach((id) => {
+          const n = findNode(id);
+          const c = (n && n.color) || '';
+          if (common === null) common = c;
+          else if (common !== c) mixed = true;
+        });
+        nodeMenu.querySelectorAll('[data-color]').forEach((d) => {
+          const c = d.getAttribute('data-color');
+          d.classList.toggle('active', !mixed && c === (common || ''));
+        });
+      }
+      // 先显示再量尺寸，做边界 clamp
+      nodeMenu.hidden = false;
+      const rect = nodeMenu.getBoundingClientRect();
+      let x = clientX, y = clientY;
+      if (x + rect.width > window.innerWidth - 8) x = window.innerWidth - rect.width - 8;
+      if (y + rect.height > window.innerHeight - 8) y = window.innerHeight - rect.height - 8;
+      nodeMenu.style.left = Math.max(8, x) + 'px';
+      nodeMenu.style.top = Math.max(8, y) + 'px';
+    }
+    function hideNodeMenu() {
+      if (nodeMenu) {
+        nodeMenu.hidden = true;
+        nodeMenu.classList.remove('decor-color-mode');
+      }
+    }
+
+    function menuColorBlockTargets() {
+      return [...selectedNodeIds].map((id) => findNode(id)).filter(isColorBlockNode);
+    }
+
+    function decorColorFromMenuValue(value) {
+      return DECOR_MENU_COLOR_MAP[value] || decorBaseDefaults('color-block').fillColor;
+    }
+
+    function setColorBlockMenuColor(value) {
+      const color = decorColorFromMenuValue(value);
+      const targets = menuColorBlockTargets();
+      if (!targets.length) return;
+      targets.forEach((node) => {
+        node.fillColor = color;
+        node.borderColor = color;
+        renderEditedDecoration(node);
+      });
+      refreshDecorPanel();
+      pushHistory();
+      notify();
+    }
+
+    function showColorBlockMenu(clientX, clientY) {
+      if (!nodeMenu) return;
+      hideEdgeMenu();
+      const normalColors = nodeMenu.querySelector('[data-role="node-menu-normal-colors"]');
+      const stickyColors = nodeMenu.querySelector('[data-role="node-menu-sticky-colors"]');
+      const randomButton = nodeMenu.querySelector('[data-action="sticky-random"]');
+      nodeMenu.classList.add('decor-color-mode');
+      if (normalColors) normalColors.hidden = false;
+      if (stickyColors) stickyColors.hidden = true;
+      if (randomButton) randomButton.hidden = true;
+      const targets = menuColorBlockTargets();
+      const current = normalizeHexColor(targets[0] && targets[0].fillColor);
+      nodeMenu.querySelectorAll('[data-color]').forEach((button) => {
+        const color = normalizeHexColor(decorColorFromMenuValue(button.getAttribute('data-color')));
+        button.classList.toggle('active', !!current && color === current);
+      });
+      nodeMenu.hidden = false;
+      const rect = nodeMenu.getBoundingClientRect();
+      let x = clientX, y = clientY;
+      if (x + rect.width > window.innerWidth - 8) x = window.innerWidth - rect.width - 8;
+      if (y + rect.height > window.innerHeight - 8) y = window.innerHeight - rect.height - 8;
+      nodeMenu.style.left = Math.max(8, x) + 'px';
+      nodeMenu.style.top = Math.max(8, y) + 'px';
+    }
+    // ── 连线右键菜单（编辑文字 / 删除连线）──────
+    function showEdgeMenu(clientX, clientY) {
+      if (!edgeMenu) return;
+      hideNodeMenu();
+      edgeMenu.hidden = false;
+      const rect = edgeMenu.getBoundingClientRect();
+      let x = clientX, y = clientY;
+      if (x + rect.width > window.innerWidth - 8) x = window.innerWidth - rect.width - 8;
+      if (y + rect.height > window.innerHeight - 8) y = window.innerHeight - rect.height - 8;
+      edgeMenu.style.left = Math.max(8, x) + 'px';
+      edgeMenu.style.top = Math.max(8, y) + 'px';
+    }
+    function hideEdgeMenu() {
+      if (edgeMenu) edgeMenu.hidden = true;
+      menuEdgeId = null;
+    }
+    function onContextMenu(e) {
+      if (mindmapColorBrushState) {
+        e.preventDefault();
+        e.stopPropagation();
+        cancelMindmapColorBrush(true);
+        return;
+      }
+      if (suppressNextContextMenu) {
+        suppressNextContextMenu = false;
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      if (drag && drag.mode === 'color-block-create') {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      if (drawTool !== 'select') {
+        hideNodeMenu();
+        hideEdgeMenu();
+        e.preventDefault();
+        e.stopPropagation();
+        if (currentMode() === 'decor' && hasActiveDecorTool()) clearActiveDecorTool();
+        setDrawTool('select');
+        return;
+      }
+      const nodeEl = e.target.closest ? e.target.closest('.node') : null;
+      if (!nodeEl || !surface.contains(nodeEl)) {
+        // 右键空白：切回左侧工具栏的「选择」工具（同时屏蔽浏览器原生右键菜单）
+        hideNodeMenu();
+        hideEdgeMenu();
+        e.preventDefault();
+        e.stopPropagation();
+        if (currentMode() === 'decor' && hasActiveDecorTool()) clearActiveDecorTool();
+        setDrawTool('select');
+        return;
+      }
+      hideEdgeMenu();
+      e.preventDefault();
+      e.stopPropagation();
+      const id = nodeEl.dataset.id;
+      const node = findNode(id);
+      if (isColorBlockNode(node)) {
+        if (!selectedNodeIds.has(id)) selectNodes([id], false);
+        showColorBlockMenu(e.clientX, e.clientY);
+        return;
+      }
+      if (isDecorationNode(node)) {
+        if (currentMode() === 'decor' && hasActiveDecorTool()) clearActiveDecorTool();
+        hideNodeMenu();
+        return;
+      }
+      // 右键的节点若不在选区 → 单选它（让菜单作用对象明确）
+      if (!selectedNodeIds.has(id)) selectNodes([id], false);
+      showNodeMenu(e.clientX, e.clientY);
+    }
+
+    // ── C2 轮：外部链接点击 ─────────────────
+    function postOpenExternal(target, kind) {
+      fetch('/api/open-external', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target: target, kind: kind, baseDir: baseDir }),
+      }).then(function (r) {
+        return r.json().then(function (j) { return { ok: r.ok, json: j }; });
+      }).then(function (res) {
+        if (!res.ok) {
+          window.alert((res.json && res.json.error) || '打开失败');
+        }
+      }).catch(function (err) {
+        console.warn('[画布] 打开外部链接失败', err);
+        window.alert('打开失败：服务未响应');
+      });
+    }
+
+    // 网址直接开；本地文件先弹确认框
+    function openExternalLink(href, kind) {
+      if (!href) return;
+      if (kind === 'url' && /^https?:\/\//i.test(href)) {
+        postOpenExternal(href, 'url');
+        return;
+      }
+      // 其余一律当本地文件，弹确认框
+      showConfirm(href, function () { postOpenExternal(href, 'file'); });
+    }
+
+    // 确认框：显示路径 + 确认/取消回调
+    let confirmCallback = null;
+    function showConfirm(pathText, onOk) {
+      const config = typeof pathText === 'object'
+        ? pathText
+        : {
+          title: '用系统默认程序打开这个文件？',
+          detail: pathText,
+          okLabel: '打开',
+          destructive: false,
+        };
+      if (!confirmOverlay) {
+        // 没有确认框 DOM 时降级为原生 confirm
+        if (window.confirm(config.title + '\n' + (config.detail || ''))) onOk();
+        return;
+      }
+      confirmCallback = onOk;
+      const titleEl = confirmOverlay.querySelector('[data-role="confirm-title"]');
+      const pathEl = confirmOverlay.querySelector('[data-role="confirm-path"]');
+      const okEl = confirmOverlay.querySelector('[data-role="confirm-ok"]');
+      if (titleEl) titleEl.textContent = config.title;
+      if (pathEl) pathEl.textContent = config.detail || '';
+      if (okEl) {
+        okEl.textContent = config.okLabel || '确认';
+        okEl.classList.toggle('danger', !!config.destructive);
+      }
+      confirmOverlay.hidden = false;
+    }
+    function hideConfirm() {
+      if (confirmOverlay) confirmOverlay.hidden = true;
+      confirmCallback = null;
+    }
+
+    // ── 文本节点：F 键专注阅读浮层 ─────────────
+    // 正文 body 不铺在画布上，只在这个只读窗口渲染；标题继续沿用普通节点的 text。
+    function nodeAnnotFp(node) {
+      return mdContentFp(String((node && node.body) || ''));
+    }
+    function loadNodeAnnotations() {
+      if (nodeAnnotLoaded) return Promise.resolve(nodeAnnotData);
+      if (nodeAnnotLoadPromise) return nodeAnnotLoadPromise;
+      nodeAnnotLoadPromise = fetch('/api/node-annotations?path=' + encodeURIComponent(filePath))
+        .then((r) => r.json()).then((res) => {
+          const raw = res && res.annotations;
+          nodeAnnotData = raw && raw.nodes && typeof raw.nodes === 'object' ? raw : { version: 1, nodes: {} };
+          if (!nodeAnnotData.nodes || typeof nodeAnnotData.nodes !== 'object') nodeAnnotData.nodes = {};
+          nodeAnnotLoaded = true;
+          return nodeAnnotData;
+        }).catch((err) => {
+          console.warn('[画布] 节点批注读取失败', err);
+          nodeAnnotData = { version: 1, nodes: {} };
+          nodeAnnotLoaded = true;
+          return nodeAnnotData;
+        });
+      return nodeAnnotLoadPromise;
+    }
+    function flushNodeAnnotations() {
+      if (nodeAnnotSaveTimer) { clearTimeout(nodeAnnotSaveTimer); nodeAnnotSaveTimer = null; }
+      if (!nodeAnnotDirty) return;
+      nodeAnnotDirty = false;
+      fetch('/api/save-node-annotations', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: filePath, data: nodeAnnotData }),
+      }).then((r) => r.json()).then((res) => {
+        if (!res || !res.ok) {
+          nodeAnnotDirty = true;
+          console.warn('[画布] 节点批注保存失败', res && res.error);
+        }
+      }).catch((err) => {
+        nodeAnnotDirty = true;
+        console.warn('[画布] 节点批注保存失败', err);
+      });
+    }
+    function scheduleNodeAnnotationsSave() {
+      if (nodeAnnotSaveTimer) clearTimeout(nodeAnnotSaveTimer);
+      nodeAnnotDirty = true;
+      nodeAnnotSaveTimer = setTimeout(flushNodeAnnotations, 600);
+    }
+    function nodeAnnotState(node, create) {
+      if (!node) return null;
+      let st = nodeAnnotData.nodes[node.id];
+      if (!st && create !== false) {
+        st = { src: nodeAnnotFp(node), strokes: [], boxes: [] };
+        nodeAnnotData.nodes[node.id] = st;
+      }
+      if (!st) return null;
+      if (!Array.isArray(st.strokes)) st.strokes = [];
+      if (!Array.isArray(st.boxes)) st.boxes = [];
+      const fp = nodeAnnotFp(node);
+      if (st.src !== fp) {
+        st.src = fp;
+        st.strokes = [];
+        st.boxes = [];
+        scheduleNodeAnnotationsSave();
+      }
+      return st;
+    }
+    function clearNodeSpatialAnnotations(node, reason) {
+      const st = nodeAnnotState(node, false);
+      if (!st || (!st.strokes.length && !st.boxes.length)) return;
+      st.strokes = [];
+      st.boxes = [];
+      scheduleNodeAnnotationsSave();
+      if (reason) console.warn('[画布] 已清除节点空间批注：' + reason);
+    }
+    // 批注笔画抽稀（Ramer–Douglas–Peucker）：去掉对形状几乎无贡献的过采样点，保留首末点与各点压力。
+    // 批注落笔时把每个指针采样点都存了（不像主画布 ink 有距离门控），一笔常上百点；这里在"提交入库前"
+    // 按亚像素容差简化——三类批注虚拟坐标 VW 均=1000（1 单位约对应渲染页宽/1000，半像素上下），eps=0.4 即亚像素，
+    // 肉眼无差，却显著缩小存盘体积与撤销快照的深拷贝成本。只删近共线点，绝不改动手写观感。
+    function simplifyAnnotPts(pts, eps) {
+      if (!pts || pts.length <= 2) return pts || [];
+      const eps2 = eps * eps;
+      const keep = new Array(pts.length).fill(false);
+      keep[0] = keep[pts.length - 1] = true;
+      const stack = [[0, pts.length - 1]];
+      while (stack.length) {
+        const seg = stack.pop();
+        const a = seg[0], b = seg[1];
+        if (b - a < 2) continue;
+        const ax = pts[a].x, ay = pts[a].y;
+        const dx = pts[b].x - ax, dy = pts[b].y - ay;
+        const len2 = dx * dx + dy * dy;
+        let maxD2 = -1, idx = -1;
+        for (let i = a + 1; i < b; i++) {
+          const px = pts[i].x - ax, py = pts[i].y - ay;
+          // 点到直线 a-b 的垂距平方（len2=0 退化为到端点距离）
+          const cross = px * dy - py * dx;
+          const d2 = len2 > 0 ? (cross * cross) / len2 : (px * px + py * py);
+          if (d2 > maxD2) { maxD2 = d2; idx = i; }
+        }
+        if (maxD2 > eps2) {
+          keep[idx] = true;
+          stack.push([a, idx]); stack.push([idx, b]);
+        }
+      }
+      const out = [];
+      for (let i = 0; i < pts.length; i++) if (keep[i]) out.push(pts[i]);
+      return out;
+    }
+    function snapshotNodeAnnot() {
+      const node = findNode(readingNodeId);
+      const st = nodeAnnotState(node);
+      return st ? { strokes: JSON.parse(JSON.stringify(st.strokes)), boxes: JSON.parse(JSON.stringify(st.boxes)) } : null;
+    }
+    function pushNodeAnnotHistory() {
+      const snap = snapshotNodeAnnot();
+      if (!snap) return;
+      nodeAnnotHistory.push(snap);
+      if (nodeAnnotHistory.length > 60) nodeAnnotHistory.shift();
+      nodeAnnotRedo.length = 0;
+    }
+    function applyNodeAnnotSnapshot(snap) {
+      const node = findNode(readingNodeId);
+      const st = nodeAnnotState(node);
+      if (!st || !snap) return;
+      st.strokes = JSON.parse(JSON.stringify(snap.strokes || []));
+      st.boxes = JSON.parse(JSON.stringify(snap.boxes || []));
+      redrawNodeAnnotations();
+      scheduleNodeAnnotationsSave();
+    }
+    function nodeAnnotUndo() {
+      if (!nodeAnnotHistory.length) return;
+      nodeAnnotRedo.push(snapshotNodeAnnot());
+      applyNodeAnnotSnapshot(nodeAnnotHistory.pop());
+    }
+    function nodeAnnotRedoAction() {
+      if (!nodeAnnotRedo.length) return;
+      nodeAnnotHistory.push(snapshotNodeAnnot());
+      applyNodeAnnotSnapshot(nodeAnnotRedo.pop());
+    }
+    function nodeAnnotPathEl(s) {
+      const pts = (s.pts || []).map((a) => ({ x: a[0] * NODE_ANNOT_VW, y: a[1] * NODE_ANNOT_VW, p: a[2] == null ? 0.5 : a[2] }));
+      const path = document.createElementNS(SVG_NS, 'path');
+      path.setAttribute('class', 'node-annot-stroke');
+      path.setAttribute('d', pressureStrokeD(pts, (s.w || 0.0045) * NODE_ANNOT_VW));
+      path.setAttribute('fill', s.color || '#1a1a1a');
+      return path;
+    }
+    function redrawNodeAnnotations() {
+      if (!nodeAnnotSvg) return;
+      nodeAnnotSvg.innerHTML = '';
+      const st = nodeAnnotState(findNode(readingNodeId), false);
+      if (!st) return;
+      st.boxes.forEach((b) => {
+        const rect = document.createElementNS(SVG_NS, 'rect');
+        rect.setAttribute('class', 'node-annot-box');
+        rect.setAttribute('x', b.x * NODE_ANNOT_VW);
+        rect.setAttribute('y', b.y * NODE_ANNOT_VW);
+        rect.setAttribute('width', b.w * NODE_ANNOT_VW);
+        rect.setAttribute('height', b.h * NODE_ANNOT_VW);
+        rect.setAttribute('stroke', b.color || '#f4b740');
+        nodeAnnotSvg.appendChild(rect);
+      });
+      st.strokes.forEach((s) => nodeAnnotSvg.appendChild(nodeAnnotPathEl(s)));
+    }
+    function syncNodeAnnotSvg() {
+      if (!textReaderOpen || textReaderEditing || !textReader) return;
+      const node = findNode(readingNodeId);
+      const content = textReader.querySelector('[data-role="text-reader-content"]');
+      if (!node || !content || content.hidden) return;
+      if (isCodeNode(node)) {
+        if (nodeAnnotSvg) nodeAnnotSvg.remove();
+        nodeAnnotSvg = null;
+        return;
+      }
+      const W = content.clientWidth, H = content.scrollHeight;
+      if (!Number.isFinite(W) || !Number.isFinite(H) || W < 40 || H < 20 || H / W > 300) {
+        clearNodeSpatialAnnotations(node, '阅读版心尺寸异常');
+        if (nodeAnnotSvg) nodeAnnotSvg.remove();
+        nodeAnnotSvg = null;
+        return;
+      }
+      if (!nodeAnnotSvg || !content.contains(nodeAnnotSvg)) {
+        nodeAnnotSvg = document.createElementNS(SVG_NS, 'svg');
+        nodeAnnotSvg.setAttribute('class', 'node-annot-svg');
+        nodeAnnotSvg.setAttribute('preserveAspectRatio', 'none');
+        nodeAnnotSvg.addEventListener('pointerdown', onNodeAnnotPointerDown);
+        content.appendChild(nodeAnnotSvg);
+      }
+      nodeAnnotSvg.setAttribute('viewBox', '0 0 ' + NODE_ANNOT_VW + ' ' + Math.round(NODE_ANNOT_VW * H / W));
+      refreshNodeAnnotTools();
+      redrawNodeAnnotations();
+    }
+    function refreshNodeAnnotTools() {
+      if (!textReader) return;
+      textReader.classList.toggle('node-annot-draw', !!nodeAnnotTool);
+      if (nodeAnnotSvg) {
+        nodeAnnotSvg.classList.toggle('armed', !!nodeAnnotTool);
+        nodeAnnotSvg.classList.toggle('erasing', nodeAnnotTool === 'eraser');
+      }
+      const map = { pen: 'node-annot-pen', box: 'node-annot-box', eraser: 'node-annot-eraser' };
+      Object.keys(map).forEach((tool) => {
+        const btn = textReader.querySelector('[data-role="' + map[tool] + '"]');
+        if (btn) btn.classList.toggle('active', nodeAnnotTool === tool);
+      });
+      textReader.querySelectorAll('[data-node-annot-color]').forEach((b) => {
+        b.classList.toggle('active', (b.dataset.nodeAnnotColor || '').toLowerCase() === nodeAnnotColor.toLowerCase());
+      });
+    }
+    function setNodeAnnotTool(tool) {
+      nodeAnnotTool = nodeAnnotTool === tool ? null : tool;
+      refreshNodeAnnotTools();
+    }
+    function nodeAnnotStrokeHit(s, v) {
+      const pts = (s.pts || []).map((a) => ({ x: a[0] * NODE_ANNOT_VW, y: a[1] * NODE_ANNOT_VW }));
+      const t = 14 + ((s.w || 0.0045) * NODE_ANNOT_VW) / 2;
+      if (pts.length === 1) return Math.hypot(pts[0].x - v.x, pts[0].y - v.y) <= t;
+      for (let i = 0; i < pts.length - 1; i++) if (distToSeg(v.x, v.y, pts[i], pts[i + 1]) <= t) return true;
+      return false;
+    }
+    function onNodeAnnotPointerDown(e) {
+      if (!nodeAnnotTool || !nodeAnnotSvg) return;
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const svg = nodeAnnotSvg;
+      const vb = (svg.getAttribute('viewBox') || '').split(/\s+/).map(Number);
+      const VH = vb[3] || NODE_ANNOT_VW;
+      const toV = (cx, cy) => { const r = svg.getBoundingClientRect(); return { x: (cx - r.left) / r.width * NODE_ANNOT_VW, y: (cy - r.top) / r.height * VH }; };
+      try { svg.setPointerCapture(e.pointerId); } catch (_) {}
+      const st = nodeAnnotState(findNode(readingNodeId));
+      if (nodeAnnotTool === 'eraser') {
+        let changed = false;
+        const erase = (ev) => {
+          const v = toV(ev.clientX, ev.clientY);
+          const boxes = st.boxes.filter((b) => !(v.x >= b.x * NODE_ANNOT_VW && v.x <= (b.x + b.w) * NODE_ANNOT_VW && v.y >= b.y * NODE_ANNOT_VW && v.y <= (b.y + b.h) * NODE_ANNOT_VW));
+          const strokes = st.strokes.filter((s) => !nodeAnnotStrokeHit(s, v));
+          if (boxes.length !== st.boxes.length || strokes.length !== st.strokes.length) {
+            if (!changed) pushNodeAnnotHistory();
+            st.boxes = boxes; st.strokes = strokes; changed = true; redrawNodeAnnotations();
+          }
+        };
+        erase(e);
+        const move = (ev) => erase(ev);
+        const up = (ev) => { svg.removeEventListener('pointermove', move); svg.removeEventListener('pointerup', up); svg.removeEventListener('pointercancel', up); try { svg.releasePointerCapture(ev.pointerId); } catch (_) {} if (changed) scheduleNodeAnnotationsSave(); };
+        svg.addEventListener('pointermove', move); svg.addEventListener('pointerup', up); svg.addEventListener('pointercancel', up);
+        return;
+      }
+      const start = toV(e.clientX, e.clientY);
+      if (nodeAnnotTool === 'box') {
+        const live = document.createElementNS(SVG_NS, 'rect');
+        live.setAttribute('class', 'node-annot-box node-annot-box-live'); live.setAttribute('stroke', nodeAnnotColor); svg.appendChild(live);
+        const draw = (v) => { live.setAttribute('x', Math.min(start.x, v.x)); live.setAttribute('y', Math.min(start.y, v.y)); live.setAttribute('width', Math.abs(v.x - start.x)); live.setAttribute('height', Math.abs(v.y - start.y)); };
+        const move = (ev) => draw(toV(ev.clientX, ev.clientY));
+        const up = (ev) => { svg.removeEventListener('pointermove', move); svg.removeEventListener('pointerup', up); svg.removeEventListener('pointercancel', up); try { svg.releasePointerCapture(ev.pointerId); } catch (_) {} const end = toV(ev.clientX, ev.clientY); live.remove(); if (Math.abs(end.x - start.x) < 8 || Math.abs(end.y - start.y) < 8) return; const r4 = (n) => Math.round(n * 1e4) / 1e4; pushNodeAnnotHistory(); st.boxes.push({ x: r4(Math.min(start.x, end.x) / NODE_ANNOT_VW), y: r4(Math.min(start.y, end.y) / NODE_ANNOT_VW), w: r4(Math.abs(end.x - start.x) / NODE_ANNOT_VW), h: r4(Math.abs(end.y - start.y) / NODE_ANNOT_VW), color: nodeAnnotColor }); redrawNodeAnnotations(); scheduleNodeAnnotationsSave(); };
+        draw(start); svg.addEventListener('pointermove', move); svg.addEventListener('pointerup', up); svg.addEventListener('pointercancel', up);
+        return;
+      }
+      const usePressure = penPressureOn(), maxW = 0.0045 * NODE_ANNOT_VW, pts = [];
+      const add = (ev) => { const v = toV(ev.clientX, ev.clientY); v.p = usePressure ? pointerPressure(ev) : 0.5; pts.push(v); };
+      add(e);
+      const live = document.createElementNS(SVG_NS, 'path'); live.setAttribute('class', 'node-annot-stroke'); live.setAttribute('fill', nodeAnnotColor); svg.appendChild(live);
+      const draw = () => live.setAttribute('d', pressureStrokeD(pts, maxW)); draw();
+      const move = (ev) => { const evs = ev.getCoalescedEvents && ev.getCoalescedEvents().length ? ev.getCoalescedEvents() : [ev]; evs.forEach(add); draw(); };
+      const up = (ev) => { svg.removeEventListener('pointermove', move); svg.removeEventListener('pointerup', up); svg.removeEventListener('pointercancel', up); try { svg.releasePointerCapture(ev.pointerId); } catch (_) {} live.remove(); if (!pts.length) return; const r4 = (n) => Math.round(n * 1e4) / 1e4; const r3 = (n) => Math.round(n * 1e3) / 1e3; pushNodeAnnotHistory(); const sp = simplifyAnnotPts(pts, 0.4); st.strokes.push({ color: nodeAnnotColor, w: r4(maxW / NODE_ANNOT_VW), pts: sp.map((p) => [r4(p.x / NODE_ANNOT_VW), r4(p.y / NODE_ANNOT_VW), r3(p.p)]) }); redrawNodeAnnotations(); scheduleNodeAnnotationsSave(); };
+      svg.addEventListener('pointermove', move); svg.addEventListener('pointerup', up); svg.addEventListener('pointercancel', up);
+    }
+    // 阅读浮层展示的正文：仅当“正文第一行”就是与标题重复的标题行时，去掉它（纯前缀删除，
+    // 便于把预览里的偏移精确换算回完整 body）。返回展示文字、偏移和对应的结构化格式。
+    function readerDisplayBody(node) {
+      const full = String(node.body || '');
+      if (isCodeNode(node)) return { text: full, offset: 0, marks: [] };
+      const fullMarks = richMarks(node, 'body');
+      const lines = full.split('\n');
+      const m = lines.length ? /^\s*#{1,6}\s+(.+?)\s*$/.exec(lines[0]) : null;
+      if (m && m[1].trim() === String(node.text || '').trim()) {
+        let remove = 1;
+        if (lines.length > 1 && lines[1].trim() === '') remove = 2;
+        const display = lines.slice(remove).join('\n');
+        const offset = full.length - display.length;
+        return { text: display, offset: offset, marks: richSlice(node, 'body', offset, full.length) };
+      }
+      return { text: full, offset: 0, marks: fullMarks };
+    }
+    function refreshReaderTocActive(toc, content, scroll) {
+      if (!toc || toc.hidden || !content || !scroll) return;
+      const headings = Array.from(content.querySelectorAll('[data-reader-section]'));
+      if (!headings.length) return;
+      const scrollTop = scroll.getBoundingClientRect().top;
+      let active = headings[0];
+      headings.forEach(function (heading) {
+        if (heading.getBoundingClientRect().top <= scrollTop + 34) active = heading;
+      });
+      toc.querySelectorAll('.text-reader-toc-link').forEach(function (btn) {
+        btn.classList.toggle('active', btn.dataset.readerSection === active.dataset.readerSection);
+      });
+    }
+    function buildReaderToc(toc, content, scroll, enabled) {
+      if (!toc) return;
+      toc.innerHTML = '';
+      toc.hidden = true;
+      if (!enabled || !content || !scroll) return;
+      const headings = Array.from(content.querySelectorAll('h2, h3, h4')).filter(function (heading) {
+        return !!heading.textContent.trim();
+      });
+      if (!headings.length) return;
+      const label = document.createElement('div');
+      label.className = 'text-reader-toc-label';
+      label.textContent = '目录';
+      toc.appendChild(label);
+      headings.forEach(function (heading, idx) {
+        const key = String(idx);
+        heading.dataset.readerSection = key;
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'text-reader-toc-link level-' + heading.tagName.toLowerCase();
+        btn.dataset.readerSection = key;
+        btn.textContent = heading.textContent.trim();
+        btn.addEventListener('click', function () {
+          const current = content.querySelector('[data-reader-section="' + key + '"]');
+          if (!current) return;
+          const top = current.getBoundingClientRect().top - scroll.getBoundingClientRect().top + scroll.scrollTop - 18;
+          scroll.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
+        });
+        toc.appendChild(btn);
+      });
+      toc.hidden = false;
+      toc.__readerContent = content;
+      if (!scroll.__readerTocSetup) {
+        scroll.__readerTocSetup = true;
+        scroll.addEventListener('scroll', function () {
+          const liveToc = scroll.__readerToc;
+          refreshReaderTocActive(liveToc, liveToc && liveToc.__readerContent, scroll);
+        }, { passive: true });
+        if (global.ResizeObserver) {
+          scroll.__readerTocResize = new ResizeObserver(function () {
+            const liveToc = scroll.__readerToc;
+            refreshReaderTocActive(liveToc, liveToc && liveToc.__readerContent, scroll);
+          });
+          scroll.__readerTocResize.observe(scroll);
+        }
+      }
+      scroll.__readerToc = toc;
+      refreshReaderTocActive(toc, content, scroll);
+    }
+    // ── 索引节点阅读：左目录栏 + 右只读阅读区（Obsidian 式）──────────────────
+    // 左栏（renderIndexReaderNav）：沿连线自动生成的目录树，点一项在右栏阅读、双击跳到画布节点。
+    // 右栏（renderIndexReaderPane）：按 indexReaderTargetId 渲染该项内容（正文 / 代码 / MD），
+    //   未选或目标失效时回落到索引节点自身正文当“总览”，再没有就给一句提示。
+    //   纯只读：右栏不编辑、不批注（批注 / 编辑仍走各自的 F 浮层），PDF 第二轮再内嵌。
+    function renderIndexReaderNav(nav, node) {
+      const info = buildIndexTree(node, 4);
+      if (!nav) return info;
+      nav.innerHTML = '';
+      const label = document.createElement('div');
+      label.className = 'index-reader-nav-label';
+      label.textContent = '目录';
+      nav.appendChild(label);
+      if (!info.count) {
+        const hint = document.createElement('div');
+        hint.className = 'index-reader-nav-empty';
+        hint.textContent = '把索引节点连到其它节点，这里会自动生成目录。';
+        nav.appendChild(hint);
+        return info;
+      }
+      function appendItems(items, prefix, idPath) {
+        items.forEach(function (item, idx) {
+          const number = prefix.concat(idx + 1);
+          const chain = idPath.concat(item.id);   // 根索引 → … → 该条目 的节点 id 链
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'index-reader-nav-item level-' + Math.min(item.depth, 4)
+            + (item.id === indexReaderTargetId ? ' active' : '');
+          btn.dataset.indexNodeId = item.id;
+          btn.dataset.indexPath = chain.join(',');
+          btn.style.setProperty('--index-level', String(item.depth - 1));
+          const num = document.createElement('span');
+          num.className = 'index-reader-nav-num';
+          num.textContent = number.join('.');
+          const main = document.createElement('span');
+          main.className = 'index-reader-nav-main';
+          const title = document.createElement('span');
+          title.className = 'index-reader-nav-title';
+          title.textContent = item.title;
+          const meta = document.createElement('span');
+          meta.className = 'index-reader-nav-meta';
+          meta.textContent = item.summary;
+          main.appendChild(title);
+          main.appendChild(meta);
+          btn.appendChild(num);
+          btn.appendChild(main);
+          nav.appendChild(btn);
+          if (item.children && item.children.length) appendItems(item.children, number, chain);
+        });
+      }
+      appendItems(info.children, [], [node.id]);
+      return info;
+    }
+    function renderIndexReaderPane(indexNode) {
+      if (!textReader) return;
+      const content = textReader.querySelector('[data-role="text-reader-content"]');
+      const paneHead = textReader.querySelector('[data-role="index-pane-head"]');
+      const empty = textReader.querySelector('[data-role="text-reader-empty"]');
+      const mdHost = textReader.querySelector('[data-role="index-pane-md-host"]');
+      if (!content) return;
+      const target = indexReaderTargetId ? findNode(indexReaderTargetId) : null;
+      const keepMd = !!(target && isMdNode(target) && indexPaneMdNodeId === target.id);   // 同一篇 MD 仅层级重渲 → 不重载
+      // 切走内嵌 PDF（换别的项 / 同一篇也算除非下面命中保留）→ 释放那份 PDF.js 文档与懒渲染监听
+      if (indexPanePdfNodeId && (!target || target.id !== indexPanePdfNodeId)) {
+        disposeIndexPanePdf();
+        indexPanePdfNodeId = null;
+      }
+      // 离开当前 MD 项 → 收起并清空 MD 宿主（含覆盖层引用）
+      if (mdHost && !keepMd) { mdHost.hidden = true; mdHost.innerHTML = ''; indexPaneMdSvg = null; }
+      if (!(target && isMdNode(target))) indexPaneMdNodeId = null;
+      // 切项前清掉上一项遗留：MathJax DOM、渲染幂等判据、附加类
+      if (content.dataset.hasMath === '1') { try { clearMath(content); } catch (e) {} }
+      delete content.dataset.hasMath;
+      delete content.dataset.source;
+      delete content.dataset.codeLanguage;
+      delete content.dataset.indexReader;
+      indexPaneMdToken += 1;   // 作废任何在途的右栏 MD 加载（防快速连点时旧请求覆盖新内容）
+      // 未选 / 目标已删 → 看索引节点自身正文当“总览”，再没有就提示
+      if (!target) {
+        if (paneHead) paneHead.hidden = true;
+        const disp = readerDisplayBody(indexNode);
+        if (disp.text.trim()) {
+          content.hidden = false;
+          renderNodeText(content, disp.text, disp.marks);
+          if (empty) empty.hidden = true;
+        } else {
+          content.hidden = true;
+          content.innerHTML = '';
+          if (empty) {
+            empty.hidden = false;
+            const et = empty.querySelector('[data-role="text-reader-empty-text"]');
+            if (et) et.textContent = '从左侧目录选择一项，在这里阅读它的内容。';
+          }
+        }
+        return;
+      }
+      if (empty) empty.hidden = true;
+      if (paneHead) {
+        paneHead.hidden = false;
+        const k = paneHead.querySelector('[data-role="index-pane-kicker"]');
+        const t = paneHead.querySelector('[data-role="index-pane-title"]');
+        if (k) k.textContent = indexNodeSummary(target);
+        if (t) renderInlineMarkdown(t, indexNodeTitle(target), richMarks(target, 'text'));
+      }
+      if (isMdNode(target)) {
+        // MD 渲染到 .text-reader-content 之外的专用宿主（浮层同款样式 → 笔迹/盒子贴合）
+        content.hidden = true;
+        if (mdHost) {
+          mdHost.hidden = false;
+          if (!keepMd) renderIndexPaneMd(mdHost, target);
+        }
+      } else if (isPdfNode(target)) {
+        content.hidden = false;
+        // 内嵌只读 PDF（独立文档懒渲染）。同一篇仅因层级变化重渲时保留现有页面，不重载。
+        if (indexPanePdfNodeId === target.id && indexPanePdfDoc) {
+          // 已在显示这篇，无需动作
+        } else {
+          indexPanePdfNodeId = target.id;
+          renderIndexPanePdf(content, target);
+        }
+      } else if (isCodeNode(target)) {
+        content.hidden = false;
+        // 代码节点：非代码阅读模式下 pre.md-code 自带围栏代码块样式，无需额外类
+        renderCodeNodeText(content, readerDisplayBody(target).text, target.language);
+      } else {
+        content.hidden = false;
+        const targetDisplay = readerDisplayBody(target);
+        renderNodeText(content, targetDisplay.text, targetDisplay.marks);
+      }
+    }
+    // 右栏渲染 MD 附件正文（只读）：正文 + 已有批注（文字高光/字色/字号 + 钢笔笔迹 + 盒子）的只读复刻。
+    // 关键：MD 笔迹/盒子按「内容框宽度」归一化存盘，必须与 MD 专用浮层**逐行排版一致**才贴合。
+    // 故右栏按「MD 专用浮层在当前窗口对这篇的真实正文宽」渲染正文（用浮层 DOM 实测，自带目录/媒体查询/滚动条，
+    // 比纯公式可靠），再把整块（正文+批注层）等比缩放塞进较窄的右栏宽度——文字与笔迹一起缩放，永远对齐。增改批注仍在专用浮层。
+    // 量出 MD 专用浮层渲染这篇时的真实正文宽：往隐藏的浮层 DOM 里塞个等宽探针测 offsetWidth。
+    // 复刻目录显隐（有标题才显示，窄屏再被媒体查询藏掉）与竖向滚动条占位，得到与浮层逐像素一致的版心宽。
+    function measureMdReaderBodyWidth(hasHeadings) {
+      if (!mdReader) return 760;
+      const content = mdReader.querySelector('[data-role="md-reader-content"]');
+      if (!content) return 760;
+      const toc = mdReader.querySelector('[data-role="md-reader-toc"]');
+      const wasHidden = mdReader.hidden;
+      const prevVis = mdReader.style.visibility;
+      const prevToc = toc ? toc.hidden : null;
+      mdReader.style.visibility = 'hidden';   // 保持布局、不绘制，避免闪一下
+      mdReader.hidden = false;
+      if (toc) toc.hidden = !hasHeadings;      // 有标题→显示目录（与 buildReaderToc 同口径；<900px 媒体查询会再藏）
+      const probe = document.createElement('div');
+      probe.className = 'attach-md-body';
+      probe.style.height = '3000px';           // 撑出竖向滚动条，让测得宽度计入滚动条占位（与真实渲染一致）
+      probe.style.visibility = 'hidden';
+      content.appendChild(probe);
+      const w = probe.offsetWidth || 760;
+      content.removeChild(probe);
+      mdReader.hidden = wasHidden;
+      mdReader.style.visibility = prevVis;
+      if (toc && prevToc !== null) toc.hidden = prevToc;
+      return w;
+    }
+    // host = .index-pane-md-host（在 .text-reader-content 之外）。结构复刻 MD 专用浮层：
+    // .index-pane-md-fit > .index-pane-md-scale > .md-reader-content > .attach-md-body.node-text。
+    // 这样 Markdown 元素只吃 .node-text / .md-reader-content 样式（与浮层逐行一致），不被 .text-reader-content 的大标题样式干扰。
+    function renderIndexPaneMd(host, node) {
+      indexPaneMdBase = null;
+      indexPaneMdSvg = null;
+      indexPaneMdNodeId = node.id;
+      host.innerHTML = '<div class="attach-status">正在载入…</div>';
+      const src = decorationAssetUrl(node);
+      const token = indexPaneMdToken;   // 进入时的票据；回来时若已变说明切了别的项，丢弃结果
+      fetch(src).then(function (r) { return r.ok ? r.text() : Promise.reject(new Error('读取失败')); }).then(function (text) {
+        if (token !== indexPaneMdToken || indexReaderTargetId !== node.id) return;
+        const fp = mdContentFp(text);
+        const md = global.MarkdownMini;
+        const html = md ? md.render(text)
+          : ('<pre>' + text.replace(/[&<>]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]; }) + '</pre>');
+        host.innerHTML = '';
+        const fit = document.createElement('div');     // 裁剪 + 占据缩放后高度的外框
+        fit.className = 'index-pane-md-fit';
+        const scaleEl = document.createElement('div'); // 固定「浮层版心宽」、整体 transform 缩放的内层
+        scaleEl.className = 'index-pane-md-scale';
+        const mdc = document.createElement('div');     // 复用浮层正文容器样式（字号/版心/内边距）
+        mdc.className = 'md-reader-content';
+        const body = document.createElement('div');
+        body.className = 'attach-md-body node-text';   // 复用浮层正文样式（紧凑标题/段距，与笔迹归一化一致）
+        body.innerHTML = html;
+        mdc.appendChild(body);
+        scaleEl.appendChild(mdc);
+        fit.appendChild(scaleEl);
+        host.appendChild(fit);
+        if (hasMathSource(text)) body.dataset.hasMath = '1';
+        // Mermaid 图表渲染（异步）。与 MD 专用浮层同口径：必须等所有图表都画完，再捕净快照 + 测高对齐，
+        // 否则 ① indexPaneMdBase 里缺 SVG，下面 applyMarksToBody 会把已渲染的图洗回占位；
+        //      ② syncIndexPaneMdAnnot 在图表撑高前测 body 高度，fit 外框(overflow:hidden)被设过矮 → 底部内容被裁、滚不到底。
+        var mermaidDone = renderMermaidDiagrams(body);
+        // 右栏正文宽 = 浮层渲染这篇时的真实正文宽（笔迹按该宽归一化）；换行逐行一致才贴合
+        const hasHeadings = body.querySelectorAll('h2,h3').length > 0;
+        indexPaneMdRefW = measureMdReaderBodyWidth(hasHeadings);
+        scaleEl.style.width = indexPaneMdRefW + 'px';   // body 由 .md-reader-content .attach-md-body 的 max-width + 容器宽自然撑满
+        whenMathReady(function () {
+          Promise.all([
+            Promise.resolve(typesetMath(body)),
+            mermaidDone || Promise.resolve()
+          ]).then(function () {
+            if (token !== indexPaneMdToken || indexReaderTargetId !== node.id) return;
+            indexPaneMdBase = body.innerHTML;                 // 净快照（含已排版公式 + Mermaid SVG，无批注）
+            loadMdAnnot(node, fp).then(function () {
+              if (token !== indexPaneMdToken || indexReaderTargetId !== node.id) return;
+              const st = mdAnnotState(node.id);
+              applyMarksToBody(body, indexPaneMdBase, st.marks);   // 文字高光/字色/字号（按字符偏移，任何宽度都准）
+              syncIndexPaneMdAnnot();                              // 钢笔笔迹 + 盒子覆盖层 + 等比缩放
+            });
+          });
+        }, body);
+      }).catch(function (err) {
+        if (token !== indexPaneMdToken) return;
+        host.innerHTML = '<div class="attach-status attach-error">Markdown 载入失败</div>';
+        console.warn('[画布] 索引右栏 Markdown 载入失败', err);
+      });
+    }
+    // 给右栏 MD 算等比缩放（固定浮层版心 → 缩进右栏宽）并在该坐标系下绘制只读笔迹/盒子。
+    function syncIndexPaneMdAnnot() {
+      if (!textReader || !indexPaneMdNodeId) return;
+      const host = textReader.querySelector('[data-role="index-pane-md-host"]');
+      const fit = host && host.querySelector('.index-pane-md-fit');
+      const scaleEl = fit && fit.querySelector('.index-pane-md-scale');
+      const mdc = scaleEl && scaleEl.querySelector('.md-reader-content');
+      const body = mdc && mdc.querySelector('.attach-md-body');
+      if (!host || !fit || !scaleEl || !mdc || !body) return;
+      const W = body.offsetWidth || indexPaneMdRefW || 760;    // = 浮层版心宽
+      const H = body.offsetHeight || body.scrollHeight || W;
+      const fitW = fit.clientWidth || W;
+      const scale = Math.min(1, fitW / W);                     // 右栏窄于版心就等比缩小
+      scaleEl.style.transform = scale < 1 ? ('scale(' + scale + ')') : 'none';
+      fit.style.height = Math.ceil(H * scale) + 'px';          // 外框占据缩放后的高度，保证滚动正确
+      const st = mdAnnotStore.get(indexPaneMdNodeId);
+      const strokes = (st && st.strokes) ? st.strokes : [];
+      const boxes = (st && st.boxes) ? st.boxes : [];
+      if (!strokes.length && !boxes.length) {
+        if (indexPaneMdSvg) { indexPaneMdSvg.remove(); indexPaneMdSvg = null; }
+        return;
+      }
+      let svg = indexPaneMdSvg;
+      if (!svg || !svg.isConnected) {
+        svg = document.createElementNS(SVG_NS, 'svg');
+        svg.setAttribute('class', 'md-annot-svg');   // 复用样式：position:absolute + pointer-events:none（无 .armed = 只读）
+        svg.setAttribute('preserveAspectRatio', 'none');
+        mdc.appendChild(svg);                        // 挂到 .md-reader-content（body 的定位父级），随缩放层一起等比缩放
+        indexPaneMdSvg = svg;
+      }
+      svg.style.left = body.offsetLeft + 'px';
+      svg.style.top = body.offsetTop + 'px';
+      svg.style.width = W + 'px';
+      svg.style.height = H + 'px';
+      svg.setAttribute('viewBox', '0 0 ' + MD_ANNOT_VW + ' ' + Math.round(MD_ANNOT_VW * H / W));
+      svg.innerHTML = '';
+      boxes.forEach(function (b) {
+        const rect = document.createElementNS(SVG_NS, 'rect');
+        rect.setAttribute('class', 'md-annot-box');
+        rect.setAttribute('x', b.x * MD_ANNOT_VW);
+        rect.setAttribute('y', b.y * MD_ANNOT_VW);
+        rect.setAttribute('width', b.w * MD_ANNOT_VW);
+        rect.setAttribute('height', b.h * MD_ANNOT_VW);
+        rect.setAttribute('stroke', b.color || '#f4b740');
+        svg.appendChild(rect);
+      });
+      strokes.forEach(function (s) { svg.appendChild(mdStrokePathEl(s)); });
+    }
+    // 右栏内嵌 PDF（只读，无批注）：独立文档 + 懒渲染，借鉴专用浮层但精简成纯 canvas 页。
+    // 与画布卡片共用同一文件但各自一份 PDF.js 文档（专用浮层亦如此），互不干扰生命周期。
+    function disposeIndexPanePdf() {
+      indexPanePdfToken += 1;   // 作废任何在途加载
+      if (indexPanePdfObserver) { try { indexPanePdfObserver.disconnect(); } catch (e) {} indexPanePdfObserver = null; }
+      destroyPdfLoadingTask(indexPanePdfLoadingTask);
+      indexPanePdfLoadingTask = null;
+      if (textReader) textReader.querySelectorAll('.index-pane-pdf-page').forEach(function (pageEl) {
+        cancelPdfRenderTask(pageEl);
+        pageEl.querySelectorAll('canvas').forEach(function (canvas) { canvas.width = 0; canvas.height = 0; });
+      });
+      destroyPdfDocument(indexPanePdfDoc);
+      indexPanePdfDoc = null;
+    }
+    function renderIndexPanePdf(content, node) {
+      disposeIndexPanePdf();                 // 先拆掉上一篇右栏 PDF
+      indexPanePdfAnnot = {};
+      const token = indexPanePdfToken;       // disposeIndexPanePdf 刚自增过，这是本次票据
+      content.innerHTML = '<div class="attach-status">正在载入 PDF…</div>';
+      const scroll = textReader && textReader.querySelector('[data-role="text-reader-scroll"]');
+      let loadingTask = null;
+      let loadCancelled = false;
+      Promise.all([
+        loadPdfjs().then(function (lib) {
+          if (loadCancelled || token !== indexPanePdfToken || indexReaderTargetId !== node.id) {
+            throw new Error('PDF load superseded');
+          }
+          loadingTask = lib.getDocument({
+            url: decorationAssetUrl(node), cMapUrl: PDFJS_BASE + 'cmaps/', cMapPacked: true,
+            standardFontDataUrl: PDFJS_BASE + 'standard_fonts/',
+          });
+          indexPanePdfLoadingTask = loadingTask;
+          return loadingTask.promise;
+        }),
+        loadIndexPanePdfAnnot(node),          // 同时拉批注（独立 fetch，不碰全局 pdfAnnot）
+      ]).then(function (results) {
+        const doc = results[0];
+        if (indexPanePdfLoadingTask === loadingTask) indexPanePdfLoadingTask = null;
+        if (token !== indexPanePdfToken || indexReaderTargetId !== node.id) {
+          destroyPdfDocument(doc);
+          return;
+        }
+        indexPanePdfDoc = doc;
+        indexPanePdfAnnot = results[1] || {};
+        return doc.getPage(1).then(function (page) {
+          const vp = page.getViewport({ scale: 1 });
+          indexPanePdfRatio = vp.height / vp.width;
+          buildIndexPanePdfPages(content, scroll, doc.numPages, token);
+        });
+      }).catch(function (err) {
+        loadCancelled = true;
+        if (indexPanePdfLoadingTask === loadingTask) {
+          indexPanePdfLoadingTask = null;
+          destroyPdfLoadingTask(loadingTask);
+        }
+        if (token !== indexPanePdfToken) return;
+        destroyPdfDocument(indexPanePdfDoc);
+        indexPanePdfDoc = null;
+        content.innerHTML = '<div class="attach-status attach-error">PDF 载入失败</div>';
+        console.warn('[画布] 索引右栏 PDF 载入失败', err);
+      });
+    }
+    function buildIndexPanePdfPages(content, scroll, numPages, token) {
+      if (token !== indexPanePdfToken) return;
+      content.innerHTML = '';
+      const wrap = document.createElement('div');
+      wrap.className = 'index-pane-pdf';
+      content.appendChild(wrap);
+      const observer = new IntersectionObserver(function (items) {
+        items.forEach(function (it) {
+          it.target.dataset.pdfVisible = it.isIntersecting ? '1' : '0';
+          if (it.isIntersecting) renderIndexPanePdfPage(it.target, token);
+          else unloadIndexPanePdfPage(it.target);
+        });
+      }, { root: scroll || null, rootMargin: '600px 0px' });
+      indexPanePdfObserver = observer;
+      const guessW = Math.max(40, (scroll ? scroll.clientWidth : 700) - 8);
+      const guessH = Math.round(Math.min(900, guessW) * (indexPanePdfRatio || 1.414));
+      for (let p = 1; p <= numPages; p++) {
+        const pageEl = document.createElement('div');
+        pageEl.className = 'index-pane-pdf-page';
+        pageEl.dataset.page = String(p);
+        pageEl.style.minHeight = guessH + 'px';
+        wrap.appendChild(pageEl);
+        observer.observe(pageEl);
+      }
+      // 首屏兜底：浮层刚出时 observer 初次回调偶发不触发，主动渲染前两页（renderIndexPanePdfPage 自带防重）
+      const kick = function () {
+        if (token !== indexPanePdfToken || !indexPanePdfDoc) return;
+        const a = wrap.querySelector('.index-pane-pdf-page[data-page="1"]');
+        if (a) renderIndexPanePdfPage(a, token);
+        const b = wrap.querySelector('.index-pane-pdf-page[data-page="2"]');
+        if (b) renderIndexPanePdfPage(b, token);
+      };
+      requestAnimationFrame(kick);
+      setTimeout(kick, 120);
+    }
+    function renderIndexPanePdfPage(pageEl, token) {
+      if (token !== indexPanePdfToken || !indexPanePdfDoc) return;
+      if (pageEl.dataset.rendered === '1' || pageEl.dataset.rendering === '1') return;
+      const p = parseInt(pageEl.dataset.page, 10);
+      pageEl.dataset.rendering = '1';
+      indexPanePdfDoc.getPage(p).then(function (page) {
+        if (token !== indexPanePdfToken || !pageEl.isConnected || pageEl.dataset.pdfVisible === '0') {
+          pageEl.dataset.rendering = '';
+          return;
+        }
+        const cssW = pageEl.clientWidth || 700;
+        const base = page.getViewport({ scale: 1 });
+        const dpr = Math.min(2, global.devicePixelRatio || 1);
+        const vp = page.getViewport({ scale: (cssW / base.width) * dpr });
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.round(vp.width);
+        canvas.height = Math.round(vp.height);
+        const ctx = canvas.getContext('2d');
+        const renderTask = page.render({ canvasContext: ctx, viewport: vp });
+        pageEl.__pdfRenderTask = renderTask;
+        return renderTask.promise.then(function () {
+          if (token !== indexPanePdfToken || !pageEl.isConnected || pageEl.dataset.pdfVisible === '0') {
+            canvas.width = 0; canvas.height = 0;
+            pageEl.dataset.rendering = '';
+            return;
+          }
+          pageEl.style.minHeight = '';
+          pageEl.innerHTML = '';
+          pageEl.appendChild(canvas);
+          drawIndexPanePdfAnnot(pageEl, p);   // 盖上该页只读批注（高光/下划线/钢笔/荧光笔/盒子/便签）
+          pageEl.dataset.rendered = '1';
+          pageEl.dataset.rendering = '';
+        }).finally(function () {
+          if (pageEl.__pdfRenderTask === renderTask) pageEl.__pdfRenderTask = null;
+        });
+      }).catch(function (err) {
+        pageEl.dataset.rendering = '';
+        if (!isPdfRenderCancelled(err) && token === indexPanePdfToken && pageEl.isConnected) {
+          console.warn('[画布] 索引右栏 PDF 页渲染失败', err);
+        }
+      });
+    }
+    function unloadIndexPanePdfPage(pageEl) {
+      if (!pageEl) return;
+      cancelPdfRenderTask(pageEl);
+      if (pageEl.dataset.rendered !== '1') {
+        pageEl.dataset.rendering = '';
+        return;
+      }
+      const h = pageEl.clientHeight;
+      if (h > 0) pageEl.style.minHeight = h + 'px';
+      pageEl.querySelectorAll('canvas').forEach(function (canvas) {
+        canvas.width = 0; canvas.height = 0;
+      });
+      pageEl.innerHTML = '';
+      pageEl.dataset.rendered = '';
+      pageEl.dataset.rendering = '';
+    }
+    function loadIndexPanePdfAnnot(node) {
+      return fetch('/api/canvas-annotation?path=' + encodeURIComponent(filePath)
+        + '&asset=' + encodeURIComponent(node.assetPath || ''))
+        .then(function (r) { return r.json(); }).then(function (res) {
+          const ann = res && res.annotation;
+          return (ann && ann.pages && typeof ann.pages === 'object') ? ann.pages : {};
+        }).catch(function () { return {}; });
+    }
+    // 在右栏某页 canvas 上盖只读批注层。PDF 坐标页内归一化 → 精确对齐，与显示缩放无关。
+    // 复用浮层的纯元素构造器（pdfThlRectEl/pdfTulEl/pdfBoxEl/pdfAnnotPathEl），不加指针交互 = 只读。
+    function drawIndexPanePdfAnnot(pageEl, pageNo) {
+      const items = indexPanePdfAnnot[pageNo];
+      if (!items || !items.length) return;
+      const ratio = indexPanePdfRatio || 1.414;
+      const svg = document.createElementNS(SVG_NS, 'svg');
+      svg.setAttribute('class', 'pdf-annot-svg');   // 复用样式：absolute inset:0 + pointer-events:none（无 .armed = 只读）
+      svg.setAttribute('viewBox', '0 0 ' + PDF_ANNOT_VW + ' ' + Math.round(PDF_ANNOT_VW * ratio));
+      svg.setAttribute('preserveAspectRatio', 'none');
+      let notes = null;
+      items.forEach(function (it) {
+        if (it.kind === 'thl') (it.rects || []).forEach(function (rc) { svg.appendChild(pdfThlRectEl(it, rc)); });
+        else if (it.kind === 'tul') (it.rects || []).forEach(function (rc) { svg.appendChild(pdfTulEl(it, rc)); });
+        else if (it.kind === 'box') svg.appendChild(pdfBoxEl(it));
+        else if (it.kind === 'note') {
+          if (!notes) { notes = document.createElement('div'); notes.className = 'index-pane-pdf-notes'; }
+          const n = document.createElement('div');
+          n.className = 'index-pane-pdf-note';
+          n.style.left = (it.x * 100) + '%';
+          n.style.top = (it.y / ratio * 100) + '%';
+          n.style.width = (it.w * 100) + '%';
+          n.style.height = (it.h / ratio * 100) + '%';
+          n.style.setProperty('--note-bg', it.color || '#ffe9a3');
+          n.textContent = it.text || '';
+          notes.appendChild(n);
+        } else if (!it.kind) {
+          svg.appendChild(pdfAnnotPathEl(it));   // 钢笔 / 荧光笔笔画
+        }
+      });
+      pageEl.appendChild(svg);
+      if (notes) pageEl.appendChild(notes);
+    }
+    function jumpToIndexNode(id) {
+      const target = findNode(id);
+      if (!target) return;
+      closeTextReader();             // 关浮窗再定位，让用户看清飞到了哪个节点 + 闪烁
+      selectNodes([target.id], false);
+      centerOnNode(target.id);
+      flashNode(target.id);
+    }
+    // 阅读浮层透明度（正文 / 索引 / MD 共用，存 canvas:readerOpacity）。
+    // 只改卡片白底 alpha 变量 --reader-surface-alpha，不动 backdrop blur → 不影响帧率（同图谱滑条惯例）。
+    function readReaderOpacity() {
+      try { const v = parseInt(localStorage.getItem('canvas:readerOpacity'), 10); if (Number.isFinite(v)) return v; } catch (e) {}
+      return 80;   // 默认 80%：比正文原 0.9 略通透、比索引原 0.62 略实，居中又可读
+    }
+    function applyReaderOpacity(value) {
+      let amount = Math.round(Number(value));
+      if (!Number.isFinite(amount)) amount = 80;
+      amount = Math.max(50, Math.min(100, amount));   // 下限 50%：阅读面比图谱更吃对比度，别糊到看不清
+      document.documentElement.style.setProperty('--reader-surface-alpha', (amount / 100).toFixed(2));
+      document.querySelectorAll('[data-role="reader-opacity"]').forEach(function (el) { if (el.value !== String(amount)) el.value = String(amount); });
+      document.querySelectorAll('[data-role="reader-opacity-val"]').forEach(function (el) { el.textContent = amount + '%'; });
+      try { localStorage.setItem('canvas:readerOpacity', String(amount)); } catch (e) {}
+    }
+    // 同步「目录最大层级」选择器（2/3/4/全部）的选中态；缺省层级=4
+    function syncIndexDepthSwitch(node) {
+      const sw = textReader && textReader.querySelector('[data-role="index-depth-switch"]');
+      if (!sw) return;
+      const cur = Math.max(1, Math.min(6, Math.round(Number(node && node.indexDepth) || 4)));
+      sw.querySelectorAll('.index-depth-opt').forEach(function (b) {
+        b.classList.toggle('active', Number(b.dataset.depth) === cur);
+      });
+    }
+    function renderTextReader(node) {
+      if (!textReader || !node || !isReadableNode(node)) return;
+      const title = textReader.querySelector('[data-role="text-reader-title"]');
+      const kicker = textReader.querySelector('[data-role="text-reader-kicker"]');
+      const content = textReader.querySelector('[data-role="text-reader-content"]');
+      const empty = textReader.querySelector('[data-role="text-reader-empty"]');
+      const editor = textReader.querySelector('[data-role="text-reader-editor"]');
+      const richEditor = textReader.querySelector('[data-role="text-reader-rich-editor"]');
+      const scroll = textReader.querySelector('[data-role="text-reader-scroll"]');
+      const toc = textReader.querySelector('[data-role="text-reader-toc"]');
+      const nav = textReader.querySelector('[data-role="index-reader-nav"]');
+      const paneHead = textReader.querySelector('[data-role="index-pane-head"]');
+      const foot = textReader.querySelector('[data-role="text-reader-foot"]');
+      const emptyText = textReader.querySelector('[data-role="text-reader-empty-text"]');
+      const disp = readerDisplayBody(node);
+      const indexNode = isIndexNode(node);
+      const codeNode = isCodeNode(node);
+      textReader.classList.toggle('code-reader-mode', codeNode);
+      textReader.classList.toggle('index-reader-mode', indexNode);
+      if (indexNode) syncIndexDepthSwitch(node);
+      if (kicker) kicker.textContent = indexNode ? '索引节点 · 目录阅读' : codeNode ? ('代码节点 · ' + codeLanguageLabel(node.language)) : isStickyNode(node) ? '便签节点' : isCardNode(node) ? '卡片节点' : isPreviewNode(node) ? '预览节点' : '正文节点';
+      if (title) renderInlineMarkdown(title, node.text || '未命名索引', richMarks(node, 'text'));
+      // 索引右栏的空态文案由 renderIndexReaderPane 自己设；这里只管正文/代码节点
+      if (emptyText && !indexNode) emptyText.textContent = codeNode ? '这张代码节点还是空的。点击这里开始写代码。' : '这张正文节点还没有正文。点击这里开始录入内容。';
+      if (foot) foot.innerHTML = indexNode
+        ? '点目录项在右栏阅读 · 双击目录项跳到画布节点 · 悬停高亮路径 · <kbd>F</kbd> / <kbd>Esc</kbd> 返回画布'
+        : codeNode
+        ? '点击代码编辑 · <kbd>Tab</kbd> 缩进 · <kbd>Shift</kbd>+<kbd>Tab</kbd> 减少缩进 · <kbd>F</kbd> / <kbd>Esc</kbd> 返回画布'
+        : '点击正文编辑 · <kbd>1</kbd>钢笔 <kbd>2</kbd>盒子 <kbd>3</kbd>橡皮 · 再按一次取消工具 · <kbd>Ctrl</kbd>+<kbd>Z</kbd>/<kbd>Y</kbd> 撤销重做 · 正文变化时空间批注自动清除 · <kbd>F</kbd> / <kbd>Esc</kbd> 返回画布';
+      if (indexNode) {
+        // 双栏：左栏目录树 + 右栏只读阅读区（右栏内容、空态、小标题都交给 pane 管）
+        if (nav) nav.hidden = false;
+        renderIndexReaderNav(nav, node);
+        renderIndexReaderPane(node);
+        buildReaderToc(toc, content, scroll, false);
+      } else {
+        if (nav) { nav.hidden = true; nav.innerHTML = ''; }
+        if (paneHead) paneHead.hidden = true;
+        if (content) {
+          content.hidden = textReaderEditing || !disp.text.trim();
+          delete content.dataset.indexReader;
+          content.dataset.bodyOffset = String(disp.offset);   // 展示源码偏移 → 完整 body 偏移的换算量
+          delete content.dataset.source;
+          if (codeNode) renderCodeNodeText(content, disp.text, node.language);
+          else renderNodeText(content, disp.text, disp.marks);
+          if (!codeNode) {
+            requestAnimationFrame(syncNodeAnnotSvg);
+            setTimeout(syncNodeAnnotSvg, 180);
+          }
+        }
+        buildReaderToc(toc, content, scroll, !codeNode && !textReaderEditing && !!disp.text.trim());
+        if (empty) empty.hidden = textReaderEditing || !!disp.text.trim();
+      }
+      if (editor) {
+        editor.hidden = indexNode || !textReaderEditing || !codeNode;
+        editor.classList.toggle('code-source-editor', codeNode);
+        editor.placeholder = '直接输入代码。Tab 缩进，Shift+Tab 减少缩进。';
+      }
+      if (richEditor) {
+        richEditor.hidden = indexNode || !textReaderEditing || codeNode;
+      }
+    }
+    // 量出 textarea 中第 pos 个字符所在行的顶端像素（用同字体/同宽镜像 div 测量）
+    function textareaCaretTop(ta, pos) {
+      const cs = getComputedStyle(ta);
+      const div = document.createElement('div');
+      ['boxSizing', 'width', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft',
+        'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth',
+        'fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'lineHeight', 'letterSpacing',
+        'textTransform', 'wordSpacing', 'tabSize'].forEach(function (p) { div.style[p] = cs[p]; });
+      div.style.position = 'absolute';
+      div.style.visibility = 'hidden';
+      div.style.left = '-9999px';
+      div.style.top = '0';
+      div.style.height = 'auto';
+      div.style.whiteSpace = 'pre-wrap';
+      div.style.overflowWrap = 'break-word';
+      div.style.wordWrap = 'break-word';
+      div.appendChild(document.createTextNode(ta.value.slice(0, pos)));
+      const marker = document.createElement('span');
+      marker.textContent = '​';
+      div.appendChild(marker);
+      document.body.appendChild(div);
+      const top = marker.offsetTop;
+      document.body.removeChild(div);
+      return top;
+    }
+    function lineStartOffset(lines, idx) {
+      let s = 0;
+      for (let k = 0; k < idx && k < lines.length; k++) s += lines[k].length + 1;
+      return s;
+    }
+    // 让编辑框自增高到正文高度，自己不出滚动条（统一用外层容器那条，位置/轨道固定）
+    function autoGrowEditor(ta) {
+      // 增高前先记住外层滚动位置：height:'auto' 会让 textarea 瞬间塌缩、外层 scrollHeight 骤减，
+      // 浏览器会顺手把 scrollTop 夹小；测完高度再把滚动位置原样放回，消除"打字时滑条上下瞬移"。
+      const scroll = ta.closest('.text-reader-scroll');
+      const keep = scroll ? scroll.scrollTop : 0;
+      ta.style.height = 'auto';
+      ta.style.height = ta.scrollHeight + 'px';
+      if (scroll) scroll.scrollTop = keep;
+    }
+    // 把点击的渲染文字精确反查回完整 body 的字符偏移（“指哪打哪”）。
+    // 关键：先用块上的 data-ln 锁定源码行，再只在“这一行”里定位列，绝不全局 indexOf。查不到返回 -1。
+    function sourceOffsetFromClick(displayBody, bodyOffset, content, e) {
+      if (!content) return -1;
+      let node = null, domOff = 0;
+      if (document.caretRangeFromPoint) {
+        const r = document.caretRangeFromPoint(e.clientX, e.clientY);
+        if (r && content.contains(r.startContainer)) { node = r.startContainer; domOff = r.startOffset; }
+      } else if (document.caretPositionFromPoint) {
+        const p = document.caretPositionFromPoint(e.clientX, e.clientY);
+        if (p && content.contains(p.offsetNode)) { node = p.offsetNode; domOff = p.offset; }
+      }
+      if (!node) return -1;
+      // 上溯到带 data-ln 的块级元素
+      let block = node.nodeType === 3 ? node.parentNode : node;
+      while (block && block !== content && !(block.dataset && block.dataset.ln !== undefined)) block = block.parentNode;
+      if (!block || block === content || !block.dataset || block.dataset.ln === undefined) return -1;
+      // 数点击点之前有几个 <br>（段落内每个 <br> = 下一源码行）
+      let subLine = 0;
+      let topChild = node;
+      while (topChild && topChild.parentNode && topChild.parentNode !== block) topChild = topChild.parentNode;
+      if (topChild && topChild.parentNode === block) {   // 确认 topChild 确实是 block 的直接子节点
+        for (let c = block.firstChild; c && c !== topChild; c = c.nextSibling) {
+          if (c.nodeName === 'BR') subLine++;
+        }
+      }
+      const lines = displayBody.split('\n');
+      const lineIndex = (+block.dataset.ln) + subLine;
+      if (lineIndex < 0 || lineIndex >= lines.length) return -1;
+      const sourceLine = lines[lineIndex];
+      let col = 0;
+      if (node.nodeType === 3) {
+        const probe = (node.textContent || '').slice(domOff, domOff + 10);
+        if (probe.length) {
+          let idx = sourceLine.indexOf(probe);
+          if (idx < 0 && probe.length > 3) idx = sourceLine.indexOf(probe.slice(0, 3));
+          if (idx >= 0) col = idx;
+        }
+      }
+      return bodyOffset + lineStartOffset(lines, lineIndex) + col;
+    }
+    // 退出编辑回到预览时：把“光标所在源码行”对应的块滚到原来的屏幕高度，避免跳动
+    function placeReaderAtLine(scroll, content, node, fullLine, screenY) {
+      if (!scroll || !content) return;
+      const disp = readerDisplayBody(node);
+      const prefix = String(node.body || '').slice(0, disp.offset);
+      const removedLines = prefix ? prefix.split('\n').length - 1 : 0;
+      const displayLine = fullLine - removedLines;
+      let best = null, bestLn = -1;
+      content.querySelectorAll('[data-ln]').forEach(function (b) {
+        const ln = +b.dataset.ln;
+        if (ln <= displayLine && ln > bestLn) { bestLn = ln; best = b; }
+      });
+      if (!best) best = content.firstElementChild;
+      if (!best) return;
+      const scrollRect = scroll.getBoundingClientRect();
+      const blockTopWithin = best.getBoundingClientRect().top - scrollRect.top + scroll.scrollTop;
+      const max = scroll.scrollHeight - scroll.clientHeight;
+      scroll.scrollTop = Math.max(0, Math.min(max, blockTopWithin - (screenY - scrollRect.top)));
+    }
+    function beginTextReaderEdit(clickEvent) {
+      const node = findNode(readingNodeId);
+      if (!textReaderOpen || !node || !isBodyNode(node) || !textReader) return;
+      const editor = textReader.querySelector('[data-role="text-reader-editor"]');
+      const richEditor = textReader.querySelector('[data-role="text-reader-rich-editor"]');
+      const codeNode = isCodeNode(node);
+      const activeEditor = codeNode ? editor : richEditor;
+      if (!activeEditor) return;
+      nodeAnnotTool = null;
+      refreshNodeAnnotTools();
+      const content = textReader.querySelector('[data-role="text-reader-content"]');
+      // 先在预览仍可见时取点击映射（caretRangeFromPoint 需要元素在视口里）
+      let caret = -1;
+      if (clickEvent && content && !content.hidden) {
+        const disp = readerDisplayBody(node);
+        const off = parseInt(content.dataset.bodyOffset || '0', 10) || 0;
+        caret = sourceOffsetFromClick(disp.text, off, content, clickEvent);
+      }
+      textReaderEditing = true;
+      textReaderOriginalBody = node.body || '';
+      textReaderOriginalMarks = richMarks(node, 'body');
+      if (codeNode) editor.value = node.body || '';
+      else setRichEditable(richEditor, node.body || '', textReaderOriginalMarks);
+      renderTextReader(node);
+      activeEditor.focus({ preventScroll: true });
+      if (caret < 0) caret = codeNode ? editor.value.length : 0;
+      const textLength = codeNode ? editor.value.length : (richEditor.textContent || '').length;
+      caret = Math.max(0, Math.min(textLength, caret));
+      if (codeNode) {
+        editor.setSelectionRange(caret, caret);
+        autoGrowEditor(editor);                      // 代码文本框长高到正文高度，滚动交给外层容器
+      } else {
+        setNodeSelection(richEditor, caret, caret);
+      }
+      const scrollEl = textReader.querySelector('[data-role="text-reader-scroll"]');
+      if (clickEvent && scrollEl && codeNode) {
+        // 让光标所在行停在点击时的屏幕高度 → 切到编辑框画面几乎不动
+        const scrollRect = scrollEl.getBoundingClientRect();
+        const editorRect = editor.getBoundingClientRect();
+        const caretWithin = (editorRect.top - scrollRect.top + scrollEl.scrollTop) + textareaCaretTop(editor, caret);
+        const max = scrollEl.scrollHeight - scrollEl.clientHeight;
+        scrollEl.scrollTop = Math.max(0, Math.min(max, caretWithin - (clickEvent.clientY - scrollRect.top)));
+      }
+    }
+    function finishTextReaderEdit() {
+      if (!textReaderEditing) return;
+      const node = findNode(readingNodeId);
+      const editor = textReader && textReader.querySelector('[data-role="text-reader-editor"]');
+      const richEditor = textReader && textReader.querySelector('[data-role="text-reader-rich-editor"]');
+      const codeNode = isCodeNode(node);
+      const activeEditor = codeNode ? editor : richEditor;
+      const scroll = textReader && textReader.querySelector('[data-role="text-reader-scroll"]');
+      const content = textReader && textReader.querySelector('[data-role="text-reader-content"]');
+      // 退出前记住光标行此刻的屏幕高度，回到预览后让对应块停在同一高度
+      let anchorLine = -1, screenY = 0;
+      if (activeEditor) {
+        const caret = codeNode ? (editor.selectionStart || 0) : contentEditableCaretOffset(richEditor);
+        const editorText = codeNode ? editor.value : (richEditor.textContent || '');
+        anchorLine = editorText.slice(0, caret).split('\n').length - 1;
+        if (codeNode) {
+          const top = textareaCaretTop(editor, caret);
+          screenY = editor.getBoundingClientRect().top + top - editor.scrollTop;
+        } else {
+          const sel = window.getSelection();
+          const rect = sel && sel.rangeCount ? sel.getRangeAt(0).getBoundingClientRect() : null;
+          screenY = rect && rect.top ? rect.top : richEditor.getBoundingClientRect().top;
+        }
+      }
+      const draft = codeNode
+        ? { text: editor ? editor.value : (node && node.body) || '', marks: [] }
+        : canonicalRichDraft(readRichEditable(richEditor));
+      textReaderEditing = false;
+      hideSelToolbar();
+      if (node && isBodyNode(node)) {
+        const marksChanged = !codeNode && JSON.stringify(draft.marks) !== JSON.stringify(textReaderOriginalMarks);
+        if (draft.text !== textReaderOriginalBody || marksChanged) pushHistory();
+        applyTextNodeBody(node, draft.text, codeNode ? null : draft.marks);   // 退出编辑时一次性同步卡片正文/尺寸
+        renderTextReader(node);
+      }
+      textReaderOriginalBody = '';
+      textReaderOriginalMarks = [];
+      if (scroll && content && anchorLine >= 0 && node) {
+        const place = function () { placeReaderAtLine(scroll, content, node, anchorLine, screenY); };
+        place();
+        requestAnimationFrame(place);
+        if (!isCodeNode(node) && content.dataset.hasMath === '1') {
+          typesetMath(content).then(place).catch(function () {});
+        }
+      }
+    }
+    // Ctrl+Shift+K：在正文阅读浮层的 textarea 光标处插入一个 Markdown 代码块（围栏各自独立成行）。
+    // 走 execCommand('insertText')：进浏览器原生撤销栈，并触发 input → 自动同步 node.body 与增高。
+    function insertReaderCodeBlock(ta) {
+      if (!ta) return;
+      const value = ta.value;
+      const start = ta.selectionStart;
+      const end = ta.selectionEnd;
+      const selected = value.slice(start, end);
+      const lead = (start > 0 && value[start - 1] !== '\n') ? '\n' : '';   // 围栏要顶在行首
+      const open = lead + '```\n';
+      const insert = open + selected + '\n```\n';
+      ta.focus();
+      if (!document.execCommand('insertText', false, insert)) {
+        ta.value = value.slice(0, start) + insert + value.slice(end);      // 兜底：直接赋值（这次不进撤销栈）
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      const caret = start + open.length;
+      ta.setSelectionRange(caret, caret + selected.length);   // 选中原选区 / 停在空围栏内
+    }
+    // 富文本正文也保留原有的代码块快捷键。围栏本身不继承选区格式，
+    // 选区前后的格式区间则通过 slice + concat 原样平移，避免重新暴露或拼接旧渲染语法。
+    function insertReaderRichCodeBlock(root) {
+      if (!root) return;
+      const selection = window.getSelection();
+      if (!selection || selection.rangeCount === 0) return;
+      const range = selection.getRangeAt(0);
+      if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) return;
+      const current = readRichEditable(root);
+      const start = ceCharOffset(root, range.startContainer, range.startOffset);
+      const end = ceCharOffset(root, range.endContainer, range.endOffset);
+      const selected = current.text.slice(start, end);
+      const lead = (start > 0 && current.text[start - 1] !== '\n') ? '\n' : '';
+      const open = lead + '```\n';
+      const insert = open + selected + '\n```\n';
+      const bundle = RichText ? RichText.concat([
+        { text: current.text.slice(0, start), marks: RichText.slice(current.text, current.marks, 0, start) },
+        { text: insert, marks: [] },
+        { text: current.text.slice(end), marks: RichText.slice(current.text, current.marks, end, current.text.length) },
+      ]) : { text: current.text.slice(0, start) + insert + current.text.slice(end), marks: [] };
+      setRichEditable(root, bundle.text, bundle.marks);
+      root.dispatchEvent(new Event('input', { bubbles: true }));
+      const caret = start + open.length;
+      setNodeSelection(root, caret, caret + selected.length);
+    }
+    // B1：阅读浮层进场期只挂 blur(0)（纯 transform 动画最轻），进场动画（reader-card-in）结束后
+    // 加 .reader-ready，让毛玻璃 transition 到满值，避免「重模糊 + 位移」同帧硬碰。
+    // reduced-motion 下动画被禁用、animationend 不触发 → CSS 在 media 里直接给满 blur；
+    // setTimeout 仅作「动画被打断 / 未触发」时的兜底（幂等，加类即可）。
+    function armReaderBlurReveal(overlay, cardSelector) {
+      if (!overlay) return;
+      const card = overlay.querySelector(cardSelector);
+      if (!card) return;
+      card.classList.remove('reader-ready');
+      if (card.__blurRevealEnd) { card.removeEventListener('animationend', card.__blurRevealEnd); card.__blurRevealEnd = null; }
+      if (card.__blurRevealTimer) { clearTimeout(card.__blurRevealTimer); card.__blurRevealTimer = null; }
+      const reveal = function () {
+        if (card.__blurRevealEnd) { card.removeEventListener('animationend', card.__blurRevealEnd); card.__blurRevealEnd = null; }
+        if (card.__blurRevealTimer) { clearTimeout(card.__blurRevealTimer); card.__blurRevealTimer = null; }
+        card.classList.add('reader-ready');
+      };
+      const onEnd = function (e) { if (e.animationName === 'reader-card-in') reveal(); };
+      card.__blurRevealEnd = onEnd;
+      card.addEventListener('animationend', onEnd);
+      card.__blurRevealTimer = setTimeout(reveal, 420);
+    }
+
+    function openTextReader(node) {
+      if (!textReader || !isReadableNode(node)) return;
+      if (editingNodeId !== null) commitNodeEdit();
+      if (editingEdgeId !== null) commitEdgeEdit();
+      if (searchOpen) closeSearch();
+      readingNodeId = node.id;
+      textReaderOpen = true;
+      textReaderEditing = false;
+      textReaderOriginalBody = '';
+      indexReaderTargetId = null;   // 每次打开索引节点都从“总览”起读，不串上次选中项
+      disposeIndexPanePdf();        // 防御：清掉上次遗留的右栏内嵌 PDF 文档/监听
+      indexPanePdfNodeId = null;
+      indexPaneMdNodeId = null; indexPaneMdBase = null;
+      if (indexPaneMdSvg) { indexPaneMdSvg.remove(); indexPaneMdSvg = null; }
+      nodeAnnotTool = null;
+      nodeAnnotSvg = null;
+      nodeAnnotHistory = [];
+      nodeAnnotRedo = [];
+      renderTextReader(node);
+      textReader.hidden = false;
+      armReaderBlurReveal(textReader, '.text-reader-card');
+      const scroll = textReader.querySelector('[data-role="text-reader-scroll"]');
+      if (scroll) {
+        scroll.scrollTop = 0;
+        scroll.focus({ preventScroll: true });
+      }
+      if (!isCodeNode(node)) {
+        loadNodeAnnotations().then(function () {
+          nodeAnnotState(node);
+          syncNodeAnnotSvg();
+        });
+      }
+    }
+    function closeTextReader() {
+      if (!textReaderOpen) return;
+      finishTextReaderEdit();
+      flushNodeAnnotations();
+      textReaderOpen = false;
+      readingNodeId = null;
+      indexReaderTargetId = null;
+      disposeIndexPanePdf();        // 关闭浮层即销毁右栏内嵌 PDF 文档与懒渲染监听，防内存堆积
+      indexPanePdfNodeId = null;
+      indexPaneMdNodeId = null; indexPaneMdBase = null;
+      if (indexPaneMdSvg) { indexPaneMdSvg.remove(); indexPaneMdSvg = null; }
+      nodeAnnotTool = null;
+      nodeAnnotSvg = null;
+      clearIndexReaderTarget();
+      if (textReader) {
+        dismissReaderOverlay(textReader, '.text-reader-card',
+          function () { if (!textReaderOpen) textReader.hidden = true; });
+      }
+      hideSelToolbar();
+    }
+
+    // ── MD 附件阅读浮层（只读选字高光 + 钢笔手绘批注 + 通用橡皮）──────────
+    // 双击 MD 附件 / 单选按 F → 大版面舒适阅读。正文从 .md 文件实时拉取并 MarkdownMini 渲染。
+    // 标注两类、同存伴生文件、互不干扰：
+    //   ① 文字标注 marks（高光/字色/字号，按内容字符偏移，与小框共用一份）；
+    //   ② 手绘笔迹 strokes（钢笔，坐标按内容框「宽度」归一化，固定版心下永不漂移）。
+    // 只读态可选字加高光；钢笔/橡皮态接管覆盖层指针。橡皮是「通用橡皮」：笔迹与文字标注一起擦。
+    // 全程不编辑正文、不碰 .canvas、不触发未保存。
+    function setupMdReader() {
+      if (!mdReader || mdReader.__mdSetup) return;
+      mdReader.__mdSetup = true;
+      const closeBtn = mdReader.querySelector('[data-role="md-reader-close"]');
+      if (closeBtn) closeBtn.addEventListener('click', closeMdReader);
+      mdReader.addEventListener('mousedown', (e) => { if (e.target === mdReader) closeMdReader(); });  // 点遮罩空白关闭
+      const extBtn = mdReader.querySelector('[data-role="md-open-external"]');
+      if (extBtn) extBtn.addEventListener('click', () => { const n = findNode(mdReaderNodeId); if (n) openMdExternal(n); });
+      const penBtn = mdReader.querySelector('[data-role="md-pen"]');
+      if (penBtn) penBtn.addEventListener('click', () => mdSetTool('pen'));
+      const boxBtn = mdReader.querySelector('[data-role="md-box"]');
+      if (boxBtn) boxBtn.addEventListener('click', () => mdSetTool('box'));
+      const eraserBtn = mdReader.querySelector('[data-role="md-eraser"]');
+      if (eraserBtn) eraserBtn.addEventListener('click', () => mdSetTool('eraser'));
+      mdReader.querySelectorAll('[data-md-color]').forEach((b) => {
+        b.addEventListener('click', () => {
+          mdAnnotColor = b.dataset.mdColor;
+          if (mdSelBox) {
+            pushMdHistory();
+            mdSelBox.color = mdAnnotColor;
+            redrawMdStrokes();
+            scheduleMdAnnotSave(mdReaderNodeId);
+            refreshMdToolButtons();
+            return;
+          }
+          if (!mdAnnotTool || mdAnnotTool === 'eraser') mdSetTool('pen');
+          refreshMdToolButtons();
+        });
+      });
+      // 窗口缩放：版心宽度可能变（窄屏 < 版心上限）→ 重新对齐覆盖层，笔迹随列宽等比缩放。
+      global.addEventListener('resize', () => { if (mdReaderOpen) syncMdAnnotSvg(); });
+      // MD 正文里的 [[双链]] 与 [外链](url)：只读态可点跳转；注解态交给工具处理。
+      const mdContent = mdReader.querySelector('[data-role="md-reader-content"]');
+      if (mdContent) mdContent.addEventListener('click', function (e) {
+        if (mdAnnotTool || (e.target.closest && e.target.closest('.md-annot-svg'))) return;
+        const wiki = e.target.closest ? e.target.closest('.node-wikilink') : null;
+        if (wiki && mdContent.contains(wiki)) {
+          e.preventDefault();
+          jumpToWikiTarget(wiki.dataset.wikilink);
+          return;
+        }
+        const link = e.target.closest ? e.target.closest('.node-link') : null;
+        if (link && mdContent.contains(link)) {
+          e.preventDefault();
+          openExternalLink(link.dataset.href, link.dataset.kind);
+          return;
+        }
+      });
+    }
+    // 工具切换：再点同一个回只读。进钢笔/橡皮时收起选区工具栏、清残留选区。
+    function mdSetTool(tool) {
+      mdAnnotTool = (mdAnnotTool === tool) ? null : tool;
+      mdSelBox = null;
+      if (mdAnnotTool) {
+        hideSelToolbar();
+        const sel = global.getSelection && global.getSelection();
+        if (sel && sel.removeAllRanges && sel.rangeCount) sel.removeAllRanges();
+      }
+      refreshMdToolButtons();
+      armMdAnnotSvg();
+    }
+    function refreshMdToolButtons() {
+      if (!mdReader) return;
+      const penBtn = mdReader.querySelector('[data-role="md-pen"]');
+      const boxBtn = mdReader.querySelector('[data-role="md-box"]');
+      const eraserBtn = mdReader.querySelector('[data-role="md-eraser"]');
+      if (penBtn) penBtn.classList.toggle('active', mdAnnotTool === 'pen');
+      if (boxBtn) boxBtn.classList.toggle('active', mdAnnotTool === 'box');
+      if (eraserBtn) eraserBtn.classList.toggle('active', mdAnnotTool === 'eraser');
+      mdReader.querySelectorAll('[data-md-color]').forEach((b) => {
+        b.classList.toggle('active', (mdAnnotTool === 'pen' || mdAnnotTool === 'box')
+          && (b.dataset.mdColor || '').toLowerCase() === mdAnnotColor.toLowerCase());
+      });
+    }
+    // 覆盖层指针：钢笔/橡皮态才接管（armed），只读态放行 → 选字高光照常工作。
+    function armMdAnnotSvg() {
+      const draw = (mdAnnotTool === 'pen' || mdAnnotTool === 'box' || mdAnnotTool === 'eraser');
+      if (mdReader) mdReader.classList.toggle('md-annot-draw', draw);
+      if (mdReaderSvg) {
+        mdReaderSvg.classList.toggle('armed', draw);
+        mdReaderSvg.classList.toggle('pen', mdAnnotTool === 'pen');
+        mdReaderSvg.classList.toggle('boxing', mdAnnotTool === 'box');
+        mdReaderSvg.classList.toggle('erasing', mdAnnotTool === 'eraser');
+      }
+    }
+    // 单条笔迹 → SVG path（钢笔走压感填充，复用墨迹的 pressureStrokeD）。
+    function mdStrokePathEl(s) {
+      const pts = (s.pts || []).map((a) => ({ x: a[0] * MD_ANNOT_VW, y: a[1] * MD_ANNOT_VW, p: a[2] == null ? 0.5 : a[2] }));
+      const maxW = (s.w || 0.0045) * MD_ANNOT_VW;
+      const path = document.createElementNS(SVG_NS, 'path');
+      path.setAttribute('class', 'md-annot-stroke');
+      path.setAttribute('d', pressureStrokeD(pts, maxW));
+      path.setAttribute('fill', s.color || '#1a1a1a');
+      path.__mdStroke = s;
+      return path;
+    }
+    // 确保浮层里有批注 SVG 覆盖层（建一次，挂在 .md-reader-content 上，随正文滚动）。
+    function ensureMdReaderSvg(content) {
+      let svg = content.querySelector('.md-annot-svg');
+      if (!svg) {
+        svg = document.createElementNS(SVG_NS, 'svg');
+        svg.setAttribute('class', 'md-annot-svg');
+        svg.setAttribute('preserveAspectRatio', 'none');
+        svg.addEventListener('pointerdown', onMdSvgPointerDown);
+        content.appendChild(svg);
+      }
+      mdReaderSvg = svg;
+      return svg;
+    }
+    // 覆盖层对齐正文框：用正文相对 content 的几何定位（宽=固定版心），高随正文。
+    // 坐标系按内容框「宽度」归一化（宽=VW、高=VW*高宽比）→ 固定版心下笔迹永不漂移；
+    // 窄屏版心收窄时整层等比缩放，笔迹仍贴着同一行文字。
+    function syncMdAnnotSvg() {
+      if (!mdReaderOpen || !mdReaderSvg) return;
+      const content = mdReader.querySelector('[data-role="md-reader-content"]');
+      const inner = content && content.querySelector('.attach-md-body');
+      if (!content || !inner) return;
+      const W = inner.offsetWidth || 1;
+      const H = inner.offsetHeight || inner.scrollHeight || W;
+      mdReaderSvg.style.left = inner.offsetLeft + 'px';
+      mdReaderSvg.style.top = inner.offsetTop + 'px';
+      mdReaderSvg.style.width = W + 'px';
+      mdReaderSvg.style.height = H + 'px';
+      const VH = Math.round(MD_ANNOT_VW * H / W);
+      mdReaderSvg.setAttribute('viewBox', '0 0 ' + MD_ANNOT_VW + ' ' + VH);
+      redrawMdStrokes();
+    }
+    function redrawMdStrokes() {
+      if (!mdReaderSvg) return;
+      mdReaderSvg.innerHTML = '';
+      const st = mdAnnotStore.get(mdReaderNodeId);
+      if (!st) return;
+      (st.boxes || []).forEach((b) => {
+        const rect = document.createElementNS(SVG_NS, 'rect');
+        rect.setAttribute('class', 'md-annot-box' + (mdSelBox === b ? ' md-annot-box-selected' : ''));
+        rect.setAttribute('x', b.x * MD_ANNOT_VW);
+        rect.setAttribute('y', b.y * MD_ANNOT_VW);
+        rect.setAttribute('width', b.w * MD_ANNOT_VW);
+        rect.setAttribute('height', b.h * MD_ANNOT_VW);
+        rect.setAttribute('stroke', b.color || '#f4b740');
+        rect.addEventListener('pointerdown', (e) => {
+          if (mdAnnotTool) return;
+          e.preventDefault();
+          e.stopPropagation();
+          mdSelBox = b;
+          redrawMdStrokes();
+        });
+        mdReaderSvg.appendChild(rect);
+      });
+      if (!st.strokes) return;
+      st.strokes.forEach((s) => mdReaderSvg.appendChild(mdStrokePathEl(s)));
+    }
+    // ── MD 批注撤销 / 重做 ──────────────────────────────────────────
+    // 快照同时含 marks（文字标注）与 strokes（手绘笔迹），一次 Ctrl+Z 连贯回退最后一步
+    // （不论是钢笔、橡皮还是选区高光）。仅在浮层内生效，开浮层时清栈、关浮层时丢弃。
+    function snapshotMdAnnot() {
+      const st = mdAnnotStore.get(mdReaderNodeId);
+      if (!st) return null;
+      return { marks: JSON.parse(JSON.stringify(st.marks || [])), strokes: JSON.parse(JSON.stringify(st.strokes || [])), boxes: JSON.parse(JSON.stringify(st.boxes || [])) };
+    }
+    function pushMdHistory() {
+      const snap = snapshotMdAnnot();
+      if (!snap) return;
+      mdHistory.push(snap);
+      if (mdHistory.length > 60) mdHistory.shift();
+      mdRedo.length = 0;
+    }
+    // 把一份快照套回当前节点 + 全量重渲（小框 / 浮层文字 / 浮层笔迹）。
+    function applyMdSnapshot(snap) {
+      const st = mdAnnotState(mdReaderNodeId);
+      mdSelBox = null;
+      st.marks = JSON.parse(JSON.stringify(snap.marks || []));
+      st.strokes = JSON.parse(JSON.stringify(snap.strokes || []));
+      st.boxes = JSON.parse(JSON.stringify(snap.boxes || []));
+      renderMdMarks(mdReaderNodeId);
+      renderMdReaderMarks();
+      redrawMdStrokes();
+      scheduleMdAnnotSave(mdReaderNodeId);
+    }
+    function mdUndo() {
+      if (!mdHistory.length) return;
+      mdRedo.push(snapshotMdAnnot());
+      applyMdSnapshot(mdHistory.pop());
+    }
+    function mdRedoAction() {
+      if (!mdRedo.length) return;
+      mdHistory.push(snapshotMdAnnot());
+      applyMdSnapshot(mdRedo.pop());
+    }
+    function deleteSelectedMdBox() {
+      if (!mdSelBox) return false;
+      const st = mdAnnotState(mdReaderNodeId);
+      const idx = st.boxes.indexOf(mdSelBox);
+      if (idx < 0) { mdSelBox = null; return false; }
+      pushMdHistory();
+      st.boxes.splice(idx, 1);
+      mdSelBox = null;
+      redrawMdStrokes();
+      scheduleMdAnnotSave(mdReaderNodeId);
+      return true;
+    }
+    // 橡皮整笔命中：点到虚拟坐标 v 的距离 ≤ 阈值+半笔宽。
+    function mdStrokeHitVirtual(s, v, threshold) {
+      const pts = (s.pts || []).map((a) => ({ x: a[0] * MD_ANNOT_VW, y: a[1] * MD_ANNOT_VW }));
+      const t = threshold + ((s.w || 0.0045) * MD_ANNOT_VW) / 2;
+      if (pts.length === 1) return Math.hypot(pts[0].x - v.x, pts[0].y - v.y) <= t;
+      for (let i = 0; i < pts.length - 1; i++) {
+        if (distToSeg(v.x, v.y, pts[i], pts[i + 1]) <= t) return true;
+      }
+      return false;
+    }
+    // 通用橡皮：先擦命中的笔迹；没擦到笔迹再尝试擦点中的文字标注（高光/字色/字号整段移除）。
+    // 返回是否真的擦掉了东西（用于决定是否落历史/保存）。
+    function mdEraseAt(clientX, clientY, vGetter, beforeChange) {
+      let changed = false;
+      const st = mdAnnotStore.get(mdReaderNodeId);
+      if (!st) return false;
+      // ① 盒子
+      const v = vGetter(clientX, clientY);
+      if (st.boxes && st.boxes.length) {
+        const kept = st.boxes.filter((b) => !(v.x >= b.x * MD_ANNOT_VW && v.x <= (b.x + b.w) * MD_ANNOT_VW
+          && v.y >= b.y * MD_ANNOT_VW && v.y <= (b.y + b.h) * MD_ANNOT_VW));
+        if (kept.length !== st.boxes.length) { if (beforeChange) beforeChange(); st.boxes = kept; redrawMdStrokes(); changed = true; }
+      }
+      // ② 笔迹
+      if (st.strokes && st.strokes.length) {
+        const kept = st.strokes.filter((s) => !mdStrokeHitVirtual(s, v, 14));
+        if (kept.length !== st.strokes.length) { if (beforeChange) beforeChange(); st.strokes = kept; redrawMdStrokes(); changed = true; }
+      }
+      // ③ 文字标注（只在没擦到其它标注时，避免一次手势同时误擦多类）
+      if (!changed) changed = eraseMdMarkAt(clientX, clientY, beforeChange) || changed;
+      return changed;
+    }
+    // 点擦文字标注：把点中的那条标注（含相邻连续的整段）从 marks 里整体移除。返回是否命中。
+    function eraseMdMarkAt(clientX, clientY, beforeChange) {
+      const inner = mdReader && mdReader.querySelector('.attach-md-body');
+      if (!inner) return false;
+      let container = null, domOff = 0;
+      if (document.caretRangeFromPoint) {
+        const r = document.caretRangeFromPoint(clientX, clientY);
+        if (r && inner.contains(r.startContainer)) { container = r.startContainer; domOff = r.startOffset; }
+      } else if (document.caretPositionFromPoint) {
+        const p = document.caretPositionFromPoint(clientX, clientY);
+        if (p && inner.contains(p.offsetNode)) { container = p.offsetNode; domOff = p.offset; }
+      }
+      if (!container) return false;
+      const pos = mdCharOffset(inner, container, domOff);   // 与 marks 同一套"排除公式"的字符偏移
+      const st = mdAnnotStore.get(mdReaderNodeId);
+      if (!st || !st.marks || !st.marks.length) return false;
+      const sorted = st.marks.slice().sort((a, b) => a.start - b.start);
+      let hit = sorted.findIndex((m) => pos >= m.start && pos < m.end);
+      if (hit < 0) return false;                             // 没点在标注上：无操作
+      let lo = hit, hi = hit;                                // 扩展到相邻紧挨的整段（视觉上连续的一条）
+      while (lo > 0 && sorted[lo - 1].end === sorted[lo].start) lo--;
+      while (hi < sorted.length - 1 && sorted[hi + 1].start === sorted[hi].end) hi++;
+      const runStart = sorted[lo].start, runEnd = sorted[hi].end;
+      if (beforeChange) beforeChange();
+      st.marks = st.marks.filter((m) => m.end <= runStart || m.start >= runEnd);
+      renderMdMarks(mdReaderNodeId);                         // 同步小框
+      renderMdReaderMarks();                                 // 刷浮层（重套 marks 不动覆盖层 SVG）
+      return true;
+    }
+    // 覆盖层指针按下：钢笔采集笔迹、橡皮整笔擦（笔迹+文字标注）。
+    function onMdSvgPointerDown(e) {
+      if (!mdAnnotTool || !mdReaderSvg) return;
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const svg = mdReaderSvg;
+      const vb = (svg.getAttribute('viewBox') || ('0 0 ' + MD_ANNOT_VW + ' ' + MD_ANNOT_VW)).split(/\s+/).map(Number);
+      const VH = vb[3] || MD_ANNOT_VW;
+      const toV = (cx, cy) => {
+        const r = svg.getBoundingClientRect();
+        return { x: (cx - r.left) / r.width * MD_ANNOT_VW, y: (cy - r.top) / r.height * VH };
+      };
+      try { svg.setPointerCapture(e.pointerId); } catch (_) {}
+
+      if (mdAnnotTool === 'eraser') {
+        let erased = false;
+        const beforeChange = () => { if (!erased) pushMdHistory(); };   // 本次擦除手势首次命中前留一个撤销点
+        const eraseAt = (cx, cy) => { if (mdEraseAt(cx, cy, toV, beforeChange)) erased = true; };
+        eraseAt(e.clientX, e.clientY);
+        const move = (ev) => eraseAt(ev.clientX, ev.clientY);
+        const up = (ev) => {
+          svg.removeEventListener('pointermove', move);
+          svg.removeEventListener('pointerup', up);
+          svg.removeEventListener('pointercancel', up);
+          try { svg.releasePointerCapture(ev.pointerId); } catch (_) {}
+          if (erased) scheduleMdAnnotSave(mdReaderNodeId);
+        };
+        svg.addEventListener('pointermove', move);
+        svg.addEventListener('pointerup', up);
+        svg.addEventListener('pointercancel', up);
+        return;
+      }
+
+      if (mdAnnotTool === 'box') {
+        const start = toV(e.clientX, e.clientY);
+        const live = document.createElementNS(SVG_NS, 'rect');
+        live.setAttribute('class', 'md-annot-box md-annot-box-live');
+        live.setAttribute('stroke', mdAnnotColor);
+        svg.appendChild(live);
+        const redrawLive = (v) => {
+          live.setAttribute('x', Math.min(start.x, v.x));
+          live.setAttribute('y', Math.min(start.y, v.y));
+          live.setAttribute('width', Math.abs(v.x - start.x));
+          live.setAttribute('height', Math.abs(v.y - start.y));
+        };
+        redrawLive(start);
+        const move = (ev) => redrawLive(toV(ev.clientX, ev.clientY));
+        const up = (ev) => {
+          svg.removeEventListener('pointermove', move);
+          svg.removeEventListener('pointerup', up);
+          svg.removeEventListener('pointercancel', up);
+          try { svg.releasePointerCapture(ev.pointerId); } catch (_) {}
+          const end = toV(ev.clientX, ev.clientY);
+          live.remove();
+          if (Math.abs(end.x - start.x) < 8 || Math.abs(end.y - start.y) < 8) return;
+          const r4 = (n) => Math.round(n * 1e4) / 1e4;
+          pushMdHistory();
+          mdAnnotState(mdReaderNodeId).boxes.push({
+            x: r4(Math.min(start.x, end.x) / MD_ANNOT_VW), y: r4(Math.min(start.y, end.y) / MD_ANNOT_VW),
+            w: r4(Math.abs(end.x - start.x) / MD_ANNOT_VW), h: r4(Math.abs(end.y - start.y) / MD_ANNOT_VW),
+            color: mdAnnotColor,
+          });
+          redrawMdStrokes();
+          scheduleMdAnnotSave(mdReaderNodeId);
+        };
+        svg.addEventListener('pointermove', move);
+        svg.addEventListener('pointerup', up);
+        svg.addEventListener('pointercancel', up);
+        return;
+      }
+
+      // 钢笔（压感填充）
+      const usePressure = penPressureOn();
+      const maxW = 0.0045 * MD_ANNOT_VW;
+      const vpts = [];
+      const push = (cx, cy, pr) => { const v = toV(cx, cy); v.p = usePressure ? pr : 0.5; vpts.push(v); };
+      push(e.clientX, e.clientY, pointerPressure(e));
+      const live = document.createElementNS(SVG_NS, 'path');
+      live.setAttribute('class', 'md-annot-stroke');
+      live.setAttribute('fill', mdAnnotColor);
+      svg.appendChild(live);
+      const redrawLive = () => live.setAttribute('d', pressureStrokeD(vpts, maxW));
+      redrawLive();
+      const move = (ev) => {
+        const evs = (ev.getCoalescedEvents && ev.getCoalescedEvents().length) ? ev.getCoalescedEvents() : [ev];
+        evs.forEach((p) => push(p.clientX, p.clientY, pointerPressure(p)));
+        redrawLive();
+      };
+      const up = (ev) => {
+        svg.removeEventListener('pointermove', move);
+        svg.removeEventListener('pointerup', up);
+        svg.removeEventListener('pointercancel', up);
+        try { svg.releasePointerCapture(ev.pointerId); } catch (_) {}
+        live.remove();
+        if (!vpts.length) return;
+        const r4 = (n) => Math.round(n * 1e4) / 1e4;
+        const r3 = (n) => Math.round(n * 1e3) / 1e3;
+        const sv = simplifyAnnotPts(vpts, 0.4);
+        const stroke = {
+          color: mdAnnotColor,
+          w: r4(maxW / MD_ANNOT_VW),
+          pts: sv.map((v) => [r4(v.x / MD_ANNOT_VW), r4(v.y / MD_ANNOT_VW), usePressure ? r3(v.p) : 0.5]),
+        };
+        pushMdHistory();                  // 落一个撤销点（push 新笔迹前）
+        const st = mdAnnotState(mdReaderNodeId);
+        st.strokes.push(stroke);
+        redrawMdStrokes();
+        scheduleMdAnnotSave(mdReaderNodeId);
+      };
+      svg.addEventListener('pointermove', move);
+      svg.addEventListener('pointerup', up);
+      svg.addEventListener('pointercancel', up);
+    }
+    function openMdReader(node) {
+      if (!mdReader || !isMdNode(node)) return;
+      setupMdReader();
+      if (editingNodeId !== null) commitNodeEdit();
+      if (editingEdgeId !== null) commitEdgeEdit();
+      if (searchOpen) closeSearch();
+      if (textReaderOpen) closeTextReader();
+      mdReaderOpen = true;
+      mdReaderNodeId = node.id;
+      mdReaderBase = null;
+      mdReaderSvg = null;
+      mdHistory = [];                      // 撤销/重做仅在本次浮层会话内有效
+      mdRedo = [];
+      mdAnnotTool = null;                  // 每次开浮层默认只读态
+      mdSelBox = null;
+      refreshMdToolButtons();
+      const title = mdReader.querySelector('[data-role="md-reader-title"]');
+      if (title) title.textContent = node.name || 'Markdown 文档';
+      const content = mdReader.querySelector('[data-role="md-reader-content"]');
+      const src = decorationAssetUrl(node);
+      if (content) {
+        content.innerHTML = '<div class="attach-status">正在载入…</div>';
+        buildReaderToc(mdReader.querySelector('[data-role="md-reader-toc"]'), content,
+          mdReader.querySelector('[data-role="md-reader-scroll"]'), false);
+        fetch(src).then((r) => r.ok ? r.text() : Promise.reject(new Error('读取失败'))).then((text) => {
+          if (!mdReaderOpen || mdReaderNodeId !== node.id) return;   // 期间已关/已切，丢弃
+          const fp = mdContentFp(text);
+          const md = global.MarkdownMini;
+          const html = md ? md.render(text)
+            : ('<pre>' + text.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])) + '</pre>');
+          content.innerHTML = '<div class="attach-md-body node-text">' + html + '</div>';
+          const mathContent = content.querySelector('.attach-md-body');
+          if (mathContent && hasMathSource(text)) mathContent.dataset.hasMath = '1';
+          // Mermaid 图表渲染（异步；等所有图表都完成后再捕获净快照，
+          // 否则 mdReaderBase 里没有 SVG，后续 applyMarksToBody 会把已渲染的图洗掉）
+          var mermaidDone = renderMermaidDiagrams(mathContent);
+          whenMathReady(() => {
+            Promise.all([
+              Promise.resolve(typesetMath(mathContent)),
+              mermaidDone || Promise.resolve()
+            ]).then(() => {
+              if (!mdReaderOpen || mdReaderNodeId !== node.id) return;
+              const inner = content.querySelector('.attach-md-body');
+              if (!inner) return;
+              mdReaderBase = inner.innerHTML;                     // 浮层自己的净快照
+              loadMdAnnot(node, fp).then(() => {
+                if (!mdReaderOpen || mdReaderNodeId !== node.id) return;
+                const st = mdAnnotState(node.id);
+                if (st.staleCleared) { st.staleCleared = false; flushMdAnnotSave(node.id); }
+                renderMdMarks(node.id);                          // 同步小框（指纹失效后也要刷掉旧高光）
+                renderMdReaderMarks();
+                ensureMdReaderSvg(content);                       // 建/取批注覆盖层
+                syncMdAnnotSvg();                                // 对齐版心 + 重画笔迹
+                armMdAnnotSvg();
+              });
+            });
+          }, mathContent);
+        }).catch((err) => {
+          if (content) content.innerHTML = '<div class="attach-status attach-error">Markdown 载入失败</div>';
+          console.warn('[画布] Markdown 载入失败', err);
+        });
+      }
+      mdReader.hidden = false;
+      const scroll = mdReader.querySelector('[data-role="md-reader-scroll"]');
+      if (scroll) { scroll.scrollTop = 0; scroll.focus({ preventScroll: true }); }
+    }
+    function closeMdReader() {
+      if (!mdReaderOpen) return;
+      mdAnnotTool = null;
+      mdSelBox = null;
+      armMdAnnotSvg();
+      mdReaderOpen = false;
+      mdReaderNodeId = null;
+      mdReaderBase = null;
+      mdReaderSvg = null;
+      if (mdReader) {
+        mdReader.classList.remove('md-annot-draw');
+        dismissReaderOverlay(mdReader, '.text-reader-card',
+          function () { if (!mdReaderOpen) mdReader.hidden = true; });
+      }
+      hideSelToolbar();
+    }
+    // ── 在外部编辑器打开 MD 附件 + 改完回来自动刷新 ───────────────────
+    // 附件是画布里的副本（非 Obsidian 原文）；在外部改了正文后，旧高光的字符偏移会失效，
+    // 由内容指纹（srcFp）在重渲时自动判废。打开外部程序前先弹确认框（铁律 §2.9）。
+    const mdExternalPending = new Set();   // 已外部打开、等回到画布时强制重渲校验的节点 id
+    function openMdExternal(node) {
+      if (!node || !isMdNode(node)) return;
+      showConfirm({
+        title: '用外部编辑器打开这份 Markdown 附件？',
+        detail: (node.name || 'Markdown 文档')
+          + '\n\n它是画布里的副本，不是你的 Obsidian 原文；改动会留在画布里。'
+          + '\n若你改了正文，已加的高光 / 字色 / 字号标注会自动失效（偏移对不上）。',
+        okLabel: '打开',
+        destructive: false,
+      }, function () {
+        fetch('/api/open-attachment', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: filePath, asset: node.assetPath }),
+        }).then((r) => r.json().then((j) => ({ ok: r.ok, j: j }))).then((res) => {
+          if (!res.ok) { window.alert((res.j && res.j.error) || '打开失败'); return; }
+          mdExternalPending.add(node.id);   // 回到画布（window focus）时强制重渲、按指纹判废标注
+        }).catch((err) => { console.warn('[画布] 打开附件失败', err); window.alert('打开失败：服务未响应'); });
+      });
+    }
+    // 强制重新拉取并重渲一篇 MD 附件（清幂等标记 + 重置加载态 → 重新校验内容指纹）。
+    function forceReloadMdNode(id) {
+      const node = findNode(id);
+      if (!node || !isMdNode(node)) return;
+      const st = mdAnnotStore.get(id);
+      if (st) { st.loaded = false; st.srcFp = null; }   // 让 loadMdAnnot 重新拉标注并按新指纹判废
+      const el = nodeMap.get(id);
+      if (el) {
+        const content = el.querySelector('.decor-content');
+        if (content) { delete content.dataset.attachSrc; renderAttachment(content, el, node); }
+      }
+      if (mdReaderOpen && mdReaderNodeId === id) openMdReader(node);   // 浮层开着就连同浮层一起重载
+    }
+
+    // ── PDF 阅读 + 批注浮层 ──────────────────────────────────────
+    // 大版面读论文 + 钢笔/荧光笔/橡皮批注。批注是矢量笔画（可橡皮整笔擦、可重渲），
+    // 坐标按页归一化（虚拟空间 PDF_ANNOT_VW 宽、高=VW*页比例），存进 PDF 旁的伴生
+    // 文件 <pdf>.annot.json（自动保存，不进 .canvas）。复用墨迹的 strokePath/pressureStrokeD。
+    function setPdfReaderStatus(msg) {
+      const el = pdfReader && pdfReader.querySelector('[data-role="pdf-reader-status"]');
+      if (el) el.textContent = msg || '';
+    }
+    function refreshPdfToolButtons() {
+      if (!pdfReader) return;
+      pdfReader.querySelectorAll('[data-pdf-tool]').forEach((b) => {
+        b.classList.toggle('active', b.dataset.pdfTool === pdfAnnotTool);
+      });
+      pdfReader.querySelectorAll('[data-pdf-color]').forEach((b) => {
+        b.classList.toggle('active', (b.dataset.pdfColor || '').toLowerCase() === pdfAnnotColor.toLowerCase());
+      });
+      const dot = pdfReader.querySelector('[data-role="pdf-color-dot"]');
+      if (dot) dot.style.background = pdfAnnotColor;
+      const range = pdfReader.querySelector('[data-role="pdf-size"]');
+      if (range) range.value = String(pdfDrawSizeVal);
+      const sizeVal = pdfReader.querySelector('[data-role="pdf-size-val"]');
+      if (sizeVal) sizeVal.textContent = pdfDrawSizeVal.toFixed(1);
+    }
+    // 当前指针模式：draw(笔/荧光/盒子/橡皮在 SVG 上写) / thl(可选字加高光) / note(空白处建便签) / read(只读+可选字复制)
+    function pdfMode() {
+      if (pdfAnnotTool === 'pen' || pdfAnnotTool === 'hl' || pdfAnnotTool === 'box' || pdfAnnotTool === 'eraser') return 'draw';
+      if (pdfAnnotTool === 'thl' || pdfAnnotTool === 'tul') return 'thl';
+      if (pdfAnnotTool === 'note') return 'note';
+      return 'read';
+    }
+    function armPdfPages() {
+      const mode = pdfMode();
+      const pagesEl = pdfReader && pdfReader.querySelector('[data-role="pdf-reader-pages"]');
+      if (pagesEl) pagesEl.dataset.pdfMode = mode;   // 驱动 CSS 切换各层 pointer-events
+      pdfReaderPageState.forEach((st) => {
+        if (!st.svg) return;
+        st.svg.classList.toggle('armed', mode === 'draw');
+        st.svg.classList.toggle('erasing', pdfAnnotTool === 'eraser');
+      });
+    }
+    function setPdfAnnotTool(tool) {
+      pdfAnnotTool = (pdfAnnotTool === tool) ? null : tool;   // 再点同一个 = 回只读
+      clearPdfAnnotSelection();
+      refreshPdfToolButtons();
+      armPdfPages();
+    }
+    // 粗细：滑条值 1..5 → 宽度系数（2=基准 1.0）。笔/荧光笔即时生效，已落地的笔画保持各自存的宽。
+    function pdfDrawWidth(isPen) { return (isPen ? 0.005 : 0.024) * (pdfDrawSizeVal / 2); }
+    function setPdfDrawSize(v) {
+      pdfDrawSizeVal = Math.max(1, Math.min(5, v));
+      try { localStorage.setItem('canvas:pdfAnnotSize', String(pdfDrawSizeVal)); } catch (e) {}
+      const sizeVal = pdfReader && pdfReader.querySelector('[data-role="pdf-size-val"]');
+      if (sizeVal) sizeVal.textContent = pdfDrawSizeVal.toFixed(1);
+    }
+    // ── 批注撤销 / 重做（快照整页结构，深 60）──
+    function snapshotPdfPages() { return JSON.parse(JSON.stringify(pdfAnnot.pages || {})); }
+    function pushPdfHistory() {
+      pdfHistory.push(snapshotPdfPages());
+      if (pdfHistory.length > 60) pdfHistory.shift();
+      pdfRedo.length = 0;
+    }
+    function redrawAllPdfPages() {
+      pdfReaderPageState.forEach((st, no) => { if (st.rendered) redrawPdfPageStrokes(no); });
+    }
+    function pdfUndo() {
+      if (!pdfHistory.length) return;
+      pdfRedo.push(snapshotPdfPages());
+      pdfAnnot.pages = pdfHistory.pop();
+      redrawAllPdfPages();
+      schedulePdfAnnotSave();
+      setPdfReaderStatus('已撤销');
+    }
+    function pdfRedoAction() {
+      if (!pdfRedo.length) return;
+      pdfHistory.push(snapshotPdfPages());
+      pdfAnnot.pages = pdfRedo.pop();
+      redrawAllPdfPages();
+      schedulePdfAnnotSave();
+      setPdfReaderStatus('已重做');
+    }
+    function isEditingPdfNote() {
+      const a = document.activeElement;
+      return !!(a && a.classList && a.classList.contains('pdf-note-text'));
+    }
+    // ── 只读模式点选已有标注（笔画/划词高光/下划线）→ 改色或删除 ──
+    function markPdfSelection() {
+      pdfReaderPageState.forEach((st) => {
+        if (!st.svg) return;
+        st.svg.querySelectorAll('.pdf-annot-selected').forEach((el) => el.classList.remove('pdf-annot-selected'));
+      });
+      if (!pdfSelAnnot) return;
+      const st = pdfReaderPageState.get(pdfSelAnnot.pageNo);
+      if (st && st.svg) Array.prototype.forEach.call(st.svg.childNodes, (el) => {
+        if (el.__annotItem === pdfSelAnnot.item && el.classList) el.classList.add('pdf-annot-selected');
+      });
+    }
+    function clearPdfAnnotSelection() {
+      pdfSelAnnot = null;
+      if (pdfAnnotPop) pdfAnnotPop.hidden = true;
+      markPdfSelection();
+    }
+    function showPdfAnnotPop(clientX, clientY) {
+      if (!pdfAnnotPop) return;
+      // 高亮当前标注色
+      pdfAnnotPop.querySelectorAll('[data-pop-color]').forEach((b) => {
+        b.classList.toggle('active', (b.dataset.popColor || '').toLowerCase() === ((pdfSelAnnot && pdfSelAnnot.item.color) || '').toLowerCase());
+      });
+      pdfAnnotPop.hidden = false;
+      // 浮层 fixed 定位（覆盖层铺满视口，client 坐标即屏幕坐标），夹在视口内
+      const r = pdfAnnotPop.getBoundingClientRect();
+      let x = clientX - r.width / 2, y = clientY + 12;
+      x = Math.max(8, Math.min(global.innerWidth - r.width - 8, x));
+      if (y + r.height > global.innerHeight - 8) y = clientY - r.height - 12;
+      pdfAnnotPop.style.left = x + 'px';
+      pdfAnnotPop.style.top = Math.max(8, y) + 'px';
+    }
+    function selectPdfAnnot(pageNo, item, clientX, clientY) {
+      pdfSelAnnot = { pageNo: pageNo, item: item };
+      markPdfSelection();
+      showPdfAnnotPop(clientX, clientY);
+    }
+    function recolorSelectedPdfAnnot(color) {
+      if (!pdfSelAnnot) return;
+      pushPdfHistory();
+      pdfSelAnnot.item.color = color;
+      redrawPdfPageStrokes(pdfSelAnnot.pageNo);
+      markPdfSelection();
+      schedulePdfAnnotSave();
+      pdfAnnotPop.querySelectorAll('[data-pop-color]').forEach((b) => {
+        b.classList.toggle('active', (b.dataset.popColor || '').toLowerCase() === color.toLowerCase());
+      });
+    }
+    function deleteSelectedPdfAnnot() {
+      if (!pdfSelAnnot) return;
+      const pageNo = pdfSelAnnot.pageNo, item = pdfSelAnnot.item;
+      pushPdfHistory();
+      const list = pdfAnnot.pages[pageNo] || [];
+      const idx = list.indexOf(item);
+      if (idx >= 0) list.splice(idx, 1);
+      if (!list.length) delete pdfAnnot.pages[pageNo];
+      clearPdfAnnotSelection();
+      redrawPdfPageStrokes(pageNo);
+      schedulePdfAnnotSave();
+    }
+    // 给一个标注 SVG 元素绑定「点选」（只读模式）。多段（划词高光/下划线）共享同一 item。
+    function tagPdfAnnotEl(el, pageNo, item) {
+      el.__annotItem = item;
+      if (pdfSelAnnot && pdfSelAnnot.item === item) el.classList.add('pdf-annot-selected');
+      el.addEventListener('pointerdown', (ev) => {
+        if (pdfAnnotTool) return;                 // 只读模式才点选（有工具时让位绘制/选字）
+        ev.stopPropagation();
+        ev.preventDefault();
+        selectPdfAnnot(pageNo, item, ev.clientX, ev.clientY);
+      });
+    }
+    function pickPdfColor(color) {
+      pdfAnnotColor = color;
+      if (!pdfAnnotTool || pdfAnnotTool === 'eraser') pdfAnnotTool = 'pen';
+      refreshPdfToolButtons();
+      armPdfPages();
+    }
+    function setupPdfReader() {
+      if (pdfReaderSetup || !pdfReader) return;
+      pdfReaderSetup = true;
+      pdfReader.querySelectorAll('[data-pdf-tool]').forEach((b) => {
+        b.addEventListener('click', () => setPdfAnnotTool(b.dataset.pdfTool));
+      });
+      // 颜色面板：9 色格（动态生成），点选即设色
+      const colorGrid = pdfReader.querySelector('[data-role="pdf-colors"]');
+      if (colorGrid) {
+        PDF_ANNOT_COLORS.forEach(([hex, name]) => {
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.className = 'pdf-swatch';
+          b.dataset.pdfColor = hex;
+          b.title = name;
+          b.style.background = hex;
+          b.addEventListener('click', () => { pickPdfColor(hex); closeColorPop(); });
+          colorGrid.appendChild(b);
+        });
+      }
+      // 颜色下拉：trigger 开合，点外部收起
+      const colorPop = pdfReader.querySelector('[data-role="pdf-color-pop"]');
+      const colorTrigger = pdfReader.querySelector('[data-role="pdf-color-trigger"]');
+      function closeColorPop() { if (colorPop) colorPop.hidden = true; }
+      if (colorTrigger && colorPop) {
+        colorTrigger.addEventListener('click', (e) => {
+          e.stopPropagation();
+          colorPop.hidden = !colorPop.hidden;
+        });
+        colorPop.addEventListener('click', (e) => e.stopPropagation());
+        document.addEventListener('pointerdown', (e) => {
+          if (!colorPop.hidden && !colorPop.contains(e.target) && e.target !== colorTrigger && !colorTrigger.contains(e.target)) closeColorPop();
+        });
+      }
+      // 粗细滑条
+      const range = pdfReader.querySelector('[data-role="pdf-size"]');
+      if (range) range.addEventListener('input', () => setPdfDrawSize(parseFloat(range.value)));
+      const closeBtn = pdfReader.querySelector('[data-role="pdf-reader-close"]');
+      if (closeBtn) closeBtn.addEventListener('click', closePdfReader);
+      const clearBtn = pdfReader.querySelector('[data-role="pdf-clear-page"]');
+      if (clearBtn) clearBtn.addEventListener('click', clearVisiblePdfPage);
+      const undoBtn = pdfReader.querySelector('[data-role="pdf-undo"]');
+      if (undoBtn) undoBtn.addEventListener('click', pdfUndo);
+      const redoBtn = pdfReader.querySelector('[data-role="pdf-redo"]');
+      if (redoBtn) redoBtn.addEventListener('click', pdfRedoAction);
+      // 划词高光 / 下划线：松开鼠标/笔时若有选区就落标注（仅这两个工具激活时）
+      const scroll = pdfReader.querySelector('[data-role="pdf-reader-scroll"]');
+      if (scroll) {
+        scroll.addEventListener('mouseup', () => setTimeout(commitPdfTextHighlight, 0));
+        scroll.addEventListener('scroll', clearPdfAnnotSelection);          // 滚动时收起改色浮层
+      }
+      // 改色浮层是「瞬态」的：点标注才弹出，点其它任何地方都立即收起。
+      // 标注元素与浮层内按钮均已 stopPropagation，故不会误收；这里覆盖顶栏/底栏/留白等所有区域。
+      document.addEventListener('pointerdown', (e) => {
+        if (pdfSelAnnot && pdfAnnotPop && !pdfAnnotPop.contains(e.target)) clearPdfAnnotSelection();
+      });
+      // 点选标注后的改色 / 删除浮层（建一次，复用 9 色）
+      pdfAnnotPop = document.createElement('div');
+      pdfAnnotPop.className = 'pdf-annot-pop';
+      pdfAnnotPop.hidden = true;
+      PDF_ANNOT_COLORS.forEach(([hex, name]) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'pdf-swatch';
+        b.dataset.popColor = hex;
+        b.title = name;
+        b.style.background = hex;
+        b.addEventListener('pointerdown', (e) => e.stopPropagation());
+        b.addEventListener('click', () => recolorSelectedPdfAnnot(hex));
+        pdfAnnotPop.appendChild(b);
+      });
+      const sep = document.createElement('span');
+      sep.className = 'pdf-tool-sep';
+      pdfAnnotPop.appendChild(sep);
+      const delBtn = document.createElement('button');
+      delBtn.type = 'button';
+      delBtn.className = 'pdf-annot-pop-del';
+      delBtn.textContent = '删除';
+      delBtn.addEventListener('pointerdown', (e) => e.stopPropagation());
+      delBtn.addEventListener('click', deleteSelectedPdfAnnot);
+      pdfAnnotPop.appendChild(delBtn);
+      pdfReader.appendChild(pdfAnnotPop);
+    }
+
+    function loadPdfAnnot(node) {
+      return fetch('/api/canvas-annotation?path=' + encodeURIComponent(filePath)
+        + '&asset=' + encodeURIComponent(node.assetPath || ''))
+        .then((r) => r.json()).then((res) => {
+          if (res && res.annotation && res.annotation.pages && typeof res.annotation.pages === 'object') {
+            return { version: 1, pages: res.annotation.pages };
+          }
+          return { version: 1, pages: {} };
+        }).catch(() => ({ version: 1, pages: {} }));
+    }
+    function schedulePdfAnnotSave() {
+      pdfAnnotDirty = true;
+      setPdfReaderStatus('编辑中…');
+      if (pdfAnnotSaveTimer) clearTimeout(pdfAnnotSaveTimer);
+      pdfAnnotSaveTimer = setTimeout(flushPdfAnnotSave, 600);
+    }
+    function flushPdfAnnotSave() {
+      if (pdfAnnotSaveTimer) { clearTimeout(pdfAnnotSaveTimer); pdfAnnotSaveTimer = null; }
+      if (!pdfAnnotDirty) return;
+      const node = pdfReaderNodeId ? findNode(pdfReaderNodeId) : null;
+      if (!node) { pdfAnnotDirty = false; return; }
+      pdfAnnotDirty = false;
+      fetch('/api/save-canvas-annotation', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: filePath, asset: node.assetPath, data: { version: 1, pages: pdfAnnot.pages } }),
+      }).then((r) => r.json()).then((res) => {
+        setPdfReaderStatus(res && res.ok ? '已保存' : ('保存失败：' + ((res && res.error) || '')));
+      }).catch((err) => {
+        pdfAnnotDirty = true; setPdfReaderStatus('保存失败'); console.warn('[画布] 批注保存失败', err);
+      });
+    }
+
+    // 单条笔画（归一化）→ SVG path 元素（钢笔=压感填充轮廓；荧光笔=半透明粗描边正片叠底）
+    function pdfAnnotPathEl(s) {
+      const pts = (s.pts || []).map((a) => ({ x: a[0] * PDF_ANNOT_VW, y: a[1] * PDF_ANNOT_VW, p: a[2] == null ? 0.5 : a[2] }));
+      const maxW = (s.w || 0.005) * PDF_ANNOT_VW;
+      const path = document.createElementNS(SVG_NS, 'path');
+      if (s.tool === 'hl') {
+        path.setAttribute('class', 'pdf-annot-stroke pdf-annot-hl');
+        path.setAttribute('d', strokePath(pts));
+        path.setAttribute('fill', 'none');
+        path.setAttribute('stroke', s.color || '#f4b740');
+        path.setAttribute('stroke-width', maxW);
+        path.setAttribute('stroke-linecap', 'round');
+        path.setAttribute('stroke-linejoin', 'round');
+      } else {
+        path.setAttribute('class', 'pdf-annot-stroke pdf-annot-pen');
+        path.setAttribute('d', pressureStrokeD(pts, maxW));
+        path.setAttribute('fill', s.color || '#1a1a1a');
+      }
+      return path;
+    }
+    // 划词高光：归一化矩形（按页宽）→ SVG rect（半透明正片叠底，盖字仍可读）
+    function pdfThlRectEl(item, rc) {
+      const rect = document.createElementNS(SVG_NS, 'rect');
+      rect.setAttribute('class', 'pdf-annot-thl');
+      rect.setAttribute('x', rc[0] * PDF_ANNOT_VW);
+      rect.setAttribute('y', rc[1] * PDF_ANNOT_VW);
+      rect.setAttribute('width', rc[2] * PDF_ANNOT_VW);
+      rect.setAttribute('height', rc[3] * PDF_ANNOT_VW);
+      rect.setAttribute('fill', item.color || '#f4b740');
+      return rect;
+    }
+    // 划词下划线：每行底部一条线（按页宽归一化矩形 → 取底边）
+    function pdfTulEl(item, rc) {
+      const line = document.createElementNS(SVG_NS, 'line');
+      line.setAttribute('class', 'pdf-annot-tul');
+      const y = (rc[1] + rc[3]) * PDF_ANNOT_VW - 1.5;
+      line.setAttribute('x1', rc[0] * PDF_ANNOT_VW);
+      line.setAttribute('x2', (rc[0] + rc[2]) * PDF_ANNOT_VW);
+      line.setAttribute('y1', y);
+      line.setAttribute('y2', y);
+      line.setAttribute('stroke', item.color || '#e8482f');
+      line.setAttribute('stroke-width', 3);
+      line.setAttribute('stroke-linecap', 'round');
+      return line;
+    }
+    function pdfBoxEl(item) {
+      const rect = document.createElementNS(SVG_NS, 'rect');
+      rect.setAttribute('class', 'pdf-annot-box');
+      rect.setAttribute('x', item.x * PDF_ANNOT_VW);
+      rect.setAttribute('y', item.y * PDF_ANNOT_VW);
+      rect.setAttribute('width', item.w * PDF_ANNOT_VW);
+      rect.setAttribute('height', item.h * PDF_ANNOT_VW);
+      rect.setAttribute('stroke', item.color || '#f4b740');
+      return rect;
+    }
+    function redrawPdfPageStrokes(pageNo) {
+      const st = pdfReaderPageState.get(pageNo);
+      if (!st || !st.svg) return;
+      st.svg.innerHTML = '';
+      (pdfAnnot.pages[pageNo] || []).forEach((it) => {
+        if (it.kind === 'thl') (it.rects || []).forEach((rc) => { const el = pdfThlRectEl(it, rc); tagPdfAnnotEl(el, pageNo, it); st.svg.appendChild(el); });
+        else if (it.kind === 'tul') (it.rects || []).forEach((rc) => { const el = pdfTulEl(it, rc); tagPdfAnnotEl(el, pageNo, it); st.svg.appendChild(el); });
+        else if (it.kind === 'box') { const el = pdfBoxEl(it); tagPdfAnnotEl(el, pageNo, it); st.svg.appendChild(el); }
+        else if (!it.kind) { const el = pdfAnnotPathEl(it); tagPdfAnnotEl(el, pageNo, it); st.svg.appendChild(el); }   // 笔画
+      });
+      renderPdfNotes(pageNo);
+    }
+    function pdfStrokeHitVirtual(s, v, threshold) {
+      const pts = (s.pts || []).map((a) => ({ x: a[0] * PDF_ANNOT_VW, y: a[1] * PDF_ANNOT_VW }));
+      const t = threshold + ((s.w || 0.005) * PDF_ANNOT_VW) / 2;
+      if (pts.length === 1) return Math.hypot(pts[0].x - v.x, pts[0].y - v.y) <= t;
+      for (let i = 0; i < pts.length - 1; i++) {
+        if (distToSeg(v.x, v.y, pts[i], pts[i + 1]) <= t) return true;
+      }
+      return false;
+    }
+
+    // ── 划词高光：选中 PDF 原文文字 → 存归一化矩形（按页宽）到当前页 ──
+    function commitPdfTextHighlight() {
+      if (pdfAnnotTool !== 'thl' && pdfAnnotTool !== 'tul') return;
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+      const range = sel.getRangeAt(0);
+      let node = range.commonAncestorContainer;
+      if (node.nodeType === 3) node = node.parentNode;
+      const wrap = node && node.closest ? node.closest('.pdf-reader-page') : null;
+      if (!wrap) return;
+      const pageNo = parseInt(wrap.dataset.page, 10);
+      const wrapRect = wrap.getBoundingClientRect();
+      const W = wrapRect.width;
+      if (!W) return;
+      const r4 = (n) => Math.round(n * 1e4) / 1e4;
+      const rects = [];
+      const clientRects = range.getClientRects();
+      for (let i = 0; i < clientRects.length; i++) {
+        const rc = clientRects[i];
+        if (rc.width < 1 || rc.height < 1) continue;
+        rects.push([r4((rc.left - wrapRect.left) / W), r4((rc.top - wrapRect.top) / W), r4(rc.width / W), r4(rc.height / W)]);
+      }
+      if (!rects.length) return;
+      pushPdfHistory();
+      if (!pdfAnnot.pages[pageNo]) pdfAnnot.pages[pageNo] = [];
+      pdfAnnot.pages[pageNo].push({ kind: pdfAnnotTool === 'tul' ? 'tul' : 'thl', color: pdfAnnotColor, rects: rects });
+      sel.removeAllRanges();
+      redrawPdfPageStrokes(pageNo);
+      schedulePdfAnnotSave();
+    }
+
+    // ── 便签：像节点一样随手建、可拖可改可删，半透明便签外观，存进当页批注数组 ──
+    function createPdfNote(pageNo, clientX, clientY) {
+      const st = pdfReaderPageState.get(pageNo);
+      if (!st || !st.wrap) return;
+      const r = st.wrap.getBoundingClientRect();
+      const W = r.width || 1;
+      const w = 0.26, h = 0.13;   // 归一化（按页宽）：约页宽 26%，高约页宽 13%
+      const r4 = (n) => Math.round(n * 1e4) / 1e4;
+      let x = (clientX - r.left) / W;
+      let y = (clientY - r.top) / W;
+      x = Math.max(0, Math.min(1 - w, x));                       // 落点为左上角，夹在页内
+      y = Math.max(0, Math.min((st.ratio || 1.414) - h, y));
+      const note = { kind: 'note', x: r4(x), y: r4(y), w: w, h: h, text: '', color: PDF_NOTE_COLORS[0] };
+      pushPdfHistory();
+      if (!pdfAnnot.pages[pageNo]) pdfAnnot.pages[pageNo] = [];
+      pdfAnnot.pages[pageNo].push(note);
+      redrawPdfPageStrokes(pageNo);
+      schedulePdfAnnotSave();
+      // 新建即聚焦输入
+      const st2 = pdfReaderPageState.get(pageNo);
+      if (st2 && st2.noteLayer) {
+        const els = st2.noteLayer.querySelectorAll('.pdf-note');
+        const last = els[els.length - 1];
+        const txt = last && last.querySelector('.pdf-note-text');
+        if (txt) txt.focus();
+      }
+    }
+    function renderPdfNotes(pageNo) {
+      const st = pdfReaderPageState.get(pageNo);
+      if (!st || !st.noteLayer) return;
+      const layer = st.noteLayer;
+      layer.innerHTML = '';
+      const ratio = st.ratio || 1.414;
+      (pdfAnnot.pages[pageNo] || []).forEach((note) => {
+        if (note.kind !== 'note') return;
+        layer.appendChild(buildPdfNoteEl(pageNo, note, ratio));
+      });
+    }
+    function buildPdfNoteEl(pageNo, note, ratio) {
+      const el = document.createElement('div');
+      el.className = 'pdf-note';
+      el.style.left = (note.x * 100) + '%';
+      el.style.top = (note.y / ratio * 100) + '%';
+      el.style.width = (note.w * 100) + '%';
+      el.style.height = (note.h / ratio * 100) + '%';
+      el.style.setProperty('--note-bg', note.color || PDF_NOTE_COLORS[0]);
+      const head = document.createElement('div');
+      head.className = 'pdf-note-head';
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'pdf-note-del';
+      del.textContent = '×';
+      del.title = '删除便签';
+      head.appendChild(del);
+      const text = document.createElement('div');
+      text.className = 'pdf-note-text';
+      text.contentEditable = 'plaintext-only';
+      text.spellcheck = false;
+      text.textContent = note.text || '';
+      el.appendChild(head);
+      el.appendChild(text);
+
+      // 删除
+      del.addEventListener('pointerdown', (e) => { e.stopPropagation(); });
+      del.addEventListener('click', (e) => {
+        e.stopPropagation();
+        pushPdfHistory();
+        const list = pdfAnnot.pages[pageNo] || [];
+        const idx = list.indexOf(note);
+        if (idx >= 0) list.splice(idx, 1);
+        if (!list.length) delete pdfAnnot.pages[pageNo];
+        redrawPdfPageStrokes(pageNo);
+        schedulePdfAnnotSave();
+      });
+      // 编辑文字：聚焦时先留撤销点，输入防抖保存
+      let editedSnapshotTaken = false;
+      text.addEventListener('focus', () => { editedSnapshotTaken = false; });
+      text.addEventListener('input', () => {
+        if (!editedSnapshotTaken) { pushPdfHistory(); editedSnapshotTaken = true; }
+        note.text = text.innerText;
+        schedulePdfAnnotSave();
+      });
+      // 拖动：拖标题栏移动整张便签
+      head.addEventListener('pointerdown', (e) => {
+        if (e.target === del) return;
+        if (e.button !== 0 && e.pointerType === 'mouse') return;
+        e.preventDefault();
+        e.stopPropagation();
+        const st = pdfReaderPageState.get(pageNo);
+        const W = st && st.wrap ? st.wrap.getBoundingClientRect().width : 1;
+        const startX = e.clientX, startY = e.clientY;
+        const ox = note.x, oy = note.y;
+        let moved = false;
+        try { head.setPointerCapture(e.pointerId); } catch (_) {}
+        const move = (ev) => {
+          const dx = (ev.clientX - startX) / W;
+          const dy = (ev.clientY - startY) / W;
+          if (!moved && Math.hypot(ev.clientX - startX, ev.clientY - startY) > 3) { moved = true; pushPdfHistory(); }
+          if (!moved) return;
+          note.x = Math.max(0, Math.min(1 - note.w, ox + dx));
+          note.y = Math.max(0, Math.min((st.ratio || 1.414) - note.h, oy + dy));
+          el.style.left = (note.x * 100) + '%';
+          el.style.top = (note.y / (st.ratio || 1.414) * 100) + '%';
+        };
+        const up = (ev) => {
+          head.removeEventListener('pointermove', move);
+          head.removeEventListener('pointerup', up);
+          head.removeEventListener('pointercancel', up);
+          try { head.releasePointerCapture(ev.pointerId); } catch (_) {}
+          if (moved) schedulePdfAnnotSave();
+        };
+        head.addEventListener('pointermove', move);
+        head.addEventListener('pointerup', up);
+        head.addEventListener('pointercancel', up);
+      });
+      return el;
+    }
+
+    function onPdfPagePointerDown(pageNo, svg, VH, e) {
+      if (!pdfAnnotTool) return;
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const toV = (cx, cy) => {
+        const r = svg.getBoundingClientRect();
+        return { x: (cx - r.left) / r.width * PDF_ANNOT_VW, y: (cy - r.top) / r.height * VH };
+      };
+      try { svg.setPointerCapture(e.pointerId); } catch (_) {}
+
+      if (pdfAnnotTool === 'eraser') {
+        let erased = false;
+        // 整笔擦除：笔画按距离命中；划词高光按"点落在任一矩形内"命中；便签不被橡皮擦（用便签自带 ×）。
+        const itemHit = (it, v) => {
+          if (it.kind === 'thl' || it.kind === 'tul') {
+            return (it.rects || []).some((rc) => v.x >= rc[0] * PDF_ANNOT_VW && v.x <= (rc[0] + rc[2]) * PDF_ANNOT_VW
+              && v.y >= rc[1] * PDF_ANNOT_VW && v.y <= (rc[1] + rc[3]) * PDF_ANNOT_VW);
+          }
+          if (it.kind === 'box') return v.x >= it.x * PDF_ANNOT_VW && v.x <= (it.x + it.w) * PDF_ANNOT_VW
+            && v.y >= it.y * PDF_ANNOT_VW && v.y <= (it.y + it.h) * PDF_ANNOT_VW;
+          if (it.kind === 'note') return false;
+          return pdfStrokeHitVirtual(it, v, 14);
+        };
+        const eraseAt = (cx, cy) => {
+          const v = toV(cx, cy);
+          const list = pdfAnnot.pages[pageNo] || [];
+          if (!list.length) return;
+          const kept = list.filter((s) => !itemHit(s, v));
+          if (kept.length !== list.length) {
+            if (!erased) pushPdfHistory();   // 本次擦除手势的首次命中前留一个撤销点
+            if (kept.length) pdfAnnot.pages[pageNo] = kept; else delete pdfAnnot.pages[pageNo];
+            redrawPdfPageStrokes(pageNo);
+            erased = true;
+          }
+        };
+        eraseAt(e.clientX, e.clientY);
+        const move = (ev) => eraseAt(ev.clientX, ev.clientY);
+        const up = (ev) => {
+          svg.removeEventListener('pointermove', move);
+          svg.removeEventListener('pointerup', up);
+          svg.removeEventListener('pointercancel', up);
+          try { svg.releasePointerCapture(ev.pointerId); } catch (_) {}
+          if (erased) schedulePdfAnnotSave();
+        };
+        svg.addEventListener('pointermove', move);
+        svg.addEventListener('pointerup', up);
+        svg.addEventListener('pointercancel', up);
+        return;
+      }
+
+      if (pdfAnnotTool === 'box') {
+        const start = toV(e.clientX, e.clientY);
+        const live = document.createElementNS(SVG_NS, 'rect');
+        live.setAttribute('class', 'pdf-annot-box pdf-annot-box-live');
+        live.setAttribute('stroke', pdfAnnotColor);
+        svg.appendChild(live);
+        const redrawLive = (v) => {
+          live.setAttribute('x', Math.min(start.x, v.x));
+          live.setAttribute('y', Math.min(start.y, v.y));
+          live.setAttribute('width', Math.abs(v.x - start.x));
+          live.setAttribute('height', Math.abs(v.y - start.y));
+        };
+        redrawLive(start);
+        const move = (ev) => redrawLive(toV(ev.clientX, ev.clientY));
+        const up = (ev) => {
+          svg.removeEventListener('pointermove', move);
+          svg.removeEventListener('pointerup', up);
+          svg.removeEventListener('pointercancel', up);
+          try { svg.releasePointerCapture(ev.pointerId); } catch (_) {}
+          const end = toV(ev.clientX, ev.clientY);
+          live.remove();
+          if (Math.abs(end.x - start.x) < 8 || Math.abs(end.y - start.y) < 8) return;
+          const r4 = (n) => Math.round(n * 1e4) / 1e4;
+          pushPdfHistory();
+          if (!pdfAnnot.pages[pageNo]) pdfAnnot.pages[pageNo] = [];
+          pdfAnnot.pages[pageNo].push({
+            kind: 'box', x: r4(Math.min(start.x, end.x) / PDF_ANNOT_VW), y: r4(Math.min(start.y, end.y) / PDF_ANNOT_VW),
+            w: r4(Math.abs(end.x - start.x) / PDF_ANNOT_VW), h: r4(Math.abs(end.y - start.y) / PDF_ANNOT_VW),
+            color: pdfAnnotColor,
+          });
+          redrawPdfPageStrokes(pageNo);
+          schedulePdfAnnotSave();
+        };
+        svg.addEventListener('pointermove', move);
+        svg.addEventListener('pointerup', up);
+        svg.addEventListener('pointercancel', up);
+        return;
+      }
+
+      // 钢笔 / 荧光笔
+      const isPen = pdfAnnotTool === 'pen';
+      const usePressure = isPen && penPressureOn();
+      const maxW = pdfDrawWidth(isPen) * PDF_ANNOT_VW;
+      const vpts = [];
+      const push = (cx, cy, pr) => {
+        const v = toV(cx, cy);
+        v.p = usePressure ? pr : 0.5;
+        vpts.push(v);
+      };
+      push(e.clientX, e.clientY, pointerPressure(e));
+      const live = document.createElementNS(SVG_NS, 'path');
+      live.setAttribute('class', 'pdf-annot-stroke ' + (isPen ? 'pdf-annot-pen' : 'pdf-annot-hl'));
+      if (isPen) {
+        live.setAttribute('fill', pdfAnnotColor);
+      } else {
+        live.setAttribute('fill', 'none');
+        live.setAttribute('stroke', pdfAnnotColor);
+        live.setAttribute('stroke-width', maxW);
+        live.setAttribute('stroke-linecap', 'round');
+        live.setAttribute('stroke-linejoin', 'round');
+      }
+      svg.appendChild(live);
+      const redrawLive = () => {
+        live.setAttribute('d', isPen ? pressureStrokeD(vpts, maxW) : strokePath(vpts));
+      };
+      redrawLive();
+      const move = (ev) => {
+        const evs = (ev.getCoalescedEvents && ev.getCoalescedEvents().length) ? ev.getCoalescedEvents() : [ev];
+        evs.forEach((p) => push(p.clientX, p.clientY, pointerPressure(p)));
+        redrawLive();
+      };
+      const up = (ev) => {
+        svg.removeEventListener('pointermove', move);
+        svg.removeEventListener('pointerup', up);
+        svg.removeEventListener('pointercancel', up);
+        try { svg.releasePointerCapture(ev.pointerId); } catch (_) {}
+        live.remove();
+        if (!vpts.length) return;
+        const r4 = (n) => Math.round(n * 1e4) / 1e4;
+        const r3 = (n) => Math.round(n * 1e3) / 1e3;
+        const sv = simplifyAnnotPts(vpts, 0.4);
+        const stroke = {
+          tool: pdfAnnotTool,
+          color: pdfAnnotColor,
+          w: r4(maxW / PDF_ANNOT_VW),
+          pts: sv.map((v) => [r4(v.x / PDF_ANNOT_VW), r4(v.y / PDF_ANNOT_VW), usePressure ? r3(v.p) : 0.5]),
+        };
+        pushPdfHistory();
+        if (!pdfAnnot.pages[pageNo]) pdfAnnot.pages[pageNo] = [];
+        pdfAnnot.pages[pageNo].push(stroke);
+        redrawPdfPageStrokes(pageNo);
+        schedulePdfAnnotSave();
+      };
+      svg.addEventListener('pointermove', move);
+      svg.addEventListener('pointerup', up);
+      svg.addEventListener('pointercancel', up);
+    }
+
+    function unloadPdfReaderPage(pageNo, wrapHint) {
+      const state = pdfReaderPageState.get(pageNo);
+      const pagesEl = pdfReader && pdfReader.querySelector('[data-role="pdf-reader-pages"]');
+      const wrap = (state && state.wrap) || wrapHint
+        || (pagesEl && pagesEl.querySelector('.pdf-reader-page[data-page="' + pageNo + '"]'));
+      if (!wrap) {
+        pdfReaderPageState.delete(pageNo);
+        return;
+      }
+      if (pdfSelAnnot && pdfSelAnnot.pageNo === pageNo) clearPdfAnnotSelection();
+      cancelPdfRenderTask(wrap);
+      cancelPdfTextRenderTask(wrap);
+      const height = wrap.clientHeight;
+      if (height > 0) wrap.style.minHeight = height + 'px';
+      wrap.querySelectorAll('canvas').forEach((canvas) => { canvas.width = 0; canvas.height = 0; });
+      wrap.innerHTML = '';
+      pdfReaderPageState.delete(pageNo);
+    }
+
+    function renderPdfReaderPage(pageNo) {
+      const existing = pdfReaderPageState.get(pageNo);
+      if (existing && (existing.rendered || existing.rendering)) return;
+      if (!pdfReaderDoc || !pdfReader) return;
+      const pagesEl = pdfReader.querySelector('[data-role="pdf-reader-pages"]');
+      const wrap = pagesEl && pagesEl.querySelector('.pdf-reader-page[data-page="' + pageNo + '"]');
+      if (!wrap || wrap.dataset.pdfVisible === '0') return;
+      const doc = pdfReaderDoc;
+      const pending = { rendering: true, wrap: wrap };
+      pdfReaderPageState.set(pageNo, pending);
+      doc.getPage(pageNo).then((page) => {
+        if (!pdfReaderOpen || pdfReaderDoc !== doc || !wrap.isConnected
+          || wrap.dataset.pdfVisible === '0' || pdfReaderPageState.get(pageNo) !== pending) return;
+        const cssW = wrap.clientWidth || 800;
+        const base = page.getViewport({ scale: 1 });
+        const ratio = base.height / base.width;
+        const dpr = Math.min(2, global.devicePixelRatio || 1);
+        const vp = page.getViewport({ scale: (cssW / base.width) * dpr });
+        // 先搭页面骨架，canvas 与文字层异步填充；滚出缓冲区时整页会卸载并取消在途任务。
+        wrap.style.minHeight = '';
+        wrap.innerHTML = '';
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.round(vp.width);
+        canvas.height = Math.round(vp.height);
+        canvas.className = 'pdf-reader-canvas';
+        wrap.appendChild(canvas);
+        const textLayer = document.createElement('div');
+        textLayer.className = 'pdf-text-layer';
+        textLayer.style.setProperty('--scale-factor', String(cssW / base.width));
+        wrap.appendChild(textLayer);
+        const VH = Math.round(PDF_ANNOT_VW * ratio);
+        const svg = document.createElementNS(SVG_NS, 'svg');
+        svg.setAttribute('class', 'pdf-annot-svg');
+        svg.setAttribute('viewBox', '0 0 ' + PDF_ANNOT_VW + ' ' + VH);
+        svg.setAttribute('preserveAspectRatio', 'none');
+        svg.classList.toggle('armed', pdfMode() === 'draw');
+        svg.classList.toggle('erasing', pdfAnnotTool === 'eraser');
+        svg.addEventListener('pointerdown', (ev) => onPdfPagePointerDown(pageNo, svg, VH, ev));
+        wrap.appendChild(svg);
+        const noteLayer = document.createElement('div');
+        noteLayer.className = 'pdf-note-layer';
+        noteLayer.addEventListener('pointerdown', (ev) => {
+          if (pdfMode() !== 'note' || ev.target !== noteLayer) return;
+          ev.preventDefault();
+          createPdfNote(pageNo, ev.clientX, ev.clientY);
+        });
+        wrap.appendChild(noteLayer);
+        const state = { wrap: wrap, svg: svg, textLayer: textLayer, noteLayer: noteLayer, VH: VH, ratio: ratio, rendered: true };
+        pdfReaderPageState.set(pageNo, state);
+        redrawPdfPageStrokes(pageNo);
+
+        const renderTask = page.render({ canvasContext: canvas.getContext('2d'), viewport: vp });
+        wrap.__pdfRenderTask = renderTask;
+        renderTask.promise.then(() => {
+          if (pdfReaderPageState.get(pageNo) !== state || wrap.dataset.pdfVisible === '0') {
+            canvas.width = 0; canvas.height = 0;
+          }
+        }).catch((err) => {
+          if (!isPdfRenderCancelled(err) && pdfReaderPageState.get(pageNo) === state) {
+            console.warn('[画布] PDF 阅读页栅格化失败', err);
+          }
+        }).finally(() => {
+          if (wrap.__pdfRenderTask === renderTask) wrap.__pdfRenderTask = null;
+        });
+
+        const textViewport = page.getViewport({ scale: cssW / base.width });
+        page.getTextContent().then((tc) => {
+          if (!pdfReaderOpen || pdfReaderDoc !== doc || wrap.dataset.pdfVisible === '0'
+            || pdfReaderPageState.get(pageNo) !== state) return;
+          const lib = global.pdfjsLib;
+          if (!lib || typeof lib.renderTextLayer !== 'function') return;
+          const textTask = lib.renderTextLayer({ textContentSource: tc, container: textLayer, viewport: textViewport });
+          wrap.__pdfTextRenderTask = textTask;
+          return textTask.promise.catch(() => {}).finally(() => {
+            if (wrap.__pdfTextRenderTask === textTask) wrap.__pdfTextRenderTask = null;
+          });
+        }).catch(() => {});
+      }).catch((err) => {
+        if (pdfReaderPageState.get(pageNo) === pending) pdfReaderPageState.delete(pageNo);
+        if (!isPdfRenderCancelled(err) && pdfReaderOpen && pdfReaderDoc === doc) {
+          console.warn('[画布] PDF 阅读页渲染失败', err);
+        }
+      });
+    }
+
+    function buildPdfReaderPages() {
+      const pagesEl = pdfReader.querySelector('[data-role="pdf-reader-pages"]');
+      const scroll = pdfReader.querySelector('[data-role="pdf-reader-scroll"]');
+      const token = pdfReaderToken;
+      const doc = pdfReaderDoc;
+      Array.from(pdfReaderPageState.keys()).forEach((pageNo) => unloadPdfReaderPage(pageNo));
+      pagesEl.innerHTML = '';
+      if (pdfReaderObserver) { try { pdfReaderObserver.disconnect(); } catch (_) {} }
+      pdfReaderObserver = new IntersectionObserver((items) => {
+        if (token !== pdfReaderToken || doc !== pdfReaderDoc) return;
+        items.forEach((it) => {
+          const pageNo = parseInt(it.target.dataset.page, 10);
+          it.target.dataset.pdfVisible = it.isIntersecting ? '1' : '0';
+          if (it.isIntersecting) renderPdfReaderPage(pageNo);
+          else unloadPdfReaderPage(pageNo, it.target);
+        });
+      }, { root: scroll, rootMargin: '800px 0px' });
+      const placeholderH = Math.round(Math.min(900, (scroll.clientWidth || 800)) * pdfReaderRatio);
+      for (let p = 1; p <= doc.numPages; p++) {
+        const wrap = document.createElement('div');
+        wrap.className = 'pdf-reader-page';
+        wrap.dataset.page = String(p);
+        wrap.style.minHeight = placeholderH + 'px';
+        pagesEl.appendChild(wrap);
+        pdfReaderObserver.observe(wrap);
+      }
+      // 首屏页主动渲染：浮层刚显示时 IntersectionObserver 初次回调偶尔不触发，
+      // 直接渲染前两页兜底，其余页仍交给滚动懒加载（renderPdfReaderPage 自带防重）。
+      // rAF + setTimeout 双保险：窗口在后台时 rAF 会被节流，setTimeout 仍能驱动首屏。
+      const kick = () => {
+        if (!pdfReaderOpen || token !== pdfReaderToken || doc !== pdfReaderDoc) return;
+        renderPdfReaderPage(1);
+        if (doc.numPages > 1) renderPdfReaderPage(2);
+      };
+      requestAnimationFrame(kick);
+      setTimeout(kick, 120);
+    }
+
+    function currentPdfReaderPage() {
+      const scroll = pdfReader && pdfReader.querySelector('[data-role="pdf-reader-scroll"]');
+      if (!scroll) return null;
+      const mid = scroll.getBoundingClientRect().top + scroll.clientHeight / 2;
+      let best = null, bestDist = Infinity;
+      pdfReaderPageState.forEach((st, no) => {
+        if (!st.wrap) return;
+        const r = st.wrap.getBoundingClientRect();
+        const d = Math.abs((r.top + r.bottom) / 2 - mid);
+        if (d < bestDist) { bestDist = d; best = no; }
+      });
+      return best;
+    }
+    function clearVisiblePdfPage() {
+      const pageNo = currentPdfReaderPage();
+      if (!pageNo || !(pdfAnnot.pages[pageNo] && pdfAnnot.pages[pageNo].length)) return;
+      if (!window.confirm('清空第 ' + pageNo + ' 页的全部批注？')) return;
+      pushPdfHistory();
+      delete pdfAnnot.pages[pageNo];
+      redrawPdfPageStrokes(pageNo);
+      schedulePdfAnnotSave();
+    }
+
+    function openPdfReader(node) {
+      if (!pdfReader || !isPdfNode(node)) return;
+      setupPdfReader();
+      if (editingNodeId !== null) commitNodeEdit();
+      if (textReaderOpen) closeTextReader();
+      if (searchOpen) closeSearch();
+      const token = ++pdfReaderToken;
+      if (pdfReaderObserver) { try { pdfReaderObserver.disconnect(); } catch (_) {} pdfReaderObserver = null; }
+      Array.from(pdfReaderPageState.keys()).forEach((pageNo) => unloadPdfReaderPage(pageNo));
+      destroyPdfLoadingTask(pdfReaderLoadingTask);
+      pdfReaderLoadingTask = null;
+      destroyPdfDocument(pdfReaderDoc);
+      pdfReaderDoc = null;
+      pdfReaderOpen = true;
+      pdfReaderNodeId = node.id;
+      pdfAnnotTool = null;
+      pdfAnnotDirty = false;
+      pdfAnnot = { version: 1, pages: {} };
+      pdfHistory = [];
+      pdfRedo = [];
+      pdfSelAnnot = null;
+      if (pdfAnnotPop) pdfAnnotPop.hidden = true;
+      const titleEl = pdfReader.querySelector('[data-role="pdf-reader-title"]');
+      if (titleEl) titleEl.textContent = node.name || 'PDF';
+      setPdfReaderStatus('');
+      refreshPdfToolButtons();
+      armPdfPages();
+      pdfReader.hidden = false;
+      armReaderBlurReveal(pdfReader, '.pdf-reader-card');
+      showOnboardingHint('pdf-tools', '数字键：<kbd>1</kbd> 只读 · <kbd>2</kbd> 钢笔 · <kbd>3</kbd> 荧光笔 · <kbd>4</kbd> 橡皮', 6200);
+      const pagesEl = pdfReader.querySelector('[data-role="pdf-reader-pages"]');
+      pagesEl.innerHTML = '<div class="pdf-reader-loading">正在载入 PDF…</div>';
+      const scroll = pdfReader.querySelector('[data-role="pdf-reader-scroll"]');
+      if (scroll) scroll.scrollTop = 0;
+      let loadingTask = null;
+      let loadCancelled = false;
+      Promise.all([
+        loadPdfjs().then((lib) => {
+          if (loadCancelled || !pdfReaderOpen || token !== pdfReaderToken || pdfReaderNodeId !== node.id) {
+            throw new Error('PDF load superseded');
+          }
+          loadingTask = lib.getDocument({
+            url: decorationAssetUrl(node), cMapUrl: PDFJS_BASE + 'cmaps/', cMapPacked: true,
+            standardFontDataUrl: PDFJS_BASE + 'standard_fonts/',
+          });
+          pdfReaderLoadingTask = loadingTask;
+          return loadingTask.promise;
+        }),
+        loadPdfAnnot(node),
+      ]).then((results) => {
+        const doc = results[0];
+        if (pdfReaderLoadingTask === loadingTask) pdfReaderLoadingTask = null;
+        if (!pdfReaderOpen || token !== pdfReaderToken || pdfReaderNodeId !== node.id) {
+          destroyPdfDocument(doc);
+          return;
+        }
+        pdfAnnot = results[1] || { version: 1, pages: {} };
+        pdfReaderDoc = doc;
+        return doc.getPage(1).then((page) => {
+          if (!pdfReaderOpen || token !== pdfReaderToken || pdfReaderDoc !== doc) return;
+          const vp = page.getViewport({ scale: 1 });
+          pdfReaderRatio = vp.height / vp.width;
+          buildPdfReaderPages();
+        });
+      }).catch((err) => {
+        loadCancelled = true;
+        if (pdfReaderLoadingTask === loadingTask) {
+          pdfReaderLoadingTask = null;
+          destroyPdfLoadingTask(loadingTask);
+        }
+        if (token !== pdfReaderToken || !pdfReaderOpen || pdfReaderNodeId !== node.id) return;
+        destroyPdfDocument(pdfReaderDoc);
+        pdfReaderDoc = null;
+        if (pagesEl && pagesEl.isConnected) pagesEl.innerHTML = '<div class="pdf-reader-loading">PDF 载入失败</div>';
+        if (!isPdfRenderCancelled(err)) console.warn('[画布] PDF 阅读载入失败', err);
+      });
+    }
+    function closePdfReader() {
+      if (!pdfReaderOpen) return;
+      pdfReaderToken += 1;
+      flushPdfAnnotSave();
+      clearPdfAnnotSelection();
+      pdfReaderOpen = false;
+      pdfReaderNodeId = null;
+      pdfAnnotTool = null;
+      if (pdfReaderObserver) { try { pdfReaderObserver.disconnect(); } catch (_) {} pdfReaderObserver = null; }
+      Array.from(pdfReaderPageState.keys()).forEach((pageNo) => unloadPdfReaderPage(pageNo));
+      destroyPdfLoadingTask(pdfReaderLoadingTask);
+      pdfReaderLoadingTask = null;
+      destroyPdfDocument(pdfReaderDoc);
+      pdfReaderDoc = null;
+      if (pdfReader) {
+        dismissReaderOverlay(pdfReader, '.pdf-reader-card', function () {
+          if (pdfReaderOpen) return;            // 160ms 内又被打开了 → 不收尾
+          pdfReader.hidden = true;
+          const pagesEl = pdfReader.querySelector('[data-role="pdf-reader-pages"]');
+          if (pagesEl) pagesEl.innerHTML = '';
+        });
+      }
+    }
+
+    // ── 选中文字浮动工具栏（高光 / 文字颜色 / 字号）─────────────
+    // 支持三种编辑面：节点文字、编辑抽屉正文与阅读浮层正文。
+    let selToolbarRaf = null;
+    let selToolbarRevealRaf = null;
+    let selToolbarRevealRaf2 = null;
+    let selToolbarRevealAnimation = null;
+    function cancelSelToolbarReveal() {
+      if (selToolbarRevealRaf != null) {
+        cancelAnimationFrame(selToolbarRevealRaf);
+        selToolbarRevealRaf = null;
+      }
+      if (selToolbarRevealRaf2 != null) {
+        cancelAnimationFrame(selToolbarRevealRaf2);
+        selToolbarRevealRaf2 = null;
+      }
+      if (selToolbarRevealAnimation) {
+        selToolbarRevealAnimation.cancel();
+        selToolbarRevealAnimation = null;
+      }
+    }
+    function revealSelToolbar() {
+      if (!selToolbar) return;
+      cancelSelToolbarReveal();
+      selToolbar.classList.remove('toolbar-visible');
+      selToolbar.classList.add('toolbar-enter');
+      selToolbar.style.visibility = '';
+      selToolbar.getBoundingClientRect();
+      selToolbarRevealRaf = requestAnimationFrame(function () {
+        selToolbarRevealRaf = null;
+        if (!selToolbar || selToolbar.hidden) return;
+        const below = selToolbar.classList.contains('below');
+        const baseTransform = below ? 'translate(-50%, 0)' : 'translate(-50%, -100%)';
+        const fromTransform = baseTransform + ' translateY(10px)';
+        const toTransform = baseTransform + ' translateY(0)';
+        if (typeof selToolbar.animate === 'function') {
+          const anim = selToolbar.animate([
+            { opacity: 0, filter: 'blur(7px)', transform: fromTransform, offset: 0 },
+            { opacity: 1, filter: 'blur(0)', transform: toTransform, offset: 1 },
+          ], {
+            duration: 320,
+            easing: 'cubic-bezier(0.16, 1, 0.3, 1)',
+            fill: 'both',
+          });
+          selToolbarRevealAnimation = anim;
+          selToolbar.classList.remove('toolbar-enter');
+          selToolbar.classList.add('toolbar-visible');
+          anim.onfinish = function () {
+            if (selToolbarRevealAnimation !== anim) return;
+            selToolbarRevealAnimation = null;
+            anim.cancel();
+          };
+          anim.oncancel = function () {
+            if (selToolbarRevealAnimation === anim) selToolbarRevealAnimation = null;
+          };
+          return;
+        }
+        selToolbar.classList.add('toolbar-visible');
+        selToolbarRevealRaf2 = requestAnimationFrame(function () {
+          selToolbarRevealRaf2 = null;
+          if (!selToolbar || selToolbar.hidden) return;
+          selToolbar.classList.remove('toolbar-enter');
+        });
+      });
+    }
+    function hideSelToolbar() {
+      activeDecorTitleNodeId = null;
+      if (selToolbar) {
+        cancelSelToolbarReveal();
+        selToolbar.classList.remove('toolbar-enter', 'toolbar-visible');
+        selToolbar.classList.remove('decor-title-mode');
+        selToolbar.style.visibility = '';
+        selToolbar.hidden = true;
+      }
+    }
+    function decorTitleNode() {
+      const node = activeDecorTitleNodeId ? findNode(activeDecorTitleNodeId) : null;
+      return isGroupBoxNode(node) ? node : null;
+    }
+    function showDecorTitleToolbar(nodeId) {
+      if (!selToolbar) return;
+      activeDecorTitleNodeId = nodeId;
+      selToolbar.classList.add('decor-title-mode');
+      updateSelToolbar({ keepInvisible: true });
+      revealSelToolbar();
+    }
+
+    function prepareDecorTitleToolbar(nodeId) {
+      if (!selToolbar) return;
+      activeDecorTitleNodeId = nodeId;
+      selToolbar.classList.add('decor-title-mode');
+      updateSelToolbar({ keepInvisible: true });
+    }
+    // 当前可格式化的文字编辑面
+    function activeTextSurface() {
+      if (editingTextBoxId !== null) {
+        const te = textBoxContentEl(editingTextBoxId);
+        if (te && te.isContentEditable) return { kind: 'text-box', el: te };
+      }
+      if (editingNodeId !== null) {
+        if (isCodeNode(findNode(editingNodeId))) return null;
+        const el = nodeMap.get(editingNodeId);
+        const te = el && el.querySelector('.node-text');
+        if (te && te.isContentEditable) return { kind: 'node', el: te };
+      }
+      if (enBodyRich && document.body.dataset.inspectorView === 'selection' && document.activeElement === enBodyRich) {
+        if (isCodeNode(editGetNode())) return null;
+        return { kind: 'panel-body', el: enBodyRich };
+      }
+      const proBodyRich = document.querySelector('[data-role="pro-body-rich"]');
+      if (proBodyRich && document.activeElement === proBodyRich) {
+        const node = editGetNode();
+        if (node && isBodyNode(node) && !isCodeNode(node)) return { kind: 'pro-panel-body', el: proBodyRich };
+      }
+      if (textReaderEditing && textReader) {
+        if (isCodeNode(findNode(readingNodeId))) return null;
+        const ed = textReader.querySelector('[data-role="text-reader-rich-editor"]');
+        if (ed && document.activeElement === ed) return { kind: 'reader-body', el: ed };
+      }
+      return null;
+    }
+    // contenteditable：range 端点 → 全局字符偏移（含 \n，与 textContent 一致）
+    function ceCharOffset(root, container, offset) {
+      const r = document.createRange();
+      r.selectNodeContents(root);
+      r.setEnd(container, offset);
+      return r.toString().length;
+    }
+    function nodeSelOffsets(te) {
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
+      const range = sel.getRangeAt(0);
+      if (!te.contains(range.startContainer) || !te.contains(range.endContainer)) return null;
+      const start = ceCharOffset(te, range.startContainer, range.startOffset);
+      const end = ceCharOffset(te, range.endContainer, range.endOffset);
+      if (end <= start) return null;
+      return { start: start, end: end };
+    }
+    function contentEditableCaretOffset(te) {
+      const sel = window.getSelection();
+      if (!te || !sel || sel.rangeCount === 0) return 0;
+      const range = sel.getRangeAt(0);
+      if (!te.contains(range.startContainer)) return 0;
+      return ceCharOffset(te, range.startContainer, range.startOffset);
+    }
+    function setNodeSelection(te, start, end) {
+      const segs = [];
+      const walker = document.createTreeWalker(te, NodeFilter.SHOW_TEXT, null);
+      let n, base = 0;
+      while ((n = walker.nextNode())) { segs.push({ node: n, s: base, e: base + n.nodeValue.length }); base += n.nodeValue.length; }
+      if (segs.length === 0) return;
+      const r = document.createRange();
+      let okS = false, okE = false;
+      for (let i = 0; i < segs.length; i++) {
+        const seg = segs[i];
+        if (!okS && start >= seg.s && start <= seg.e) { r.setStart(seg.node, start - seg.s); okS = true; }
+        if (okS && end >= seg.s && end <= seg.e) { r.setEnd(seg.node, end - seg.s); okE = true; break; }
+      }
+      if (okS && okE) { const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r); }
+    }
+    // 量出 textarea 中第 pos 字符的客户端坐标（用镜像 div，含换行/自动折行）
+    function textareaCaretPoint(ta, pos) {
+      const cs = getComputedStyle(ta);
+      const div = document.createElement('div');
+      ['boxSizing', 'width', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft',
+        'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth',
+        'fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'lineHeight', 'letterSpacing',
+        'textTransform', 'wordSpacing', 'tabSize'].forEach(function (p) { div.style[p] = cs[p]; });
+      div.style.position = 'absolute';
+      div.style.visibility = 'hidden';
+      div.style.left = '-9999px';
+      div.style.top = '0';
+      div.style.height = 'auto';
+      div.style.whiteSpace = 'pre-wrap';
+      div.style.overflowWrap = 'break-word';
+      div.style.wordWrap = 'break-word';
+      div.appendChild(document.createTextNode(ta.value.slice(0, pos)));
+      const marker = document.createElement('span');
+      marker.textContent = '​';
+      div.appendChild(marker);
+      document.body.appendChild(div);
+      const ox = marker.offsetLeft, oy = marker.offsetTop;
+      document.body.removeChild(div);
+      const rect = ta.getBoundingClientRect();
+      return { x: rect.left + ox - ta.scrollLeft, y: rect.top + oy - ta.scrollTop, lh: parseFloat(cs.lineHeight) || 18 };
+    }
+    // 选区上沿中点 + 下沿（用于把工具栏放选区上方，空间不足时放下方）
+    function selAnchor() {
+      const titleNode = decorTitleNode();
+      if (titleNode) {
+        const el = nodeMap.get(titleNode.id);
+        const title = el && el.querySelector('.decor-box-title');
+        if (!title) return null;
+        const rect = title.getBoundingClientRect();
+        return { x: rect.left + rect.width / 2, top: rect.top, bottom: rect.bottom };
+      }
+      const surf = activeTextSurface();
+      if (!surf) {
+        // MD 附件正文选区：非编辑面，但允许弹工具栏给选区加高光/字色/字号（存伴生文件）。
+        const mdCtx = currentMdAnnotContext();
+        if (mdCtx) {
+          const sel = window.getSelection();
+          const range = sel.getRangeAt(0);
+          const rect = range.getBoundingClientRect();
+          if (!rect || (rect.width === 0 && rect.height === 0)) return null;
+          return { x: rect.left + rect.width / 2, top: rect.top, bottom: rect.bottom };
+        }
+        return null;
+      }
+      // 节点 / 文本框 / 正文编辑统一使用底部 textDock；旧浮条只保留给
+      // Markdown 附件批注与盒子标题调色，避免两套文字工具同时出现。
+      return null;
+    }
+    function updateSelToolbar(opts) {
+      opts = opts || {};
+      if (!selToolbar) return;
+      const a = selAnchor();
+      if (!a) {
+        cancelSelToolbarReveal();
+        selToolbar.classList.remove('toolbar-enter', 'toolbar-visible');
+        selToolbar.style.visibility = '';
+        selToolbar.hidden = true;
+        return;
+      }
+      selToolbar.classList.toggle('decor-title-mode', !!decorTitleNode());
+      const wasHidden = selToolbar.hidden;
+      const measureInvisible = opts.keepInvisible || wasHidden;
+      if (measureInvisible) selToolbar.style.visibility = 'hidden';
+      selToolbar.hidden = false;
+      const tw = selToolbar.offsetWidth || 0;
+      const th = selToolbar.offsetHeight || 0;
+      let left = a.x;
+      left = Math.max(tw / 2 + 6, Math.min(window.innerWidth - tw / 2 - 6, left));
+      if (a.top - th - 12 < 8) {                 // 顶部空间不足 → 放到选区下方
+        selToolbar.classList.add('below');
+        selToolbar.style.top = (a.bottom + 8) + 'px';
+      } else {
+        selToolbar.classList.remove('below');
+        selToolbar.style.top = (a.top - 8) + 'px';
+      }
+      selToolbar.style.left = left + 'px';
+      if (opts.keepInvisible) {
+        selToolbar.style.visibility = 'hidden';
+      } else if (wasHidden) {
+        revealSelToolbar();
+      } else {
+        selToolbar.style.visibility = '';
+      }
+    }
+    function scheduleSelToolbar() {
+      if (!selToolbar || selToolbarRaf != null) return;
+      selToolbarRaf = requestAnimationFrame(function () { selToolbarRaf = null; updateSelToolbar(); });
+    }
+    const INLINE_HL_CODE = { y: 'yellow', o: 'orange', r: 'red', p: 'purple', b: 'blue', c: 'cyan', g: 'green', k: 'gray' };
+    const INLINE_HL_NAME = { yellow: 'y', orange: 'o', red: 'r', purple: 'p', blue: 'b', cyan: 'c', green: 'g', gray: 'k' };
+    const INLINE_TC_CODE = { y: 'yellow', o: 'orange', r: 'red', p: 'purple', b: 'blue', c: 'cyan', g: 'green', k: 'gray' };
+    const INLINE_TC_NAME = { yellow: 'y', orange: 'o', red: 'r', purple: 'p', blue: 'b', cyan: 'c', green: 'g', gray: 'k' };
+    // 格式变换：工具栏始终把组合样式规范为 {hl:red|{tc:blue|{fs:lg|文字}}}，
+    // 这样无论先点哪个按钮，换样式和单独清除都不会不断套娃。
+    function readInlineStyle(seln) {
+      const style = { inner: seln, highlight: null, textColor: null, fontSize: null, bold: false };
+      let changed = true;
+      while (changed) {
+        changed = false;
+        let m = /^==([\s\S]*)==$/.exec(style.inner);
+        if (m && style.highlight === null) {
+          style.highlight = 'y';
+          style.inner = m[1];
+          changed = true;
+          continue;
+        }
+        m = /^\{hl:(yellow|orange|red|purple|blue|cyan|green|gray)\|([\s\S]*)\}$/.exec(style.inner);
+        if (m && style.highlight === null) {
+          style.highlight = INLINE_HL_NAME[m[1]] || 'y';
+          style.inner = m[2];
+          changed = true;
+          continue;
+        }
+        m = /^\{tc:(yellow|orange|red|purple|blue|cyan|green|gray)\|([\s\S]*)\}$/.exec(style.inner);
+        if (m && style.textColor === null) {
+          style.textColor = INLINE_TC_NAME[m[1]] || 'r';
+          style.inner = m[2];
+          changed = true;
+          continue;
+        }
+        m = /^\{fs:(sm|lg|xl)\|([\s\S]*)\}$/.exec(style.inner);
+        if (m && style.fontSize === null) {
+          style.fontSize = m[1];
+          style.inner = m[2];
+          changed = true;
+          continue;
+        }
+        m = /^\*\*([\s\S]*)\*\*$/.exec(style.inner);
+        if (m && !style.bold) {
+          style.bold = true;
+          style.inner = m[1];
+          changed = true;
+        }
+      }
+      return style;
+    }
+    function writeInlineStyle(style) {
+      let seg = style.inner;
+      if (style.bold) seg = '**' + seg + '**';
+      if (style.fontSize) seg = '{fs:' + style.fontSize + '|' + seg + '}';
+      if (style.textColor) seg = '{tc:' + (INLINE_TC_CODE[style.textColor] || 'red') + '|' + seg + '}';
+      if (style.highlight) {
+        const hl = INLINE_HL_CODE[style.highlight] || 'yellow';
+        seg = style.highlight === 'y' ? '==' + seg + '==' : '{hl:' + hl + '|' + seg + '}';
+      }
+      return seg;
+    }
+    function formattedResult(text, start, end, seg) {
+      return { text: text.slice(0, start) + seg + text.slice(end), selStart: start, selEnd: start + seg.length };
+    }
+    function inlineLinesTransform(mutator) {
+      return function (text, start, end) {
+        const selected = text.slice(start, end);
+        const seg = selected.split('\n').map(function (line) {
+          if (!line) return line;
+          return mutator(line);
+        }).join('\n');
+        return formattedResult(text, start, end, seg);
+      };
+    }
+    function highlightTransform(colorCode) {
+      return inlineLinesTransform(function (line) {
+        const style = readInlineStyle(line);
+        style.highlight = colorCode;
+        return writeInlineStyle(style);
+      });
+    }
+    function clearHlTransform() {
+      return inlineLinesTransform(function (line) {
+        const style = readInlineStyle(line);
+        let seg;
+        if (style.highlight !== null) {
+          style.highlight = null;
+          seg = writeInlineStyle(style);
+        } else {
+          seg = line
+            .replace(/==([^=\n]+?)==/g, '$1')
+            .replace(/\{hl:(?:yellow|orange|red|purple|blue|cyan|green|gray)\|([^{}\n]+?)\}/g, '$1');
+        }
+        return seg;
+      });
+    }
+    function textColorTransform(colorCode) {
+      return inlineLinesTransform(function (line) {
+        const style = readInlineStyle(line);
+        style.textColor = colorCode;
+        return writeInlineStyle(style);
+      });
+    }
+    function clearTextColorTransform() {
+      return inlineLinesTransform(function (line) {
+        const style = readInlineStyle(line);
+        let seg;
+        if (style.textColor !== null) {
+          style.textColor = null;
+          seg = writeInlineStyle(style);
+        } else {
+          seg = line.replace(/\{tc:(?:yellow|orange|red|purple|blue|cyan|green|gray)\|([^{}\n]+?)\}/g, '$1');
+        }
+        return seg;
+      });
+    }
+    function fontSizeTransform(sizeCode) {
+      return inlineLinesTransform(function (line) {
+        const style = readInlineStyle(line);
+        style.fontSize = sizeCode;
+        return writeInlineStyle(style);
+      });
+    }
+    function clearFontSizeTransform() {
+      return inlineLinesTransform(function (line) {
+        const style = readInlineStyle(line);
+        let seg;
+        if (style.fontSize !== null) {
+          style.fontSize = null;
+          seg = writeInlineStyle(style);
+        } else {
+          seg = line.replace(/\{fs:(?:sm|lg|xl)\|([^{}\n]+?)\}/g, '$1');
+        }
+        return seg;
+      });
+    }
+    function boldTransform(enabled) {
+      return inlineLinesTransform(function (line) {
+        const style = readInlineStyle(line);
+        style.bold = enabled;
+        return writeInlineStyle(style);
+      });
+    }
+    function clearInlineFormatTransform() {
+      return inlineLinesTransform(function (line) {
+        let out = line;
+        for (let pass = 0; pass < 8; pass++) {
+          const before = out;
+          const style = readInlineStyle(out);
+          if (style.highlight !== null || style.textColor !== null || style.fontSize !== null || style.bold) {
+            out = style.inner;
+          }
+          out = out
+            .replace(/==([^=\n]+?)==/g, '$1')
+            .replace(/\{hl:(?:yellow|orange|red|purple|blue|cyan|green|gray)\|([^{}\n]+?)\}/g, '$1')
+            .replace(/\{tc:(?:yellow|orange|red|purple|blue|cyan|green|gray)\|([^{}\n]+?)\}/g, '$1')
+            .replace(/\{fs:(?:sm|lg|xl)\|([^{}\n]+?)\}/g, '$1')
+            .replace(/\*\*([^*\n]+?)\*\*/g, '$1');
+          if (out === before) break;
+        }
+        return out;
+      });
+    }
+    function applyFormat(transform, collapseAfter) {
+      const titleNode = decorTitleNode();
+      if (titleNode) return false;
+      const surf = activeTextSurface();
+      if (!surf) return false;
+      let changed = false;
+      if (surf.el && surf.el.isContentEditable) {
+        const off = nodeSelOffsets(surf.el);
+        if (!off) return false;
+        const before = surf.el.textContent || '';
+        const res = transform(before, off.start, off.end);
+        changed = res.text !== before;
+        if (!changed) return false;
+        surf.el.focus();
+        const inserted = res.text.slice(res.selStart, res.selEnd);
+        if (!document.execCommand('insertText', false, inserted)) {
+          surf.el.textContent = res.text;
+        }
+        const caret = collapseAfter ? res.selEnd : res.selStart;
+        setNodeSelection(surf.el, caret, res.selEnd);
+        if (surf.kind === 'node') onEditingInput();   // 刷新尺寸/连线/标记淡化
+        else {
+          const node = findNode(editingTextBoxId);
+          if (node) node.text = surf.el.textContent || '';
+          redrawMinimap();
+        }
+      } else {
+        const ta = surf.el;
+        if (ta.selectionStart === ta.selectionEnd) return false;
+        const before = ta.value;
+        const res = transform(before, ta.selectionStart, ta.selectionEnd);
+        changed = res.text !== before;
+        if (!changed) return false;
+        ta.setRangeText(res.text.slice(res.selStart, res.selEnd), ta.selectionStart, ta.selectionEnd,
+          collapseAfter ? 'end' : 'select');
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
+        const node = surf.kind === 'panel-body' ? editGetNode() : findNode(readingNodeId);
+        if (node && isBodyNode(node)) {
+          applyTextNodeBody(node, ta.value);
+        }
+        if (surf.kind === 'reader-body') autoGrowEditor(ta);
+        ta.focus();
+        if (surf.kind === 'panel-body' && node && isBodyNode(node)) {
+          enBodyDirty = false;
+          pushHistory();                   // 工具栏点击是一次完整的离散正文修改
+        }
+      }
+      scheduleSelToolbar();
+      scheduleTextDock();
+      return changed;
+    }
+    const DECOR_TITLE_PALETTES = {
+      y: { border: '#dfc05f', fill: '#fff9dd' },
+      b: { border: '#9eb8cc', fill: '#edf4f7' },
+      g: { border: '#a8c9a8', fill: '#f0f7ed' },
+      r: { border: '#c99a90', fill: '#fbefec' },
+      p: { border: '#b7a7d6', fill: '#f4effb' },
+    };
+    const DECOR_TITLE_TEXT_COLORS = {
+      r: '#b84d46',
+      b: '#2f6fa6',
+      g: '#2f7a4c',
+      o: '#a96824',
+      p: '#7b58a7',
+    };
+    function applyDecorTitleToolbar(action, value) {
+      const node = decorTitleNode();
+      if (!node) return false;
+      if (action === 'palette') {
+        const p = DECOR_TITLE_PALETTES[value] || DECOR_TITLE_PALETTES.y;
+        node.borderColor = p.border;
+        node.fillColor = p.fill;
+      } else if (action === 'palette-clear') {
+        const d = decorShapeDefaults('group-box');
+        node.borderColor = d.borderColor;
+        node.fillColor = d.fillColor;
+      } else if (action === 'text-color') {
+        node.titleColor = DECOR_TITLE_TEXT_COLORS[value] || '#ffffff';
+      } else if (action === 'text-clear') {
+        node.titleColor = '#ffffff';
+      } else {
+        return false;
+      }
+      renderEditedDecoration(node);
+      refreshDecorPanel();
+      pushHistory();
+      notify();
+      showDecorTitleToolbar(node.id);
+      return true;
+    }
+    if (selToolbar) {
+      selToolbar.addEventListener('mousedown', function (e) { e.preventDefault(); }); // 保住选区/焦点
+      selToolbar.addEventListener('click', function (e) {
+        const sw = e.target.closest('[data-hl-color]');
+        const clr = e.target.closest('[data-hl-action="clear"]');
+        const textColor = e.target.closest('[data-tc-color]');
+        const clearTextColor = e.target.closest('[data-tc-action="clear"]');
+        const fontSize = e.target.closest('[data-fs-size]');
+        const clearFontSize = e.target.closest('[data-fs-action="clear"]');
+        // MD 附件正文选区：路由到伴生批注（设/清高光、字色、字号），不走文本编辑。
+        const mdCtx = currentMdAnnotContext();
+        if (mdCtx) {
+          if (sw) applyMdAnnot(mdCtx, 'hl', sw.getAttribute('data-hl-color'));
+          else if (clr) applyMdAnnot(mdCtx, 'hl', null);
+          else if (textColor) applyMdAnnot(mdCtx, 'color', textColor.getAttribute('data-tc-color'));
+          else if (clearTextColor) applyMdAnnot(mdCtx, 'color', null);
+          else if (fontSize) applyMdAnnot(mdCtx, 'size', fontSize.getAttribute('data-fs-size'));
+          else if (clearFontSize) applyMdAnnot(mdCtx, 'size', null);
+          return;
+        }
+        if (sw && applyDecorTitleToolbar('palette', sw.getAttribute('data-hl-color'))) return;
+        if (clr && applyDecorTitleToolbar('palette-clear')) return;
+        if (textColor && applyDecorTitleToolbar('text-color', textColor.getAttribute('data-tc-color'))) return;
+        if (clearTextColor && applyDecorTitleToolbar('text-clear')) return;
+        if (sw) applyFormat(highlightTransform(sw.getAttribute('data-hl-color')));
+        else if (clr) applyFormat(clearHlTransform());
+        else if (textColor) applyFormat(textColorTransform(textColor.getAttribute('data-tc-color')));
+        else if (clearTextColor) applyFormat(clearTextColorTransform());
+        else if (fontSize) applyFormat(fontSizeTransform(fontSize.getAttribute('data-fs-size')));
+        else if (clearFontSize) applyFormat(clearFontSizeTransform());
+      });
+      document.addEventListener('selectionchange', scheduleSelToolbar);
+    }
+
+    // ── 底部文字上下文工具栏 ────────────────────────────────
+    const TEXT_DOCK_HL_CSS = {
+      y: 'rgba(250, 224, 120, 0.92)', o: 'rgba(246, 184, 113, 0.92)',
+      r: 'rgba(242, 162, 152, 0.92)', p: 'rgba(192, 166, 236, 0.92)',
+      b: 'rgba(140, 197, 240, 0.92)', c: 'rgba(126, 205, 207, 0.92)',
+      g: 'rgba(150, 212, 162, 0.92)', k: 'rgba(183, 190, 187, 0.92)',
+    };
+    const TEXT_DOCK_TC_HEX = { y: '#98721d', o: '#ae692c', r: '#b64f49', p: '#7754a5', b: '#356ca8', c: '#347b84', g: '#3d7d50', k: '#69716d' };
+    const TEXT_DOCK_TONE_TO_TC = { y: 'y', o: 'o', r: 'r', p: 'p', b: 'b', c: 'c', g: 'g', k: 'k' };
+    const TEXT_DOCK_TC_TO_TONE = { y: 'y', o: 'o', r: 'r', p: 'p', b: 'b', c: 'c', g: 'g', k: 'k' };
+    const TEXT_DOCK_TONE_TO_RICH = { y: 'yellow', o: 'orange', r: 'red', p: 'purple', b: 'blue', c: 'cyan', g: 'green', k: 'gray' };
+    const TEXT_DOCK_ABS_SIZE = { sm: 22, '': 34, lg: 48, xl: 64 };
+    const TEXT_DOCK_REL_SIZE = { sm: 0.86, '': 1, lg: 1.22, xl: 1.48 };
+    const TEXT_DOCK_COLLAPSED_KEY = 'canvas:textToolbarCollapsed';
+    let textDockRaf = null;
+    let textDockVisible = false;
+    let textDockCollapsed = true;
+    let lastTextHighlight = 'y';
+    let lastTextColor = 'y';
+    let lastTextTone = 'y';
+    try {
+      const savedHl = localStorage.getItem('canvas:textHighlightColor');
+      const savedTc = localStorage.getItem('canvas:textInlineColor');
+      const savedCollapsed = localStorage.getItem(TEXT_DOCK_COLLAPSED_KEY);
+      textDockCollapsed = savedCollapsed === null ? true : savedCollapsed === '1';
+      if (TEXT_DOCK_HL_CSS[savedHl]) lastTextTone = savedHl;
+      else if (TEXT_DOCK_TC_TO_TONE[savedTc]) lastTextTone = TEXT_DOCK_TC_TO_TONE[savedTc];
+      lastTextHighlight = lastTextTone;
+      lastTextColor = TEXT_DOCK_TONE_TO_TC[lastTextTone];
+    } catch (e) {}
+
+    function selectedInlineRange(surf) {
+      if (!surf) return null;
+      if (surf.el && surf.el.isContentEditable) {
+        const off = nodeSelOffsets(surf.el);
+        if (!off) return null;
+        return { start: off.start, end: off.end, text: (surf.el.textContent || '').slice(off.start, off.end) };
+      }
+      const el = surf.el;
+      if (el.selectionStart == null || el.selectionStart === el.selectionEnd) return null;
+      return { start: el.selectionStart, end: el.selectionEnd, text: el.value.slice(el.selectionStart, el.selectionEnd) };
+    }
+    function singleSelectedTextBox() {
+      if (selectedNodeIds.size !== 1 || selectedEdgeIds.size || selectedArrowId) return null;
+      const node = findNode([...selectedNodeIds][0]);
+      return isTextBoxNode(node) ? node : null;
+    }
+    function selectedTextBindingPair() {
+      if (selectedNodeIds.size !== 2 || selectedEdgeIds.size || selectedArrowId) return null;
+      let box = null;
+      let target = null;
+      for (const id of selectedNodeIds) {
+        const node = findNode(id);
+        if (!node) return null;
+        if (isTextBoxNode(node)) {
+          if (box) return null;
+          box = node;
+        } else if (!isDecorationNode(node)) {
+          if (target) return null;
+          target = node;
+        } else return null;
+      }
+      return box && target ? { box: box, target: target } : null;
+    }
+    function textDockContext() {
+      const surf = activeTextSurface();
+      const range = selectedInlineRange(surf);
+      if (range) {
+        const node = surf.kind === 'text-box' ? findNode(editingTextBoxId)
+          : (surf.kind === 'node' ? findNode(editingNodeId)
+            : ((surf.kind === 'panel-body' || surf.kind === 'pro-panel-body') ? editGetNode() : findNode(readingNodeId)));
+        return { scope: 'range', surf: surf, range: range, node: node || null };
+      }
+      if (editingTextBoxId !== null) {
+        const box = findNode(editingTextBoxId);
+        if (box) return { scope: 'text-box', node: box, surf: surf };
+      }
+      if (surf && surf.kind === 'node') {
+        const node = findNode(editingNodeId);
+        if (node) return { scope: 'node', node: node, surf: surf };
+      }
+      const box = singleSelectedTextBox();
+      if (box) return { scope: 'text-box', node: box, surf: null };
+      if (drawTool === 'text') return { scope: 'defaults', defaults: readToolDefaults('text') };
+      return null;
+    }
+    function richTextRangeState(ctx) {
+      if (!RichText || !ctx || ctx.scope !== 'range' || !ctx.surf || !ctx.surf.el.isContentEditable) return null;
+      const draft = readRichEditable(ctx.surf.el);
+      return RichText.rangeStyle(draft.text, draft.marks, ctx.range.start, ctx.range.end);
+    }
+    function applySelectedRichText(ctx, patch) {
+      if (!RichText || !ctx || ctx.scope !== 'range' || !ctx.surf || !ctx.surf.el.isContentEditable) return false;
+      const root = ctx.surf.el;
+      const draft = readRichEditable(root);
+      const next = RichText.apply(draft.text, draft.marks, ctx.range.start, ctx.range.end, patch);
+      if (JSON.stringify(next) === JSON.stringify(draft.marks)) return false;
+      const scrollTop = root.scrollTop;
+      RichText.renderEditable(root, draft.text, next);
+      root.scrollTop = scrollTop;
+      root.focus({ preventScroll: true });
+      setNodeSelection(root, ctx.range.start, ctx.range.end);
+      if (ctx.surf.kind === 'panel-body' && ctx.node) {
+        enBodyDirty = true;
+        applyTextNodeBody(ctx.node, draft.text, next);
+      } else if (ctx.surf.kind === 'pro-panel-body' && ctx.node) {
+        root.dispatchEvent(new Event('input', { bubbles: true }));
+      } else if (ctx.surf.kind === 'reader-body' && ctx.node) {
+        applyTextNodeBody(ctx.node, draft.text, next);
+      }
+      scheduleTextDock();
+      return true;
+    }
+    function textDockCopy(key, fallback) {
+      const tc = typeof global.__tc === 'function' ? global.__tc : null;
+      const value = tc ? tc(key) : '';
+      return value && value !== key ? value : fallback;
+    }
+    function setTextDockCollapsed(collapsed, persist) {
+      if (!textDock) return;
+      textDockCollapsed = !!collapsed;
+      textDock.classList.toggle('is-collapsed', textDockCollapsed);
+      textDock.dataset.collapsed = textDockCollapsed ? '1' : '0';
+      const button = textDock.querySelector('[data-role="text-dock-collapse"]');
+      if (button) {
+        const key = textDockCollapsed ? 'textDockExpand' : 'textDockCollapse';
+        const fallback = textDockCollapsed ? '展开文字工具栏' : '收起文字工具栏';
+        const label = textDockCopy(key, fallback);
+        button.dataset.editorI18nTitle = key;
+        button.dataset.editorI18nAria = key;
+        button.title = label;
+        button.setAttribute('aria-label', label);
+        button.setAttribute('aria-expanded', textDockCollapsed ? 'false' : 'true');
+      }
+      if (persist) {
+        try { localStorage.setItem(TEXT_DOCK_COLLAPSED_KEY, textDockCollapsed ? '1' : '0'); }
+        catch (e) {}
+      }
+    }
+    function closestTextDockSize(map, value) {
+      let best = '';
+      let distance = Infinity;
+      Object.keys(map).forEach(function (code) {
+        const nextDistance = Math.abs(Number(map[code]) - Number(value));
+        if (nextDistance < distance) {
+          distance = nextDistance;
+          best = code;
+        }
+      });
+      return best;
+    }
+    function scheduleTextDock() {
+      if (!textDock || textDockRaf != null) return;
+      textDockRaf = requestAnimationFrame(function () {
+        textDockRaf = null;
+        updateTextDock();
+      });
+    }
+    function updateTextDock() {
+      if (!textDock) return;
+      const ctx = textDockContext();
+      const wasHidden = textDock.hidden;
+      textDock.hidden = false;
+      if (wasHidden && !textDockVisible) {
+        textDock.classList.add('is-entering');
+        requestAnimationFrame(function () { textDock.classList.remove('is-entering'); });
+      }
+      textDockVisible = true;
+      textDock.style.setProperty('--td-hl', TEXT_DOCK_HL_CSS[lastTextHighlight]);
+      textDock.style.setProperty('--td-tc', TEXT_DOCK_TC_HEX[lastTextColor]);
+      const rangeMode = !!ctx && ctx.scope === 'range';
+      const localOnly = rangeMode;
+      const bindingPair = selectedTextBindingPair();
+      const bold = textDock.querySelector('[data-text-action="bold"]');
+      const highlight = textDock.querySelector('[data-text-action="highlight"]');
+      const color = textDock.querySelector('[data-text-action="color"]');
+      const colorRail = textDock.querySelector('[data-role="text-color-rail"]');
+      const bind = textDock.querySelector('[data-text-bind-action="toggle"]');
+      const clear = textDock.querySelector('[data-text-action="clear"]');
+      const canHighlight = localOnly;
+      const canColor = !!ctx && (localOnly || ctx.scope === 'text-box' || ctx.scope === 'defaults');
+      if (highlight) highlight.disabled = !canHighlight;
+      if (color) color.disabled = !canColor;
+      if (colorRail) colorRail.hidden = false;
+      if (bold) bold.disabled = !ctx;
+      if (clear) clear.disabled = !ctx;
+      if (bind) {
+        const currentTarget = bindingPair ? textBindingTarget(bindingPair.box) : null;
+        const pairIsBound = !!(currentTarget && currentTarget.id === bindingPair.target.id);
+        bind.disabled = !bindingPair;
+        bind.classList.toggle('is-bound', pairIsBound);
+        bind.classList.toggle('active', pairIsBound);
+        bind.setAttribute('aria-pressed', pairIsBound ? 'true' : 'false');
+      }
+      const convert = textDock.querySelector('[data-text-bind-action="convert"]');
+      if (convert) convert.disabled = !bindingPair;
+
+      const style = rangeMode ? richTextRangeState(ctx) : null;
+      if (colorRail) {
+        colorRail.querySelectorAll('[data-text-tone]').forEach(function (swatch) {
+          const active = swatch.dataset.textTone === lastTextTone;
+          swatch.classList.toggle('active', active);
+          swatch.setAttribute('aria-pressed', active ? 'true' : 'false');
+        });
+      }
+      let activeSize = null;
+      if (ctx) {
+        if (style) activeSize = style.size && !style.size.mixed ? (style.size.value || '') : null;
+        else if (ctx.scope === 'defaults') activeSize = closestTextDockSize(TEXT_DOCK_ABS_SIZE,
+          Number(ctx.defaults && ctx.defaults.fontSize) || TEXT_DOCK_ABS_SIZE['']);
+        else if (ctx.scope === 'text-box') activeSize = closestTextDockSize(TEXT_DOCK_ABS_SIZE,
+          Number(ctx.node && ctx.node.fontSize) || TEXT_DOCK_ABS_SIZE['']);
+        else activeSize = closestTextDockSize(TEXT_DOCK_REL_SIZE,
+          Number(ctx.node && ctx.node.fontScale) || TEXT_DOCK_REL_SIZE['']);
+      }
+      textDock.querySelectorAll('[data-text-size]').forEach(function (button) {
+        const active = !!ctx && activeSize !== null && button.dataset.textSize === activeSize;
+        button.disabled = !ctx;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-pressed', active ? 'true' : 'false');
+      });
+      let activeAlign = 'left';
+      if (ctx) {
+        if (ctx.scope === 'defaults') activeAlign = (ctx.defaults && ctx.defaults.textAlign) || 'left';
+        else if (ctx.node) activeAlign = editIsMindmapNode(ctx.node)
+          ? (ctx.node.mindmapTextAlign || 'left') : (ctx.node.textAlign || 'left');
+      }
+      textDock.querySelectorAll('[data-text-align]').forEach(function (button) {
+        const active = !!ctx && button.dataset.textAlign === activeAlign;
+        button.disabled = !ctx;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-pressed', active ? 'true' : 'false');
+      });
+      if (bold) bold.classList.toggle('active', !!ctx && (style ? !!(style.bold && !style.bold.mixed && style.bold.value)
+        : !!(ctx.node && nodeFontWeightInfo(ctx.node).value >= 600)));
+      // 高光与字色是“立即应用”命令，不是可持续选中的工具模式。
+      if (highlight) highlight.classList.remove('active');
+      if (color) color.classList.remove('active');
+    }
+    function persistTextDockChoice(kind, value) {
+      try { localStorage.setItem(kind === 'highlight' ? 'canvas:textHighlightColor' : 'canvas:textInlineColor', value); }
+      catch (e) {}
+    }
+    function commitTextDockNodeStyle(node) {
+      const el = nodeMap.get(node.id);
+      if (el) applyNodeStyle(el, node);
+      edgesIncidentTo(new Set([node.id])).forEach(updateEdgePath);
+      redrawMinimap();
+      refreshEditPanel();
+      document.dispatchEvent(new CustomEvent('editor:nodestylechange', { detail: { nodeId: node.id } }));
+      if (!(editingTextBoxId === node.id && editingTextBoxIsNew)) {
+        pushHistory();
+        notify();
+      }
+      scheduleTextDock();
+    }
+    function finishTextDockEditAfterChange(ctx, changed) {
+      if (!changed || !ctx || !ctx.node) return false;
+      if (editingTextBoxId === ctx.node.id) {
+        commitTextBoxEdit();
+        return true;
+      }
+      if (editingNodeId === ctx.node.id) {
+        commitNodeEdit();
+        return true;
+      }
+      return false;
+    }
+    function writeTextDockDefaults(change) {
+      const defaults = readToolDefaults('text');
+      change(defaults);
+      writeToolDefaults('text', defaults);
+      if (toolConfigFor === 'text') rebuildToolConfig('text');
+      scheduleTextDock();
+    }
+    function applyTextDockSize(code) {
+      const ctx = textDockContext();
+      if (!ctx || !Object.prototype.hasOwnProperty.call(TEXT_DOCK_ABS_SIZE, code)) return;
+      let changed = false;
+      if (ctx.scope === 'range') {
+        changed = applySelectedRichText(ctx, { size: code || null });
+      } else if (ctx.scope === 'defaults') {
+        writeTextDockDefaults(function (d) { d.fontSize = TEXT_DOCK_ABS_SIZE[code]; });
+      } else if (ctx.scope === 'text-box') {
+        const next = TEXT_DOCK_ABS_SIZE[code];
+        changed = (Number(ctx.node.fontSize) || TEXT_DOCK_ABS_SIZE['']) !== next;
+        if (!changed) return;
+        ctx.node.fontSize = next;
+        commitTextDockNodeStyle(ctx.node);
+      } else if (ctx.scope === 'node') {
+        const value = TEXT_DOCK_REL_SIZE[code];
+        changed = Math.abs((Number(ctx.node.fontScale) || 1) - value) > 0.001;
+        if (!changed) return;
+        if (value === 1) delete ctx.node.fontScale;
+        else ctx.node.fontScale = value;
+        if (editIsMindmapNode(ctx.node)) ctx.node.mindmapSizeMode = 'custom';
+        commitTextDockNodeStyle(ctx.node);
+      }
+      if (ctx.scope !== 'range') finishTextDockEditAfterChange(ctx, changed);
+    }
+    function applyTextDockBold() {
+      const ctx = textDockContext();
+      if (!ctx) return;
+      if (ctx.scope === 'range') {
+        const state = richTextRangeState(ctx);
+        const active = !!(state && state.bold && !state.bold.mixed && state.bold.value);
+        applySelectedRichText(ctx, { bold: active ? null : true });
+      } else if (ctx.scope === 'defaults') {
+        writeTextDockDefaults(function (d) { d.fontWeight = Number(d.fontWeight) >= 600 ? 400 : 700; });
+      } else {
+        const nextWeight = nodeFontWeightInfo(ctx.node).value >= 600 ? 400 : 700;
+        if (editIsMindmapNode(ctx.node)) {
+          ctx.node.mindmapFontWeight = nextWeight;
+          ctx.node.mindmapSizeMode = 'custom';
+        } else ctx.node.fontWeight = nextWeight;
+        commitTextDockNodeStyle(ctx.node);
+      }
+    }
+    function applyTextDockHighlight(code, forceSet) {
+      const ctx = textDockContext();
+      if (!ctx || ctx.scope !== 'range') return;
+      lastTextHighlight = code || lastTextHighlight;
+      persistTextDockChoice('highlight', lastTextHighlight);
+      const state = richTextRangeState(ctx);
+      const richColor = TEXT_DOCK_TONE_TO_RICH[lastTextHighlight];
+      const current = state && state.highlight && !state.highlight.mixed ? state.highlight.value : null;
+      applySelectedRichText(ctx, { highlight: !forceSet && current === richColor ? null : richColor });
+      scheduleTextDock();
+    }
+    function applyTextDockColor(code, forceSet) {
+      const ctx = textDockContext();
+      if (!ctx) return;
+      lastTextColor = code || lastTextColor;
+      persistTextDockChoice('color', lastTextColor);
+      if (ctx.scope === 'range') {
+        const state = richTextRangeState(ctx);
+        const richColor = TEXT_DOCK_TONE_TO_RICH[lastTextColor];
+        const current = state && state.color && !state.color.mixed ? state.color.value : null;
+        applySelectedRichText(ctx, { color: !forceSet && current === richColor ? null : richColor });
+      } else if (ctx.scope === 'defaults') {
+        writeTextDockDefaults(function (d) { d.color = TEXT_DOCK_TC_HEX[lastTextColor]; });
+      } else if (ctx.scope === 'text-box') {
+        const next = TEXT_DOCK_TC_HEX[lastTextColor];
+        const changed = String(ctx.node.color || '#1a1a1a').toLowerCase() !== next.toLowerCase();
+        if (!changed) return;
+        ctx.node.color = next;
+        commitTextDockNodeStyle(ctx.node);
+        finishTextDockEditAfterChange(ctx, true);
+      }
+      scheduleTextDock();
+    }
+    function applyTextDockTone(tone) {
+      if (!TEXT_DOCK_HL_CSS[tone]) return;
+      lastTextTone = tone;
+      lastTextHighlight = tone;
+      lastTextColor = TEXT_DOCK_TONE_TO_TC[tone];
+      persistTextDockChoice('highlight', lastTextHighlight);
+      persistTextDockChoice('color', lastTextColor);
+      textDock.style.setProperty('--td-hl', TEXT_DOCK_HL_CSS[lastTextTone]);
+      textDock.style.setProperty('--td-tc', TEXT_DOCK_TC_HEX[lastTextColor]);
+      scheduleTextDock();
+    }
+    function applyTextDockAlign(align) {
+      const ctx = textDockContext();
+      if (!ctx) return;
+      align = align === 'right' || align === 'center' ? align : 'left';
+      if (ctx.scope === 'defaults') {
+        writeTextDockDefaults(function (d) { d.textAlign = align; });
+      } else if (ctx.node) {
+        if (editIsMindmapNode(ctx.node)) {
+          ctx.node.mindmapTextAlign = align;
+          ctx.node.mindmapSizeMode = 'custom';
+        } else if (!isTextBoxNode(ctx.node) && align === 'left') delete ctx.node.textAlign;
+        else ctx.node.textAlign = align;
+        commitTextDockNodeStyle(ctx.node);
+      }
+    }
+    function clearTextDockFormatting() {
+      const ctx = textDockContext();
+      if (!ctx) return;
+      if (ctx.scope === 'range') {
+        applySelectedRichText(ctx, { clear: true });
+      } else if (ctx.scope === 'defaults') {
+        writeToolDefaults('text', defaultToolDefaults('text'));
+        if (toolConfigFor === 'text') rebuildToolConfig('text');
+        scheduleTextDock();
+      } else if (ctx.scope === 'text-box') {
+        if (RichText && ctx.surf && ctx.surf.el && ctx.surf.el.isContentEditable) {
+          const draft = readRichEditable(ctx.surf.el);
+          const caret = contentEditableCaretOffset(ctx.surf.el);
+          RichText.renderEditable(ctx.surf.el, draft.text, []);
+          ctx.surf.el.focus({ preventScroll: true });
+          setNodeSelection(ctx.surf.el, caret, caret);
+        }
+        delete ctx.node.textMarks;
+        if (editingTextBoxId === ctx.node.id) editingTextBoxOriginalMarks = [];
+        ctx.node.fontSize = 34;
+        ctx.node.color = '#1a1a1a';
+        delete ctx.node.fontWeight;
+        delete ctx.node.textAlign;
+        commitTextDockNodeStyle(ctx.node);
+        const el = nodeMap.get(ctx.node.id);
+        if (el && !ctx.surf) renderDecoration(el, ctx.node);
+      } else if (ctx.scope === 'node') {
+        const field = editsBodyInline(ctx.node) ? 'body' : 'text';
+        if (RichText && ctx.surf && ctx.surf.el && ctx.surf.el.isContentEditable) {
+          const draft = readRichEditable(ctx.surf.el);
+          const caret = contentEditableCaretOffset(ctx.surf.el);
+          RichText.renderEditable(ctx.surf.el, draft.text, []);
+          ctx.surf.el.focus({ preventScroll: true });
+          setNodeSelection(ctx.surf.el, caret, caret);
+        }
+        delete ctx.node[richMarksKey(field)];
+        if (editingNodeId === ctx.node.id) editingOriginalMarks = [];
+        delete ctx.node.fontScale;
+        if (editIsMindmapNode(ctx.node)) {
+          delete ctx.node.mindmapFontWeight;
+          delete ctx.node.mindmapTextAlign;
+          ctx.node.mindmapSizeMode = 'custom';
+        } else {
+          delete ctx.node.fontWeight;
+          delete ctx.node.textAlign;
+        }
+        commitTextDockNodeStyle(ctx.node);
+      }
+    }
+
+    function replaceNodeElement(node) {
+      const old = nodeMap.get(node.id);
+      if (old) {
+        if (nodeSizeObserver) nodeSizeObserver.unobserve(old);
+        old.remove();
+      }
+      nodeSizeCache.delete(node.id);
+      const el = createNodeEl(node);
+      surface.appendChild(el);
+      nodeMap.set(node.id, el);
+      if (nodeSizeObserver) nodeSizeObserver.observe(el);
+      return el;
+    }
+    function ensureMindmapRootStyle(node) {
+      if (!node || mindmapParentOf(node) || node.mindmapStylePreset || node.mindmapRoot) return;
+      const presetId = (document.body && MINDMAP_STYLE_PRESETS[document.body.dataset.mindmapPreset])
+        ? document.body.dataset.mindmapPreset : 'paper';
+      const preset = mindmapPreset(presetId);
+      const centerFactor = mindmapSizeFactorFromDataset(0);
+      writeMindmapNodeStyle(node, Object.assign({
+        bgColor: preset.center.bgColor,
+        borderColor: preset.center.borderColor,
+        opacity: preset.center.opacity,
+        shape: 'rect',
+        hideChrome: !!preset.center.hideChrome,
+      }, mindmapSizeStyle(preset.center, 0, centerFactor, true)));
+      writeMindmapColorMeta(node, presetId, preset.center.borderColor, 0, 'auto');
+      node.mindmapRoot = true;
+      const el = nodeMap.get(node.id);
+      if (el) applyNodeStyle(el, node);
+    }
+    function closestRichTextColorForTextBox(value) {
+      const source = normalizeHexColor(value);
+      if (!source) return '';
+      const sr = parseInt(source.slice(1, 3), 16);
+      const sg = parseInt(source.slice(3, 5), 16);
+      const sb = parseInt(source.slice(5, 7), 16);
+      // 黑色系就是普通节点的语义正文色，不额外写一层灰色 marks。
+      if (Math.max(sr, sg, sb) <= 48) return '';
+      let bestTone = '';
+      let bestDistance = Infinity;
+      Object.keys(TEXT_DOCK_TC_HEX).forEach(function (tone) {
+        const candidate = normalizeHexColor(TEXT_DOCK_TC_HEX[tone]);
+        if (!candidate) return;
+        if (candidate === source) {
+          bestTone = tone;
+          bestDistance = -1;
+          return;
+        }
+        if (bestDistance < 0) return;
+        const dr = sr - parseInt(candidate.slice(1, 3), 16);
+        const dg = sg - parseInt(candidate.slice(3, 5), 16);
+        const db = sb - parseInt(candidate.slice(5, 7), 16);
+        const distance = dr * dr + dg * dg + db * db;
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          bestTone = tone;
+        }
+      });
+      return TEXT_DOCK_TONE_TO_RICH[bestTone] || '';
+    }
+    function fillMissingRichTextStyle(text, rawMarks, fallback) {
+      if (!RichText || !text) return [];
+      const marks = RichText.normalize(text, rawMarks);
+      const points = new Set([0, text.length]);
+      marks.forEach(function (mark) { points.add(mark.start); points.add(mark.end); });
+      const sorted = Array.from(points).sort(function (a, b) { return a - b; });
+      const out = [];
+      let markIndex = 0;
+      for (let i = 0; i < sorted.length - 1; i++) {
+        const start = sorted[i];
+        const end = sorted[i + 1];
+        if (end <= start) continue;
+        while (markIndex < marks.length && marks[markIndex].end <= start) markIndex += 1;
+        const active = marks[markIndex] && marks[markIndex].start <= start && marks[markIndex].end >= end
+          ? marks[markIndex] : null;
+        const style = {};
+        ['size', 'color', 'highlight', 'bold'].forEach(function (key) {
+          if (active && active[key] != null) style[key] = active[key];
+          else if (fallback && fallback[key] != null) style[key] = fallback[key];
+        });
+        if (Object.keys(style).length) out.push(Object.assign({ start: start, end: end }, style));
+      }
+      return RichText.normalize(text, out);
+    }
+    function convertTextBoxToMindmapChild(box, parent) {
+      if (!isTextBoxNode(box) || !parent) return false;
+      if (editingTextBoxId === box.id) commitTextBoxEdit();
+      const rawSource = String(box.text || '');
+      const leading = (rawSource.match(/^\s*/) || [''])[0].length;
+      const trailing = (rawSource.match(/\s*$/) || [''])[0].length;
+      const trimmedEnd = Math.max(leading, rawSource.length - trailing);
+      const source = rawSource.slice(leading, trimmedEnd) || '文字';
+      const sourceMarks = RichText && source !== '文字'
+        ? RichText.slice(rawSource, richMarks(box, 'text'), leading, trimmedEnd) : [];
+      const sourceFontSize = Math.max(12, Math.min(96, Number(box.fontSize) || 34));
+      const sourceFontWeight = Math.max(400, Math.min(800, Number(box.fontWeight) || 400));
+      const sourceRichColor = closestRichTextColorForTextBox(box.color || '#1a1a1a');
+      ['kind', 'width', 'height', 'fontSize', 'fontPreset', 'color', 'opacity', 'rotation', 'layer',
+       'boxStyle', 'fillColor', 'borderColor', 'borderWidth', 'borderStyle', 'fontWeight', 'textAlign',
+       'textBindTarget', 'textBindDx', 'textBindDy']
+        .forEach(function (prop) { delete box[prop]; });
+      box.text = source;
+      const edge = { id: newEdgeId(), from: parent.id, to: box.id, text: '' };
+      data.edges.push(edge);
+      ensureMindmapRootStyle(parent);
+      styleMindmapCreatedChild(parent, box, edge);
+      const fallbackStyle = {};
+      if (sourceRichColor) fallbackStyle.color = sourceRichColor;
+      if (sourceFontWeight >= 600) fallbackStyle.bold = true;
+      storeRichMarks(box, 'text', fillMissingRichTextStyle(source, sourceMarks, fallbackStyle));
+      // 文字框使用绝对 px，导图节点使用 14.5px × 节点缩放 × 文字比例。
+      // 只传递文字比例，保留导图预设控制的节点尺寸与层级节奏；超限按现有检查器范围截断。
+      const mindmapBaseFontSize = 14.5 * (Number(box.scale) > 0 ? Number(box.scale) : 1);
+      const transferredFontScale = Math.max(0.75, Math.min(1.6, sourceFontSize / mindmapBaseFontSize));
+      box.fontScale = Math.round(transferredFontScale * 100) / 100;
+      if (Math.abs(box.fontScale - 1) < 0.001) delete box.fontScale;
+      box.mindmapSizeMode = 'custom';
+      box.hideChrome = true;
+      markMindmapNodeColorCustom(box);
+      replaceNodeElement(box);
+      const refs = createEdgeEls(edge);
+      edgeMap.set(edge.id, refs);
+      updateEdgePath(edge);
+      const tree = buildManagedMindmapTree(parent);
+      if (tree && tree.valid) {
+        markMindmapRoot(tree);
+        orientMindmapTreeEdges(tree);
+        const layout = managedMindmapLayout(tree, mindmapDragLayoutOptions());
+        applyMindmapPositions(tree, layout.local, true, { history: false, notify: false, duration: 280 });
+      }
+      selectNodes([box.id], false);
+      refreshMindmapFolding();
+      pushHistory();
+      notify();
+      showCanvasToast('已转为导图子节点');
+      scheduleTextDock();
+      return true;
+    }
+    function toggleTextBoxBinding() {
+      const pair = selectedTextBindingPair();
+      if (!pair) return;
+      const box = pair.box;
+      const target = pair.target;
+      const current = textBindingTarget(box);
+      if (current && current.id === target.id) {
+        clearTextBinding(box);
+        showCanvasToast('已解除文本框跟随');
+      } else {
+        if (!setTextBinding(box, target)) return;
+        showCanvasToast(current ? '文本框已改为跟随所选节点' : '文本框将跟随所选节点');
+      }
+      pushHistory();
+      notify();
+      scheduleTextDock();
+    }
+
+    if (textDock) {
+      textDock.addEventListener('mousedown', function (e) { e.preventDefault(); });
+      textDock.addEventListener('click', function (e) {
+        const collapse = e.target.closest('[data-role="text-dock-collapse"]');
+        if (collapse) {
+          setTextDockCollapsed(!textDockCollapsed, true);
+          return;
+        }
+        const sizeChoice = e.target.closest('[data-text-size]');
+        const toneChoice = e.target.closest('[data-text-tone]');
+        const alignChoice = e.target.closest('[data-text-align]');
+        const bindChoice = e.target.closest('[data-text-bind-action]');
+        if (sizeChoice) { applyTextDockSize(sizeChoice.getAttribute('data-text-size')); return; }
+        if (toneChoice) { applyTextDockTone(toneChoice.dataset.textTone); return; }
+        if (alignChoice) { applyTextDockAlign(alignChoice.dataset.textAlign); return; }
+        if (bindChoice) {
+          if (bindChoice.dataset.textBindAction === 'convert') {
+            const pair = selectedTextBindingPair();
+            if (pair) convertTextBoxToMindmapChild(pair.box, pair.target);
+          } else toggleTextBoxBinding();
+          return;
+        }
+        const action = e.target.closest('[data-text-action]');
+        if (!action || action.disabled) return;
+        const name = action.dataset.textAction;
+        if (name === 'bold') applyTextDockBold();
+        else if (name === 'highlight') applyTextDockHighlight(lastTextHighlight, true);
+        else if (name === 'color') applyTextDockColor(lastTextColor, true);
+        else if (name === 'clear') clearTextDockFormatting();
+      });
+      document.addEventListener('selectionchange', scheduleTextDock);
+      setTextDockCollapsed(textDockCollapsed, false);
+      scheduleTextDock();
+    }
+
+    // ── 公式工作流 ① · LaTeX 符号 / 模板快捷面板 ───────────────
+    // fx 浮动按钮唤出分类面板，点一下把 LaTeX 片段插到「当前编辑面」光标处。
+    // 复用 activeTextSurface()：节点标题 contenteditable / 编辑模式正文框 / F 阅读正文框都支持。
+    // 模板里的占位符 ‸（光标符）标记插入后光标落点；有选区时把选区包进占位符位置。
+    const FORMULA_CARET = '‸';
+    // 分节规格：t=按钮显示字符，x=要插入的 LaTeX（含 ‸ 光标符）。无光标符的纯符号末尾留空格，避免与后续字符粘连。
+    const FORMULA_SECTIONS = [
+      { label: '公式 · 结构', keys: [
+        { t: '$ $', x: '$‸$', wide: 1 }, { t: '$$', x: '$$\n‸\n$$' },
+        { t: 'a/b', x: '\\frac{‸}{}' }, { t: '√', x: '\\sqrt{‸}' },
+        { t: 'xⁿ', x: '^{‸}' }, { t: 'xₙ', x: '_{‸}' },
+        { t: '∑', x: '\\sum_{‸}^{}' }, { t: '∏', x: '\\prod_{‸}^{}' },
+        { t: '∫', x: '\\int_{‸}^{}' }, { t: '∂/∂', x: '\\frac{\\partial ‸}{\\partial }', wide: 1 },
+        { t: 'lim', x: '\\lim_{‸}' }, { t: '{ ⋯', x: '\\begin{cases}‸ \\\\ \\end{cases}', wide: 1 },
+        { t: '(▦)', x: '\\begin{pmatrix}‸ \\\\ \\end{pmatrix}', wide: 1 },
+        { t: '|▦|', x: '\\begin{vmatrix}‸ \\\\ \\end{vmatrix}', wide: 1 },
+        { t: '⎰⎱', x: '\\left( ‸ \\right)', wide: 1 }, { t: 'text', x: '\\text{‸}' },
+        { t: '推导链', x: '\n```derive\n‸ || 步骤说明\n= … || 步骤说明\n```\n', wide: 1, tip: '分步推导：每行「公式 || 说明」→ 竖排带步号 + ↓ 箭头' },
+      ] },
+      { label: '编号 · 引用', note: '写 align / 编号式会自动出现 (1)(2)…。要引用：① 在该行公式里加 \\label{eq:名} ② 正文里用 \\eqref{eq:名}（显示编号、可点击跳到该式）。编号按每个节点各自从 (1) 起。', keys: [
+        { t: '对齐推导', x: '$$\n\\begin{align}\n‸ &= \\\\\n&= \n\\end{align}\n$$', wide: 1, tip: '多行 align：每行自动编号；行尾 \\\\ 换行、& 对齐等号' },
+        { t: '编号式', x: '$$\n\\begin{equation}\n‸\n\\end{equation}\n$$', wide: 1, tip: '单个带编号的公式 equation' },
+        { t: '\\label', x: '\\label{eq:‸}', wide: 1, tip: '给公式起名：写在某行公式里，如 \\label{eq:能量}' },
+        { t: '\\eqref', x: '\\eqref{eq:‸}', wide: 1, tip: '引用编号：正文里写 \\eqref{eq:能量} → 显示 (1)，可点击跳转' },
+        { t: '\\tag', x: '\\tag{‸}', wide: 1, tip: '手动指定编号，如 \\tag{1.2}' },
+        { t: '\\notag', x: '\\notag ', wide: 1, tip: '让本行公式不编号' },
+      ] },
+      { label: '希腊字母', keys: [
+        { t: 'α', x: '\\alpha ' }, { t: 'β', x: '\\beta ' }, { t: 'γ', x: '\\gamma ' },
+        { t: 'δ', x: '\\delta ' }, { t: 'ε', x: '\\varepsilon ' }, { t: 'ζ', x: '\\zeta ' },
+        { t: 'η', x: '\\eta ' }, { t: 'θ', x: '\\theta ' }, { t: 'κ', x: '\\kappa ' },
+        { t: 'λ', x: '\\lambda ' }, { t: 'μ', x: '\\mu ' }, { t: 'ν', x: '\\nu ' },
+        { t: 'ξ', x: '\\xi ' }, { t: 'π', x: '\\pi ' }, { t: 'ρ', x: '\\rho ' },
+        { t: 'σ', x: '\\sigma ' }, { t: 'τ', x: '\\tau ' }, { t: 'φ', x: '\\varphi ' },
+        { t: 'χ', x: '\\chi ' }, { t: 'ψ', x: '\\psi ' }, { t: 'ω', x: '\\omega ' },
+        { t: 'Γ', x: '\\Gamma ' }, { t: 'Δ', x: '\\Delta ' }, { t: 'Θ', x: '\\Theta ' },
+        { t: 'Λ', x: '\\Lambda ' }, { t: 'Π', x: '\\Pi ' }, { t: 'Σ', x: '\\Sigma ' },
+        { t: 'Φ', x: '\\Phi ' }, { t: 'Ψ', x: '\\Psi ' }, { t: 'Ω', x: '\\Omega ' },
+      ] },
+      { label: '运算 · 关系', keys: [
+        { t: '×', x: '\\times ' }, { t: '·', x: '\\cdot ' }, { t: '÷', x: '\\div ' },
+        { t: '±', x: '\\pm ' }, { t: '∓', x: '\\mp ' }, { t: '≈', x: '\\approx ' },
+        { t: '≠', x: '\\neq ' }, { t: '≤', x: '\\leq ' }, { t: '≥', x: '\\geq ' },
+        { t: '≪', x: '\\ll ' }, { t: '≫', x: '\\gg ' }, { t: '≡', x: '\\equiv ' },
+        { t: '→', x: '\\to ' }, { t: '⇒', x: '\\Rightarrow ' }, { t: '⇔', x: '\\Leftrightarrow ' },
+        { t: '∝', x: '\\propto ' }, { t: '∞', x: '\\infty ' }, { t: '∈', x: '\\in ' },
+        { t: '∉', x: '\\notin ' }, { t: '⊂', x: '\\subset ' }, { t: '∪', x: '\\cup ' },
+        { t: '∩', x: '\\cap ' }, { t: '∀', x: '\\forall ' }, { t: '∃', x: '\\exists ' },
+      ] },
+      { label: '微积分 · 向量', keys: [
+        { t: '∂', x: '\\partial ' }, { t: '∇', x: '\\nabla ' }, { t: '∮', x: '\\oint ' },
+        { t: '∬', x: '\\iint ' }, { t: '∭', x: '\\iiint ' }, { t: 'd/dx', x: '\\frac{d‸}{dx}', wide: 1 },
+        { t: 'a⃗', x: '\\vec{‸}' }, { t: 'â', x: '\\hat{‸}' }, { t: 'ā', x: '\\bar{‸}' },
+        { t: 'ȧ', x: '\\dot{‸}' }, { t: 'ä', x: '\\ddot{‸}' }, { t: 'A⃗', x: '\\overrightarrow{‸}', wide: 1 },
+        { t: '∑ₙ', x: '\\sum_{n=‸}^{}' }, { t: '∫ᵃᵇ', x: '\\int_{‸}^{}' },
+      ] },
+      { label: '电气 · 物理', keys: [
+        { t: '∠', x: '\\angle ' }, { t: 'Ω', x: '\\Omega ' }, { t: '∥', x: '\\parallel ' },
+        { t: '⊥', x: '\\perp ' }, { t: 'j', x: '\\mathrm{j}' }, { t: '°', x: '^\\circ ' },
+        { t: 'ℜ', x: '\\Re ' }, { t: 'ℑ', x: '\\Im ' }, { t: '⟨ ⟩', x: '\\langle ‸ \\rangle', wide: 1 },
+        { t: '‖ ‖', x: '\\| ‸ \\|', wide: 1 }, { t: '∝', x: '\\propto ' },
+        { t: '单位', x: '\\,\\mathrm{‸}', wide: 1 }, { t: 'μ₀', x: '\\mu_0 ' }, { t: 'ε₀', x: '\\varepsilon_0 ' },
+        { t: '∆t', x: '\\Delta t' },
+      ] },
+    ];
+
+    // 在「模板」里放入选区文字 + 定位光标。tpl 含至多一个光标符 ‸。
+    function buildFormulaInsert(tpl, selected) {
+      const idx = tpl.indexOf(FORMULA_CARET);
+      if (idx < 0) return { str: tpl, caret: tpl.length };
+      const str = (tpl.slice(0, idx) + selected + tpl.slice(idx + 1)).split(FORMULA_CARET).join('');
+      return { str: str, caret: idx + selected.length };
+    }
+
+    // 把一段 LaTeX 插入到当前正在编辑的文字面（节点标题 / 正文框）的光标处。
+    // 用 document.execCommand('insertText') 插入——与手动打字等价，会进浏览器原生撤销栈，
+    // 因此 Ctrl+Z / Ctrl+Y 能撤销/重做这次插入（编辑文字态下 app 不拦截 Ctrl+Z，交给浏览器）。
+    // 它还会触发 input 事件，让阅读浮层 / 编辑面板各自的 input 监听自动同步 node.body 与自增高。
+    function insertFormulaSnippet(tpl, plainText) {
+      const surf = activeTextSurface();
+      if (!surf) { refreshFormulaHint(); return false; }
+      if (surf.el && surf.el.isContentEditable) {
+        const te = surf.el;
+        const sel = window.getSelection();
+        if (!sel || sel.rangeCount === 0) return false;
+        const range = sel.getRangeAt(0);
+        if (!te.contains(range.startContainer) || !te.contains(range.endContainer)) return false;
+        const start = ceCharOffset(te, range.startContainer, range.startOffset);
+        const end = ceCharOffset(te, range.endContainer, range.endOffset);
+        const insertTpl = surf.kind === 'text-box' ? (plainText || tpl) : tpl;
+        const built = buildFormulaInsert(insertTpl, (te.textContent || '').slice(start, end));
+        te.focus();
+        // 选区会被 built.str 整体替换（built.str 已把选区文字包进占位符位置）
+        if (!document.execCommand('insertText', false, built.str)) {
+          const text = te.textContent || '';                                   // 兜底：不支持 execCommand 时直接赋值（这次不进撤销栈）
+          te.textContent = text.slice(0, start) + built.str + text.slice(end);
+          te.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        setNodeSelection(te, start + built.caret, start + built.caret);
+        if (surf.kind === 'node') onEditingInput();     // 刷新尺寸 / 连线 / 标记淡化
+        else if (surf.kind === 'text-box') {
+          const node = findNode(editingTextBoxId);
+          if (node) node.text = te.textContent || '';
+          redrawMinimap();
+        }
+        scheduleSelToolbar();
+        return true;
+      }
+      const ta = surf.el;
+      const start = ta.selectionStart;
+      const built = buildFormulaInsert(tpl, ta.value.slice(start, ta.selectionEnd));
+      ta.focus();
+      if (!document.execCommand('insertText', false, built.str)) {
+        const end = ta.selectionEnd;                                           // 兜底：直接赋值并手动派发 input（这次不进撤销栈）
+        ta.value = ta.value.slice(0, start) + built.str + ta.value.slice(end);
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      // execCommand 已触发 input → 阅读/编辑面板的 input 监听已更新 node.body 并自增高，这里只摆好光标
+      ta.setSelectionRange(start + built.caret, start + built.caret);
+      scheduleSelToolbar();
+      return true;
+    }
+
+    function refreshFormulaHint() {
+      if (!formulaPanel) return;
+      const hint = formulaPanel.querySelector('[data-role="formula-hint"]');
+      if (!hint) return;
+      hint.textContent = activeTextSurface()
+        ? '点符号插入到光标处；先选中一段文字再点结构键（如 √、a/b）会把它包进去。'
+        : '点符号会落到画布上；双击节点或文字框编辑时，会插入到光标处。';
+    }
+
+    function setFormulaPanelOpen(open) {
+      if (!formulaPanel) return;
+      formulaPanel.hidden = !open;
+      if (formulaBtn) {
+        formulaBtn.classList.toggle('active', open);
+        formulaBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      }
+      if (open) refreshFormulaHint();
+    }
+
+    function stopFormulaDrag() {
+      if (!formulaDrag) return;
+      if (formulaDrag.ghost) formulaDrag.ghost.remove();
+      document.removeEventListener('mousemove', onFormulaDragMove, true);
+      document.removeEventListener('mouseup', onFormulaDragUp, true);
+      formulaDrag = null;
+    }
+
+    function updateFormulaDragGhost(e) {
+      if (!formulaDrag) return;
+      if (!formulaDrag.ghost) {
+        const ghost = document.createElement('div');
+        ghost.className = 'formula-drag-ghost';
+        ghost.textContent = formulaDrag.text;
+        document.body.appendChild(ghost);
+        formulaDrag.ghost = ghost;
+      }
+      formulaDrag.ghost.style.left = e.clientX + 'px';
+      formulaDrag.ghost.style.top = e.clientY + 'px';
+    }
+
+    function onFormulaDragMove(e) {
+      if (!formulaDrag) return;
+      const moved = Math.hypot(e.clientX - formulaDrag.startX, e.clientY - formulaDrag.startY) > 6;
+      if (moved) formulaDrag.moved = true;
+      if (formulaDrag.moved) {
+        e.preventDefault();
+        updateFormulaDragGhost(e);
+      }
+    }
+
+    function onFormulaDragUp(e) {
+      if (!formulaDrag) return;
+      const d = formulaDrag;
+      if (d.moved) {
+        e.preventDefault();
+        e.stopPropagation();
+        suppressNextFormulaClick = true;
+        const r = viewport.getBoundingClientRect();
+        if (e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom) {
+          freezeViewportForInteraction();
+          addTextBoxAt(clientToSurface(e.clientX, e.clientY), d.text, { fontSize: 34 });
+        }
+      }
+      stopFormulaDrag();
+    }
+
+    function startFormulaDrag(e, key) {
+      if (!key || activeTextSurface()) return false;
+      formulaDrag = {
+        text: key.textContent || '',
+        startX: e.clientX,
+        startY: e.clientY,
+        moved: false,
+        ghost: null,
+      };
+      document.addEventListener('mousemove', onFormulaDragMove, true);
+      document.addEventListener('mouseup', onFormulaDragUp, true);
+      return true;
+    }
+
+    if (formulaPanel) {
+      const grid = formulaPanel.querySelector('[data-role="formula-grid"]');
+      if (grid) {
+        FORMULA_SECTIONS.forEach(function (sec) {
+          const label = document.createElement('div');
+          label.className = 'formula-section-label';
+          label.textContent = sec.label;
+          grid.appendChild(label);
+          if (sec.note) {
+            const note = document.createElement('div');
+            note.className = 'formula-section-note';
+            note.textContent = sec.note;
+            grid.appendChild(note);
+          }
+          const row = document.createElement('div');
+          row.className = 'formula-row';
+          sec.keys.forEach(function (k) {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.className = 'formula-key' + (k.wide ? ' wide' : '');
+            b.textContent = k.t;
+            b.setAttribute('data-tex', k.x);
+            b.title = k.tip || k.x.replace(/‸/g, '…').trim();   // 有友好说明优先显示说明，否则显示将插入的 LaTeX
+            row.appendChild(b);
+          });
+          grid.appendChild(row);
+        });
+      }
+      // mousedown preventDefault：点面板不抢走正在编辑的节点/正文框焦点（与 selToolbar 同理）。
+      // 没有编辑目标时，按住符号可直接拖到画布上生成文字框。
+      formulaPanel.addEventListener('mousedown', function (e) {
+        const key = e.target.closest('.formula-key');
+        if (key) startFormulaDrag(e, key);
+        e.preventDefault();
+      });
+      formulaPanel.addEventListener('click', function (e) {
+        if (suppressNextFormulaClick) {
+          suppressNextFormulaClick = false;
+          return;
+        }
+        const close = e.target.closest('[data-role="formula-close"]');
+        if (close) { setFormulaPanelOpen(false); return; }
+        const key = e.target.closest('.formula-key');
+        if (key) {
+          if (!insertFormulaSnippet(key.getAttribute('data-tex'), key.textContent || '')) {
+            addTextBoxAt(viewportCenterInSurface(), key.textContent || '', { fontSize: 34 });
+          }
+        }
+      });
+      if (formulaBtn) {
+        formulaBtn.addEventListener('mousedown', function (e) { e.preventDefault(); });
+        formulaBtn.addEventListener('click', function () {
+          setFormulaPanelOpen(formulaPanel.hidden);
+        });
+      }
+      // 焦点进入任意可编辑面时刷新提示语（便宜，无需轮询）
+      document.addEventListener('focusin', refreshFormulaHint);
+    }
+
+    // 公式工作流② · \eqref / \ref 点击跳转：点公式引用 (n) → 滚动到被引用的公式并闪一下。
+    // 在「同一正文容器」内按 id 找目标，避免跨节点同名 label 撞 id（每节点 label 独立）。
+    let eqFlashTimer = null;
+    function flashEquation(el) {
+      if (!el) return;
+      el.classList.add('eq-jump-flash');
+      if (eqFlashTimer) clearTimeout(eqFlashTimer);
+      eqFlashTimer = setTimeout(function () {
+        el.classList.remove('eq-jump-flash');
+        eqFlashTimer = null;
+      }, 1400);
+    }
+    document.addEventListener('click', function (e) {
+      const a = e.target.closest('a[href^="#mjx-eqn"]');
+      if (!a) return;
+      e.preventDefault();
+      e.stopPropagation();   // 别让点击冒泡触发节点拖动 / 正文进入编辑态（会重渲染、抹掉跳转高亮）
+      const id = decodeURIComponent((a.getAttribute('href') || '').slice(1));
+      if (!id) return;
+      const container = a.closest('.node-text, [data-role="text-reader-content"], [data-role="md-reader-content"]') || document;
+      let target = null;
+      try { target = container.querySelector('#' + CSS.escape(id)); } catch (err) { target = null; }
+      if (!target) { try { target = document.getElementById(id); } catch (err2) {} }
+      if (!target) return;
+      const eqn = target.closest('mjx-container') || target;
+      eqn.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      flashEquation(eqn);
+    }, true);
+
+    // ── Y1 轮：复制 / 全选 ──────────────────
+    // Ctrl+D：复制选中节点 / 图片（贴近鼠标悬停处）；选区内两端都在的连线也一并复制；
+    // 复制一次即结束——不选中副本，避免反复 Ctrl+D 连续复制。
+    function duplicateSelected() {
+      if (!canCreate()) return;             // 图案模式不复制内容节点
+      if (selectedNodeIds.size === 0) return;
+
+      // 复制位置：优先贴近鼠标悬停处（鼠标不在视口内 → 退回固定小偏移）。
+      // 以选区包围盒左上角为参考点整组平移，保持多选内部的相对布局。
+      const OFFSET = 28;
+      let minX = Infinity, minY = Infinity;
+      selectedNodeIds.forEach((id) => {
+        const n = findNode(id);
+        if (!n) return;
+        if (n.x < minX) minX = n.x;
+        if (n.y < minY) minY = n.y;
+      });
+      let dx = OFFSET, dy = OFFSET;
+      const vRect = viewport.getBoundingClientRect();
+      const mouseInside = lastMouseClientX >= vRect.left && lastMouseClientX <= vRect.right
+        && lastMouseClientY >= vRect.top && lastMouseClientY <= vRect.bottom;
+      if (mouseInside && minX !== Infinity) {
+        const p = clientToSurface(lastMouseClientX, lastMouseClientY);
+        dx = p.x - minX;
+        dy = p.y - minY;
+      }
+
+      const idMap = new Map();          // 旧节点 id → 新节点 id
+      const newIds = [];
+      // 先复制节点（含图片/图案等装饰对象——文字与装饰内容都由 createNodeEl 内部渲染）
+      selectedNodeIds.forEach((oldId) => {
+        const n = findNode(oldId);
+        if (!n) return;
+        const nid = newNodeId();
+        idMap.set(oldId, nid);
+        const copy = { ...n, id: nid, x: n.x + dx, y: n.y + dy };
+        prepareNewDecorationNode(copy);
+        data.nodes.push(copy);
+        indexNodeData(copy);
+        const el = createNodeEl(copy);
+        surface.appendChild(el);
+        nodeMap.set(nid, el);
+        spawnNodeEl(el);                 // 粘贴的副本也入场
+        newIds.push(nid);
+      });
+      if (newIds.length === 0) return;
+      // 同时复制“目标节点 + 跟随文本框”时，让副本继续跟随副本；只复制文本框时保留原目标。
+      idMap.forEach(function (newId) {
+        const copy = findNode(newId);
+        if (!isTextBoxNode(copy) || !copy.textBindTarget) return;
+        if (idMap.has(copy.textBindTarget)) copy.textBindTarget = idMap.get(copy.textBindTarget);
+        else if (textBindingTarget(copy)) refreshTextBindingOffset(copy);
+        else clearTextBinding(copy);
+      });
+      // 复制"两端都在选区内"的连线（只连副本之间，不牵连原图）
+      data.edges.slice().forEach((edge) => {
+        if (idMap.has(edge.from) && idMap.has(edge.to)) {
+          const ne = {
+            id: newEdgeId(),
+            from: idMap.get(edge.from),
+            to: idMap.get(edge.to),
+            text: edge.text || '',
+          };
+          data.edges.push(ne);
+          const refs = createEdgeEls(ne);
+          edgeMap.set(ne.id, refs);
+          updateEdgePath(ne);
+          spawnEdgeEls(refs);                  // 粘贴的连线淡入
+        }
+      });
+      lastCreatedNodeId = newIds[newIds.length - 1];   // 「定位」按钮仍能跳到最新副本
+      clearSelection();        // 复制一次即结束：不选中副本，避免连续复制
+      pushHistory();
+      notify();
+    }
+
+    // Ctrl+A：全选所有节点 + 连线
+    function selectAll() {
+      selectedNodeIds.clear();
+      selectedEdgeIds.clear();
+      data.nodes.forEach((n) => selectedNodeIds.add(n.id));
+      data.edges.forEach((e) => selectedEdgeIds.add(e.id));
+      applySelection();
+    }
+
+    // ── Y1 轮：速查表浮层 ───────────────────
+    function openShortcuts() {
+      if (!shortcutsOverlay) return;
+      shortcutsOverlay.hidden = false;
+      shortcutsOpen = true;
+    }
+    function closeShortcuts() {
+      if (!shortcutsOverlay) return;
+      shortcutsOverlay.hidden = true;
+      shortcutsOpen = false;
+    }
+    function toggleShortcuts() {
+      if (shortcutsOpen) closeShortcuts();
+      else openShortcuts();
+    }
+
+    // ── 阶段 4：节点搜索 ────────────────────
+    // 对标题 node.text 与正文节点隐藏正文 node.body 做大小写不敏感子串匹配；命中节点加
+    // .search-match，当前命中加 .search-current（CSS 用 outline 高亮，不与
+    // .selected 的 box-shadow 冲突）。Enter 下一个、Shift+Enter 上一个、Esc 关闭。
+    function openSearch() {
+      if (!searchBar || !searchInput) return;
+      // 打开搜索时退出编辑态，避免 input 焦点和 contenteditable 打架
+      if (editingNodeId !== null) commitNodeEdit();
+      if (editingEdgeId !== null) commitEdgeEdit();
+      searchBar.hidden = false;
+      searchOpen = true;
+      searchInput.focus();
+      searchInput.select();
+      runSearch(searchInput.value, true);   // 已有关键词时重新高亮
+    }
+
+    function closeSearch() {
+      if (!searchOpen) return;
+      searchOpen = false;
+      if (searchBar) searchBar.hidden = true;
+      if (searchInput) searchInput.blur();
+      clearSearchHighlight();
+      searchMatches = [];
+      searchIndex = -1;
+    }
+
+    // 重算命中集；recenter=true 时把当前指针归零并居中第一个命中。
+    // recenter=false（节点增删改后刷新）尽量保留原指针位置。
+    function runSearch(query, recenter) {
+      const q = (query || '').trim().toLowerCase();
+      const prevId = (searchIndex >= 0 && searchIndex < searchMatches.length)
+        ? searchMatches[searchIndex] : null;
+      if (q === '') {
+        searchMatches = [];
+        searchIndex = -1;
+      } else {
+        searchMatches = data.nodes
+          .filter(function (n) {
+            return ((n.text || '') + '\n' + (isBodyNode(n) ? (n.body || '') : ''))
+              .toLowerCase().indexOf(q) !== -1;
+          })
+          .map(function (n) { return n.id; });
+        if (searchMatches.length === 0) {
+          searchIndex = -1;
+        } else if (recenter) {
+          searchIndex = 0;
+          centerOnNode(searchMatches[0]);
+        } else {
+          // 刷新场景：尽量停在原来那个命中上
+          const keep = prevId ? searchMatches.indexOf(prevId) : -1;
+          searchIndex = keep >= 0 ? keep : 0;
+        }
+      }
+      applySearchHighlight();
+      updateSearchCount();
+    }
+
+    function applySearchHighlight() {
+      const matchSet = new Set(searchMatches);
+      const currentId = (searchIndex >= 0 && searchIndex < searchMatches.length)
+        ? searchMatches[searchIndex] : null;
+      nodeMap.forEach(function (el, id) {
+        el.classList.toggle('search-match', matchSet.has(id));
+        el.classList.toggle('search-current', id === currentId);
+      });
+    }
+
+    function clearSearchHighlight() {
+      nodeMap.forEach(function (el) {
+        el.classList.remove('search-match', 'search-current');
+      });
+    }
+
+    function updateSearchCount() {
+      if (!searchCount) return;
+      const q = searchInput ? searchInput.value.trim() : '';
+      if (q === '') { searchCount.textContent = ''; return; }
+      if (searchMatches.length === 0) { searchCount.textContent = '无匹配'; return; }
+      searchCount.textContent = (searchIndex + 1) + '/' + searchMatches.length;
+    }
+
+    // 跳到下一个（delta=+1）/ 上一个（delta=-1）命中并居中
+    function gotoMatch(delta) {
+      if (searchMatches.length === 0) return;
+      searchIndex = (searchIndex + delta + searchMatches.length) % searchMatches.length;
+      centerOnNode(searchMatches[searchIndex]);
+      applySearchHighlight();
+      updateSearchCount();
+    }
+
+    // ── 阶段 4：小地图 ──────────────────────
+    // 映射域 = 所有节点包围盒 ∪ 当前可见区域（surface 坐标），再加 padding。
+    // 这样取景框（当前视口）始终落在小地图内、不会跑丢。空画布时整体隐藏。
+    const MM_PAD = 60;   // 映射域四周留白（surface 单位）
+
+    // 当前视口在 surface 坐标中可见区域的 [x0,y0,x1,y1]
+    function visibleSurfaceRect() {
+      const vRect = viewport.getBoundingClientRect();
+      return {
+        x0: (-curPanX) / curScale,
+        y0: (-curPanY) / curScale,
+        x1: (vRect.width - curPanX) / curScale,
+        y1: (vRect.height - curPanY) / curScale,
+        vw: vRect.width,
+        vh: vRect.height,
+      };
+    }
+
+    // 目标视口（用 target 提前于缓动揭示）在 surface 坐标的范围，已外扩预渲染余量。
+    function cullExpandedRect() {
+      const vRect = viewport.getBoundingClientRect();
+      cullVpW = vRect.width; cullVpH = vRect.height;
+      const x0 = (-targetPanX) / targetScale;
+      const y0 = (-targetPanY) / targetScale;
+      const x1 = (vRect.width - targetPanX) / targetScale;
+      const y1 = (vRect.height - targetPanY) / targetScale;
+      const mx = (x1 - x0) * CULL_MARGIN, my = (y1 - y0) * CULL_MARGIN;
+      return { x0: x0 - mx, y0: y0 - my, x1: x1 + mx, y1: y1 + my };
+    }
+
+    // 精确重算裁剪集（按视口移动阈值或节点增删触发，不是每帧）。
+    function updateCulling() {
+      if (!surface) return;
+      if (data.nodes.length <= CULL_MIN_NODES) {
+        if (cullActive) { nodeMap.forEach((el) => el.classList.remove('culled')); cullActive = false; }
+        return;
+      }
+      cullActive = true;
+      const r = cullExpandedRect();
+      data.nodes.forEach((n) => {
+        const el = nodeMap.get(n.id);
+        if (!el) return;
+        let visible;
+        if (selectedNodeIds.has(n.id) || editingNodeId === n.id) {
+          visible = true;                         // 选中 / 编辑中的节点永不裁，拖动也不会闪隐
+        } else {
+          const s = cachedNodeSize(el, n.id);
+          visible = !(n.x > r.x1 || n.x + s.w < r.x0 || n.y > r.y1 || n.y + s.h < r.y0);
+        }
+        el.classList.toggle('culled', !visible);
+      });
+      lastCullPanX = targetPanX; lastCullPanY = targetPanY; lastCullScale = targetScale;
+    }
+
+    // applyViewport 每帧调用：纯算术守卫，移动/缩放超阈值才触发一次 O(N) 重算（不读布局）。
+    function maybeUpdateCulling() {
+      if (data.nodes.length <= CULL_MIN_NODES) { if (cullActive) updateCulling(); return; }
+      if (isNaN(lastCullPanX)) { updateCulling(); return; }
+      const movedX = Math.abs(targetPanX - lastCullPanX) / targetScale;
+      const movedY = Math.abs(targetPanY - lastCullPanY) / targetScale;
+      const scaleChanged = !(lastCullScale > 0) || Math.abs(targetScale - lastCullScale) / lastCullScale > 0.12;
+      const thX = (cullVpW / targetScale) * 0.4, thY = (cullVpH / targetScale) * 0.4;
+      if (scaleChanged || movedX > thX || movedY > thY) updateCulling();
+    }
+
+    // 世界→小地图映射：包围盒(节点 ∪ 可见区域) → 缩放/偏移。尺寸全走缓存，零强制回流。
+    function computeMinimapMapping() {
+      const mmW = minimap.clientWidth || 180;
+      const mmH = minimap.clientHeight || 120;
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      data.nodes.forEach(function (n) {
+        if (hiddenMindmapNodeIds.has(n.id) || hiddenGroupNodeIds.has(n.id)) return;
+        const s = cachedNodeSize(nodeMap.get(n.id), n.id);
+        if (n.x < minX) minX = n.x;
+        if (n.y < minY) minY = n.y;
+        if (n.x + s.w > maxX) maxX = n.x + s.w;
+        if (n.y + s.h > maxY) maxY = n.y + s.h;
+      });
+      const vis = visibleSurfaceRect();
+      if (vis.x0 < minX) minX = vis.x0;
+      if (vis.y0 < minY) minY = vis.y0;
+      if (vis.x1 > maxX) maxX = vis.x1;
+      if (vis.y1 > maxY) maxY = vis.y1;
+      minX -= MM_PAD; minY -= MM_PAD; maxX += MM_PAD; maxY += MM_PAD;
+      const worldW = Math.max(1, maxX - minX);
+      const worldH = Math.max(1, maxY - minY);
+      const s = Math.min(mmW / worldW, mmH / worldH);
+      return {
+        minX: minX, minY: minY, s: s,
+        ox: (mmW - worldW * s) / 2,
+        oy: (mmH - worldH * s) / 2,
+      };
+    }
+
+    function sameMinimapMapping(a, b) {
+      if (!a || !b) return false;
+      return Math.abs(a.minX - b.minX) < 0.5 && Math.abs(a.minY - b.minY) < 0.5
+          && Math.abs(a.ox - b.ox) < 0.5 && Math.abs(a.oy - b.oy) < 0.5
+          && Math.abs(a.s - b.s) < 1e-4;
+    }
+
+    // 仅按当前 mmMap + 可见区域摆取景框（不动节点小方块），平移缓动每帧调用，极廉价。
+    function placeMinimapViewbox() {
+      if (!mmMap || !minimapViewbox) return;
+      const vis = visibleSurfaceRect();
+      const vbLeft = mmMap.ox + (vis.x0 - mmMap.minX) * mmMap.s;
+      const vbTop = mmMap.oy + (vis.y0 - mmMap.minY) * mmMap.s;
+      // 画布世界极大（如超长节点）时取景框会缩成亚像素细丝——给个最小可见尺寸兜底
+      const vbW = Math.max(4, (vis.x1 - vis.x0) * mmMap.s);
+      const vbH = Math.max(4, (vis.y1 - vis.y0) * mmMap.s);
+      mmViewbox = { left: vbLeft, top: vbTop, w: vbW, h: vbH };
+      minimapViewbox.style.left = vbLeft + 'px';
+      minimapViewbox.style.top = vbTop + 'px';
+      minimapViewbox.style.width = vbW + 'px';
+      minimapViewbox.style.height = vbH + 'px';
+    }
+
+    // 完整重画：重算映射 + 同步所有节点小方块 + 取景框。节点增删改/拖动后调用。
+    function redrawMinimap() {
+      if (!minimap || !minimapNodes || !minimapViewbox) return;
+      if (data.nodes.length === 0) {
+        if (!minimap.hidden) minimap.hidden = true;
+        return;
+      }
+      if (minimap.hidden) minimap.hidden = false;
+
+      mmMap = computeMinimapMapping();
+      const ox = mmMap.ox, oy = mmMap.oy, s = mmMap.s, minX = mmMap.minX, minY = mmMap.minY;
+
+      // 节点小矩形：持久 div 池，增删改时同步（不每帧重建）
+      const seen = new Set();
+      data.nodes.forEach(function (n) {
+        if (hiddenMindmapNodeIds.has(n.id) || hiddenGroupNodeIds.has(n.id)) return;
+        seen.add(n.id);
+        const sz = cachedNodeSize(nodeMap.get(n.id), n.id);
+        let dot = mmNodeMap.get(n.id);
+        if (!dot) {
+          dot = document.createElement('div');
+          dot.className = 'minimap-node';
+          minimapNodes.appendChild(dot);
+          mmNodeMap.set(n.id, dot);
+        }
+        dot.style.left = (ox + (n.x - minX) * s) + 'px';
+        dot.style.top = (oy + (n.y - minY) * s) + 'px';
+        dot.style.width = Math.max(2, sz.w * s) + 'px';
+        dot.style.height = Math.max(2, sz.h * s) + 'px';
+        // 节点有颜色时小地图也带一点该色调（用 data-color，CSS 给柔和底色）
+        if (n.color) dot.dataset.color = n.color;
+        else dot.removeAttribute('data-color');
+      });
+      for (const [id, dot] of mmNodeMap) {
+        if (!seen.has(id)) { dot.remove(); mmNodeMap.delete(id); }
+      }
+
+      placeMinimapViewbox();
+    }
+
+    // 视口缓动每帧调用：映射没变（在内容范围内平移）→ 只挪取景框，跳过逐点重写；
+    // 映射变了（缩到内容外 / 缩放改变占比）→ 退回完整重画，保证结果与原行为一致。
+    function updateMinimapDraggedNodes(liveCoords) {
+      if (!minimap || !minimapNodes || !minimapViewbox || !liveCoords || !liveCoords.size) return;
+      if (data.nodes.length === 0) { redrawMinimap(); return; }
+      if (!mmMap || minimap.hidden) redrawMinimap();
+      if (!mmMap) return;
+      const ox = mmMap.ox, oy = mmMap.oy, s = mmMap.s, minX = mmMap.minX, minY = mmMap.minY;
+      let needsFullRedraw = false;
+      liveCoords.forEach((pos, id) => {
+        if (hiddenMindmapNodeIds.has(id) || hiddenGroupNodeIds.has(id)) return;
+        const node = findNode(id);
+        if (!node) return;
+        const dot = mmNodeMap.get(id);
+        if (!dot) { needsFullRedraw = true; return; }
+        const sz = cachedNodeSize(nodeMap.get(id), id);
+        dot.style.left = (ox + (pos.x - minX) * s) + 'px';
+        dot.style.top = (oy + (pos.y - minY) * s) + 'px';
+        dot.style.width = Math.max(2, sz.w * s) + 'px';
+        dot.style.height = Math.max(2, sz.h * s) + 'px';
+      });
+      if (needsFullRedraw) redrawMinimap();
+      else placeMinimapViewbox();
+    }
+
+    function updateMinimapViewport() {
+      if (!minimap || !minimapNodes || !minimapViewbox) return;
+      if (data.nodes.length === 0) { redrawMinimap(); return; }
+      const next = computeMinimapMapping();
+      if (sameMinimapMapping(next, mmMap)) {
+        mmMap = next;
+        placeMinimapViewbox();
+      } else {
+        redrawMinimap();
+      }
+    }
+
+    // 小地图坐标 → surface 坐标（反映射）
+    function minimapToSurface(mx, my) {
+      if (!mmMap) return { x: 0, y: 0 };
+      return {
+        x: mmMap.minX + (mx - mmMap.ox) / mmMap.s,
+        y: mmMap.minY + (my - mmMap.oy) / mmMap.s,
+      };
+    }
+
+    // 让某个 surface 点成为视口中心（immediate=跟手；否则缓动）
+    function centerViewportOnSurface(sx, sy, immediate) {
+      const vRect = viewport.getBoundingClientRect();
+      const px = vRect.width / 2 - sx * targetScale;
+      const py = vRect.height / 2 - sy * targetScale;
+      if (immediate) setViewportImmediate(targetScale, px, py);
+      else { targetPanX = px; targetPanY = py; requestTick(); }
+      rememberViewport();
+    }
+
+    // 小地图 mousedown：点取景框外 → 平滑跳转；之后拖动 → 跟手平移（保持抓取偏移）
+    function onMinimapMouseDown(e) {
+      if (e.button !== 0 || !minimap || !mmMap) return;
+      e.preventDefault();
+      e.stopPropagation();
+      hideNodeMenu();
+      const rect = minimap.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const vb = mmViewbox;
+      const inside = vb && mx >= vb.left && mx <= vb.left + vb.w
+        && my >= vb.top && my <= vb.top + vb.h;
+
+      const p = minimapToSurface(mx, my);
+      // 抓取偏移：点框内时保持指针与视口中心的相对位置，避免一抓就跳心
+      let offX = 0, offY = 0;
+      if (inside) {
+        const vRect = viewport.getBoundingClientRect();
+        const centerX = (vRect.width / 2 - curPanX) / curScale;
+        const centerY = (vRect.height / 2 - curPanY) / curScale;
+        offX = p.x - centerX;
+        offY = p.y - centerY;
+      } else {
+        // 点框外：先平滑跳到点击处
+        centerViewportOnSurface(p.x, p.y, false);
+      }
+
+      const onMove = function (ev) {
+        const q = minimapToSurface(ev.clientX - rect.left, ev.clientY - rect.top);
+        centerViewportOnSurface(q.x - offX, q.y - offY, true);
+      };
+      const onUp = function () {
+        window.removeEventListener('mousemove', onMove);
+        window.removeEventListener('mouseup', onUp);
+      };
+      window.addEventListener('mousemove', onMove);
+      window.addEventListener('mouseup', onUp);
+    }
+
+    // ── 建节点的公共入口（X 轮抽出）──────
+    // x, y 是左上角的 surface 坐标；如 opts.startEditing=true 则立即进编辑态（视为新节点）。
+    // history：不在这里 push——commitNodeEdit 时如果内容非空才 push；空内容则连同附带 edge 一起回滚。
+    // 便签节点配色：复用速记墙那 14 种柔和果冻色（取较饱和的一档），创建时随机取一种、
+    // 避开上一张避免相邻撞色。直接把十六进制存进 node.bgColor，自包含、随 .canvas 便携，
+    // 不依赖任何色名白名单（与 notes.json 的服务端清洗无关）。
+    let lastStickyColor = null;
+    function randomStickyColor(exclude) {
+      const avoided = normalizeHexColor(exclude);
+      const pool = avoided
+        ? STICKY_PALETTE.filter((item) => normalizeHexColor(item) !== avoided)
+        : STICKY_PALETTE;
+      const colors = pool.length ? pool : STICKY_PALETTE;
+      let pick = colors[Math.floor(Math.random() * colors.length)];
+      let guard = 0;
+      while (pick === lastStickyColor && guard++ < 8) {
+        pick = colors[Math.floor(Math.random() * colors.length)];
+      }
+      lastStickyColor = pick;
+      return pick;
+    }
+    function ensureStickyNodeColor(node) {
+      if (!isStickyNode(node) || node.bgColor) return false;
+      node.bgColor = randomStickyColor();
+      return true;
+    }
+
+    function createNode(x, y, text, opts) {
+      opts = opts || {};
+      const node = {
+        id: newNodeId(),
+        // 不再夹到 ≥0：画布平移无界，节点可落在负坐标（否则屏幕左侧双击会被推到原点/偏右）
+        x: x,
+        y: y,
+        text: text || '',
+      };
+      applyProDefaults(node);            // 正常普通模式：套用新建默认样式
+      if (opts.handText) {
+        node.handText = true;
+        node.hideChrome = true;
+        node.bgColor = '#ffffff';
+        node.opacity = 0;
+      } else if (!node.kind) {
+        // 普通节点已隐藏：新建默认就是卡片节点。
+        // 普通模式大小两套默认面板会把当前有效类型写进 canvas:normalNodeKind，
+        // 这里据此决定新节点类型；大型默认面板通常已由 applyProDefaults 设好 kind。
+        let normalKind = '';
+        try { normalKind = localStorage.getItem('canvas:normalNodeKind') || ''; } catch (e) {}
+        node.kind = (normalKind === 'sticky') ? 'sticky' : 'card';
+      }
+      if (isStickyNode(node) && !node.bgColor) {
+        node.bgColor = randomStickyColor();   // 便签：随机果冻底色（存 hex，自包含）
+      }
+      if (isCodeNode(node)) {
+        node.language = readDefaultCodeLanguage();
+        node.text = codeTitleFromBody('', node.language);
+      }
+      data.nodes.push(node);
+      indexNodeData(node);
+      const el = createNodeEl(node);
+      surface.appendChild(el);
+      nodeMap.set(node.id, el);
+      if (node.text || (isStickyNode(node) && node.body)) {
+        const textEl = el.querySelector('.node-text');
+        renderBodyNodeContent(textEl, node);
+      }
+      spawnNodeEl(el);                   // 入场动画（放大+淡入）
+      updateEmptyHint();
+      lastCreatedNodeId = node.id;       // W 轮：定位按钮要用
+      hideOnboardingHint();
+      showRelevantOnboardingHint();
+      if (opts.startEditing) {
+        enterNodeEdit(node, /* isNew */ true);
+      }
+      return node;
+    }
+
+    // 返回节点的直系孩子。Tab 创建的脑图连线约定为 parent → child；
+    // 这里沿用既有 edge，不引入额外字段，旧画布也能直接受益。
+    function buildMindmapChildrenIndex() {
+      const index = new Map();
+      const seenByParent = new Map();
+      data.edges.forEach(function (edge) {
+        if (edge.from === edge.to) return;
+        const child = findNode(edge.to);
+        if (!child || isDecorationNode(child)) return;
+        let seen = seenByParent.get(edge.from);
+        if (!seen) { seen = new Set(); seenByParent.set(edge.from, seen); }
+        if (seen.has(child.id)) return;
+        seen.add(child.id);
+        let children = index.get(edge.from);
+        if (!children) { children = []; index.set(edge.from, children); }
+        children.push(child);
+      });
+      return index;
+    }
+    function buildMindmapNeighborIndex() {
+      const index = new Map();
+      const seenByNode = new Map();
+      function push(from, to) {
+        let seen = seenByNode.get(from);
+        if (!seen) { seen = new Set(); seenByNode.set(from, seen); }
+        if (seen.has(to)) return;
+        seen.add(to);
+        let neighbors = index.get(from);
+        if (!neighbors) { neighbors = []; index.set(from, neighbors); }
+        neighbors.push(to);
+      }
+      data.edges.forEach(function (edge) {
+        if (edge.from === edge.to) return;
+        const from = findNode(edge.from);
+        const to = findNode(edge.to);
+        if (!from || !to || isDecorationNode(from) || isDecorationNode(to)) return;
+        push(from.id, to.id);
+        push(to.id, from.id);
+      });
+      return index;
+    }
+    function directMindmapChildrenOf(node, childrenIndex) {
+      if (childrenIndex) return childrenIndex.get(node.id) || [];
+      const seen = new Set();
+      const children = [];
+      data.edges.forEach(function (edge) {
+        if (edge.from !== node.id || edge.to === node.id || seen.has(edge.to)) return;
+        const child = findNode(edge.to);
+        if (!child || isDecorationNode(child)) return;
+        seen.add(child.id);
+        children.push(child);
+      });
+      return children;
+    }
+
+    // 折叠状态直接存在节点的可选字段 mindmapCollapsed，不另建 assets 文件。
+    // 隐藏范围按 parent → child 方向实时推导，因此旧画布缺省就是全部展开。
+    let hiddenMindmapNodeIds = new Set();
+    let hiddenGroupNodeIds = new Set();
+    let mindmapHoverDelay = 500;
+    let mindmapPreviewRootId = null;
+    let mindmapPreviewOpenTimer = null;
+    let mindmapPreviewCloseTimer = null;
+
+    function semanticGroupMembers(group) {
+      if (!isGroupBoxNode(group) || !Array.isArray(group.groupMemberIds)) return [];
+      const seen = new Set();
+      const out = [];
+      group.groupMemberIds.forEach(function (id) {
+        const node = findNode(id);
+        if (!node || isDecorationNode(node) || seen.has(id)) return;
+        seen.add(id);
+        out.push(node);
+      });
+      return out;
+    }
+
+    function computeHiddenGroupNodeIds() {
+      const hidden = new Set();
+      data.nodes.forEach(function (group) {
+        if (!isGroupBoxNode(group) || !group.groupCollapsed) return;
+        semanticGroupMembers(group).forEach(function (node) { hidden.add(node.id); });
+      });
+      return hidden;
+    }
+
+    function refreshSemanticGroupMembershipFromBounds(group) {
+      if (!isGroupBoxNode(group) || group.groupCollapsed) return false;
+      const left = Number(group.x) || 0;
+      const top = Number(group.y) || 0;
+      const right = left + Math.max(20, Number(group.width) || 0);
+      const bottom = top + Math.max(20, Number(group.height) || 0);
+      const ids = [];
+      data.nodes.forEach(function (node) {
+        if (!node || node.id === group.id || isDecorationNode(node)) return;
+        const rect = nodeRect(node);
+        const cx = rect.x + rect.w / 2;
+        const cy = rect.y + rect.h / 2;
+        if (cx >= left && cx <= right && cy >= top && cy <= bottom) ids.push(node.id);
+      });
+      const before = Array.isArray(group.groupMemberIds) ? group.groupMemberIds.join('|') : '';
+      const after = ids.join('|');
+      if (before === after) return false;
+      if (ids.length) group.groupMemberIds = ids;
+      else delete group.groupMemberIds;
+      const el = nodeMap.get(group.id);
+      if (el) syncSemanticGroupControl(el, group);
+      return true;
+    }
+
+    function refreshGroupContainers() {
+      hiddenGroupNodeIds = computeHiddenGroupNodeIds();
+      hiddenGroupNodeIds.forEach(function (id) { selectedNodeIds.delete(id); });
+      data.edges.forEach(function (edge) {
+        if (hiddenGroupNodeIds.has(edge.from) || hiddenGroupNodeIds.has(edge.to)) selectedEdgeIds.delete(edge.id);
+      });
+      nodeMap.forEach(function (el, id) {
+        const node = findNode(id);
+        const hidden = hiddenGroupNodeIds.has(id);
+        el.classList.toggle('group-fold-hidden', hidden);
+        if (hidden) el.classList.remove('selected');
+        if (node && isGroupBoxNode(node)) syncSemanticGroupControl(el, node);
+      });
+      const edgesById = new Map(data.edges.map(function (edge) { return [edge.id, edge]; }));
+      edgeMap.forEach(function (refs, id) {
+        const edge = edgesById.get(id);
+        const hidden = !!edge && (hiddenGroupNodeIds.has(edge.from) || hiddenGroupNodeIds.has(edge.to));
+        refs.path.classList.toggle('group-fold-hidden', hidden);
+        refs.hit.classList.toggle('group-fold-hidden', hidden);
+        refs.labelEl.classList.toggle('group-fold-hidden', hidden);
+        if (hidden) {
+          refs.path.classList.remove('selected');
+          refs.labelEl.classList.remove('selected');
+        }
+      });
+      renderEdgeHandles();
+      requestEdgesCanvasRender();
+    }
+
+    function toggleSemanticGroup(group) {
+      if (!isGroupBoxNode(group) || !Array.isArray(group.groupMemberIds) || !group.groupMemberIds.length) return;
+      if (group.groupCollapsed) {
+        delete group.groupCollapsed;
+        if (Number(group.groupExpandedHeight) > 0) group.height = Number(group.groupExpandedHeight);
+        delete group.groupExpandedHeight;
+      } else {
+        group.groupExpandedHeight = Math.max(56, Number(group.height) || 230);
+        group.groupCollapsed = true;
+        group.height = 46;
+      }
+      const el = nodeMap.get(group.id);
+      if (el) {
+        applyNodeStyle(el, group);
+        renderDecoration(el, group);
+      }
+      refreshGroupContainers();
+      pushHistory();
+      notify();
+      showCanvasToast(group.groupCollapsed ? '分组已折叠' : '分组已展开');
+    }
+
+    function onSemanticGroupControlClick(event) {
+      const button = event.target && event.target.closest && event.target.closest('.group-collapse-btn');
+      if (!button || !viewport.contains(button)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const groupEl = button.closest('.semantic-group');
+      const group = groupEl ? findNode(groupEl.dataset.id) : null;
+      if (group) toggleSemanticGroup(group);
+    }
+    try {
+      const saved = parseInt(localStorage.getItem('canvas:mindmapHoverDelay'), 10);
+      if (Number.isFinite(saved) && saved >= 0 && saved <= 2000) mindmapHoverDelay = saved;
+    } catch (e) {}
+    document.addEventListener('canvas:mindmap-hover-delay', function (e) {
+      const ms = parseInt(e.detail, 10);
+      if (Number.isFinite(ms) && ms >= 0 && ms <= 2000) mindmapHoverDelay = ms;
+    });
+
+    function clearMindmapPreviewTimers() {
+      if (mindmapPreviewOpenTimer) clearTimeout(mindmapPreviewOpenTimer);
+      if (mindmapPreviewCloseTimer) clearTimeout(mindmapPreviewCloseTimer);
+      mindmapPreviewOpenTimer = null;
+      mindmapPreviewCloseTimer = null;
+    }
+    function isMindmapDescendantOf(node, rootId) {
+      if (!node || !rootId) return false;
+      const childrenIndex = buildMindmapChildrenIndex();
+      const visited = new Set();
+      const q = [rootId];
+      for (let qi = 0; qi < q.length; qi++) {
+        const id = q[qi];
+        if (visited.has(id)) continue;
+        visited.add(id);
+        if (id === node.id) return true;
+        const current = findNode(id);
+        if (current) directMindmapChildrenOf(current, childrenIndex).forEach(function (child) { q.push(child.id); });
+      }
+      return false;
+    }
+    function scheduleMindmapPreview(node) {
+      if (!node || !node.mindmapCollapsed) return;
+      if (mindmapPreviewCloseTimer) clearTimeout(mindmapPreviewCloseTimer);
+      mindmapPreviewCloseTimer = null;
+      if (mindmapPreviewRootId === node.id) return;
+      if (mindmapPreviewOpenTimer) clearTimeout(mindmapPreviewOpenTimer);
+      mindmapPreviewOpenTimer = setTimeout(function () {
+        mindmapPreviewOpenTimer = null;
+        mindmapPreviewRootId = node.id;
+        refreshMindmapFolding();
+      }, mindmapHoverDelay);
+    }
+    function keepMindmapPreviewOpen(node) {
+      if (!mindmapPreviewRootId || !isMindmapDescendantOf(node, mindmapPreviewRootId)) return;
+      if (mindmapPreviewCloseTimer) clearTimeout(mindmapPreviewCloseTimer);
+      mindmapPreviewCloseTimer = null;
+    }
+    function scheduleMindmapPreviewClose() {
+      if (mindmapPreviewOpenTimer) clearTimeout(mindmapPreviewOpenTimer);
+      mindmapPreviewOpenTimer = null;
+      if (!mindmapPreviewRootId) return;
+      if (mindmapPreviewCloseTimer) clearTimeout(mindmapPreviewCloseTimer);
+      mindmapPreviewCloseTimer = setTimeout(function () {
+        mindmapPreviewCloseTimer = null;
+        mindmapPreviewRootId = null;
+        refreshMindmapFolding();
+      }, 180);
+    }
+    function ensureMindmapFoldControl(el, node, childrenIndex) {
+      if (!el || isDecorationNode(node)) return;
+      const children = directMindmapChildrenOf(node, childrenIndex);
+      const hasChildren = children.length > 0;
+      let btn = el.querySelector(':scope > .node-mindmap-fold');
+      if (!hasChildren) {
+        if (btn) btn.remove();
+        if (node.mindmapCollapsed) delete node.mindmapCollapsed;
+        return;
+      }
+      if (!btn) {
+        btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'node-mindmap-fold';
+        btn.tabIndex = -1;
+        ['mousedown', 'click', 'dblclick'].forEach(function (evt) {
+          btn.addEventListener(evt, function (e) { e.stopPropagation(); });
+        });
+        btn.addEventListener('click', function () {
+          clearMindmapPreviewTimers();
+          mindmapPreviewRootId = null;
+          if (node.mindmapCollapsed) delete node.mindmapCollapsed;
+          else node.mindmapCollapsed = true;
+          refreshMindmapFolding();
+          pushHistory();
+          notify();
+        });
+        el.appendChild(btn);
+      }
+      const childCount = children.length;
+      const previewOpen = mindmapPreviewRootId === node.id;
+      const label = previewOpen ? '悬停预展开中' : (node.mindmapCollapsed ? '展开子节点' : '收起子节点');
+      btn.innerHTML = '<span class="node-mindmap-fold-symbol">' + (node.mindmapCollapsed && !previewOpen ? '+' : '−') + '</span>'
+        + (node.mindmapCollapsed ? '<span class="node-mindmap-fold-count">' + childCount + '</span>' : '');
+      btn.classList.toggle('collapsed', !!node.mindmapCollapsed);
+      btn.classList.toggle('preview-open', previewOpen);
+      btn.dataset.tooltip = label;
+      btn.removeAttribute('title');
+      btn.setAttribute('aria-label', label);
+      el.classList.toggle('mindmap-collapsed', !!node.mindmapCollapsed);
+      el.classList.toggle('mindmap-preview-open', mindmapPreviewRootId === node.id);
+    }
+
+    function computeHiddenMindmapNodeIds(childrenIndex) {
+      const hidden = new Set();
+      const queue = [];
+      data.nodes.forEach(function (node) {
+        if (!isDecorationNode(node) && node.mindmapCollapsed && node.id !== mindmapPreviewRootId) {
+          directMindmapChildrenOf(node, childrenIndex).forEach(function (child) { queue.push(child); });
+        }
+      });
+      for (let queueIndex = 0; queueIndex < queue.length; queueIndex++) {
+        const child = queue[queueIndex];
+        if (!child || hidden.has(child.id)) continue;
+        hidden.add(child.id);
+        directMindmapChildrenOf(child, childrenIndex).forEach(function (next) { queue.push(next); });
+      }
+      return hidden;
+    }
+    function refreshMindmapFolding() {
+      const childrenIndex = buildMindmapChildrenIndex();
+      const hidden = computeHiddenMindmapNodeIds(childrenIndex);
+      hiddenMindmapNodeIds = hidden;
+      hidden.forEach(function (id) { selectedNodeIds.delete(id); });
+      data.edges.forEach(function (edge) {
+        if (hidden.has(edge.from) || hidden.has(edge.to)) selectedEdgeIds.delete(edge.id);
+      });
+      nodeMap.forEach(function (el, id) {
+        const node = findNode(id);
+        const bindingTarget = isTextBoxNode(node) ? textBindingTarget(node) : null;
+        const shouldHide = hidden.has(id) || !!(bindingTarget && hidden.has(bindingTarget.id));
+        el.classList.toggle('mindmap-fold-hidden', shouldHide);
+        if (shouldHide) {
+          selectedNodeIds.delete(id);
+          el.classList.remove('selected');
+        }
+        if (node && !isDecorationNode(node)) ensureMindmapFoldControl(el, node, childrenIndex);
+      });
+      const edgesById = new Map(data.edges.map(function (edge) { return [edge.id, edge]; }));
+      edgeMap.forEach(function (refs, id) {
+        const edge = edgesById.get(id);
+        const hide = !!edge && (hidden.has(edge.from) || hidden.has(edge.to));
+        refs.path.classList.toggle('mindmap-fold-hidden', hide);
+        refs.hit.classList.toggle('mindmap-fold-hidden', hide);
+        refs.labelEl.classList.toggle('mindmap-fold-hidden', hide);
+        if (hide) {
+          refs.path.classList.remove('selected');
+          refs.labelEl.classList.remove('selected');
+        }
+      });
+      renderEdgeHandles();
+      requestEdgesCanvasRender();
+    }
+
+    function mindmapChildDirection(parent, child) {
+      const pr = nodeRect(parent), cr = nodeRect(child);
+      const parentX = pr.x + pr.w / 2;
+      const parentY = pr.y + pr.h / 2;
+      const dx = cr.x + cr.w / 2 - parentX;
+      const dy = cr.y + cr.h / 2 - parentY;
+      const siblings = directMindmapChildrenOf(parent);
+      const allBelow = siblings.length > 1 && siblings.every(function (sibling) {
+        const r = nodeRect(sibling);
+        return r.y + r.h / 2 > parentY + 12;
+      });
+      const nearVerticalAxis = Math.abs(dx) <= Math.max(32, (pr.w + cr.w) * 0.22);
+      if (allBelow || (dy > 0 && nearVerticalAxis)) return 'down';
+      return dx < 0 ? 'left' : 'right';
+    }
+
+    // 脑图模式下让新孩子沿当前分支继续向外生长。根节点在“自动/均衡”时会优先补到较空的一侧；
+    // 其他模式继续保持原来的向右录入习惯。
+    function mindmapGrowthDirection(node) {
+      if (currentMode() !== 'mindmap') return 'right';
+      const chosen = (document.body && document.body.dataset.mindmapLayout) || 'auto';
+      if (chosen === 'right' || chosen === 'left' || chosen === 'down') return chosen;
+      const parent = mindmapParentOf(node);
+      if (parent) return mindmapChildDirection(parent, node);
+      const counts = { left: 0, right: 0, down: 0 };
+      const managed = buildManagedMindmapTree(node);
+      const rootDown = managed.valid && managed.center.id === node.id
+        ? mindmapRootGeometryIsDown(managed)
+        : false;
+      directMindmapChildrenOf(node).forEach(function (child) {
+        const direction = managed.valid && managed.center.id === node.id
+          ? mindmapRootChildDirection(managed, child, rootDown)
+          : mindmapChildDirection(node, child);
+        counts[direction] += 1;
+      });
+      if (counts.down > counts.left + counts.right) return 'down';
+      return counts.left < counts.right ? 'left' : 'right';
+    }
+
+    // 同一个父节点连续按 Tab 时，新孩子沿当前生长方向追加，避免叠在一起。
+    // 不主动移动旧节点：用户手工摆过的布局应当保留。
+    function nextMindmapChildPosition(node) {
+      const r = nodeRect(node);
+      const fromPanel = function (key, fallback, min, max) {
+        const value = Number(document.body && document.body.dataset[key]);
+        return Number.isFinite(value) ? clampValue(value, min, max) : fallback;
+      };
+      const gapDepth = currentMode() === 'mindmap' ? fromPanel('mindmapLevelGap', 60, 56, 180) : 60;
+      const gapBranch = currentMode() === 'mindmap' ? fromPanel('mindmapBranchGap', 24, 14, 96) : 24;
+      const direction = mindmapGrowthDirection(node);
+      const children = directMindmapChildrenOf(node).filter(function (child) {
+        return mindmapChildDirection(node, child) === direction;
+      });
+      if (direction === 'down') {
+        const y = r.y + r.h + gapDepth;
+        if (!children.length) return { x: r.x, y: y };
+        let right = -Infinity;
+        children.forEach(function (child) {
+          const cr = nodeRect(child);
+          right = Math.max(right, cr.x + cr.w);
+        });
+        return { x: right + gapBranch, y: y };
+      }
+      const x = direction === 'left'
+        ? r.x - NODE_DEFAULT_HALF_W * 2 - gapDepth
+        : r.x + r.w + gapDepth;
+      if (!children.length) return { x: x, y: r.y };
+      let bottom = -Infinity;
+      children.forEach(function (child) {
+        const cr = nodeRect(child);
+        bottom = Math.max(bottom, cr.y + cr.h);
+      });
+      return { x: x, y: bottom + gapBranch };
+    }
+
+    // Enter 创建同级节点时，只为新节点寻找最近空位，不挪动用户已摆好的内容。
+    // 默认空卡片约 160×36；留一点呼吸间距，避免视觉上贴得太紧。
+    function nextFreeSiblingPosition(x, y) {
+      const w = 160, h = 36, pad = 12, gapY = 24;
+      let nextY = y;
+      for (let tries = 0; tries < 120; tries++) {
+        let conflict = null;
+        data.nodes.forEach(function (other) {
+          if (conflict || isDecorationNode(other)) return;
+          const r = nodeRect(other);
+          const overlaps = x < r.x + r.w + pad
+            && x + w + pad > r.x
+            && nextY < r.y + r.h + pad
+            && nextY + h + pad > r.y;
+          if (overlaps) conflict = r;
+        });
+        if (!conflict) return { x: x, y: nextY };
+        nextY = conflict.y + conflict.h + gapY;
+      }
+      return { x: x, y: nextY };
+    }
+
+    // 找 Enter 所需的父节点。普通自由连线可能有多个入边时，优先选左侧最近的节点，
+    // 更贴合从左往右录入脑图的默认方向；找不到父节点时仍保留旧的孤立兄弟行为。
+    function mindmapParentOf(node) {
+      const candidates = [];
+      data.edges.forEach(function (edge) {
+        if (edge.to !== node.id || edge.from === node.id) return;
+        const parent = findNode(edge.from);
+        if (!parent || isDecorationNode(parent)) return;
+        const r = nodeRect(parent);
+        candidates.push({ node: parent, left: r.x <= node.x, dist: Math.hypot(node.x - r.x, node.y - r.y) });
+      });
+      candidates.sort(function (a, b) {
+        if (a.left !== b.left) return a.left ? -1 : 1;
+        return a.dist - b.dist;
+      });
+      return candidates.length ? candidates[0].node : null;
+    }
+
+    function moveMindmapSubtree(node, dx, dy) {
+      const childrenIndex = buildMindmapChildrenIndex();
+      const visited = new Set();
+      const queue = [node];
+      for (let queueIndex = 0; queueIndex < queue.length; queueIndex++) {
+        const current = queue[queueIndex];
+        if (!current || visited.has(current.id)) continue;
+        visited.add(current.id);
+        current.x += dx;
+        current.y += dy;
+        const el = nodeMap.get(current.id);
+        if (el) applyTransform(el, current.x, current.y);
+        directMindmapChildrenOf(current, childrenIndex).forEach(function (child) { queue.push(child); });
+      }
+    }
+
+    function createChildAt(node, p) {
+      if (node.mindmapCollapsed) delete node.mindmapCollapsed;
+      const child = createNode(p.x, p.y, '', { startEditing: true });
+      const edge = {
+        id: newEdgeId(),
+        from: node.id,
+        to: child.id,
+        text: '',
+      };
+      applyProEdgeDefaults(edge);          // 5-2：专业模式套用连线默认样式
+      data.edges.push(edge);
+      const refs = createEdgeEls(edge);
+      edgeMap.set(edge.id, refs);
+      if (currentMode() === 'mindmap') styleMindmapCreatedChild(node, child, edge);
+      updateEdgePath(edge);
+      refreshMindmapFolding();
+      return child;
+    }
+
+    // 在选中节点下方建一个兄弟节点（X 轮：Enter 键）。
+    // 若当前节点已有父节点，则新节点也连回同一个父节点，成为结构上的真正兄弟。
+    function createSiblingOf(node) {
+      const parent = mindmapParentOf(node);
+      if (parent) {
+        const p = nextMindmapChildPosition(parent);
+        return createChildAt(parent, nextFreeSiblingPosition(p.x, p.y));
+      }
+      const el = nodeMap.get(node.id);
+      const h = el ? el.offsetHeight : 36;
+      const gap = 24;
+      const p = nextFreeSiblingPosition(node.x, node.y + h + gap);
+      return createNode(p.x, p.y, '', { startEditing: true });
+    }
+
+    // 在选中节点右侧建一个子节点 + 自动从父连线过去（X 轮：Tab 键，思维导图）
+    function createChildOf(node) {
+      const p = nextMindmapChildPosition(node);
+      const child = createChildAt(node, p);
+      // 注意：不在这里 pushHistory——如果用户没给子节点打字直接 Esc，
+      // commitNodeEdit/cancelNodeEdit 走"删空新节点"路径，附带的 edge 也要一起删
+      return child;
+    }
+
+    // Shift+Enter：在当前节点上方插入同级节点；当前节点和它下方的同级分支整体下移。
+    function createSiblingAboveOf(node) {
+      const parent = mindmapParentOf(node);
+      if (!parent) {
+        const el = nodeMap.get(node.id);
+        const h = el ? el.offsetHeight : 36;
+        return createNode(node.x, node.y - h - 24, '', { startEditing: true });
+      }
+      const gap = 60;
+      directMindmapChildrenOf(parent).forEach(function (sibling) {
+        if (sibling.y >= node.y) moveMindmapSubtree(sibling, 0, gap);
+      });
+      data.edges.forEach(updateEdgePath);
+      return createChildAt(parent, { x: node.x, y: node.y });
+    }
+
+    // Shift+Tab：节点提升一级。若父节点已经是根，则当前节点成为新的顶层节点。
+    function promoteMindmapNode(node) {
+      const parent = mindmapParentOf(node);
+      if (!parent) return false;
+      const relation = data.edges.find(function (edge) { return edge.from === parent.id && edge.to === node.id; });
+      if (!relation) return false;
+      const grandparent = mindmapParentOf(parent);
+      if (grandparent) {
+        const p = nextMindmapChildPosition(grandparent);
+        relation.from = grandparent.id;
+        moveMindmapSubtree(node, p.x - node.x, p.y - node.y);
+      } else {
+        removeEdgeRaw(relation.id);
+        moveMindmapSubtree(node, parent.x - node.x, 0);
+      }
+      data.edges.forEach(updateEdgePath);
+      refreshMindmapFolding();
+      pushHistory();
+      notify();
+      return true;
+    }
+
+    // ── 双击空白 → 新建节点 ────────────────
+    function onSurfaceDblClick(e) {
+      // 绑在 viewport 上：surface 框外（含负坐标区）的空白处也能建节点
+      if (e.target !== surface && e.target !== viewport && e.target !== emptyHint) return;
+      if (lastPointerType === 'pen') return;   // 手写笔双击不建节点（防批注时误触；鼠标/触摸照常）
+      if (!canCreate()) return;             // 图案模式不新建内容节点
+      // Z 轮：用 clientToSurface 而不是直接减 surfRect——缩放下也得对
+      const p = clientToSurface(e.clientX, e.clientY);
+      createNode(p.x - NODE_DEFAULT_HALF_W, p.y - NODE_DEFAULT_HALF_H, '', { startEditing: true });
+    }
+
+    // ── 空白 mousedown → 框选 / 清选 ───────
+    function onSurfaceMouseDown(e) {
+      if (e.target !== surface && e.target !== viewport && e.target !== emptyHint) return;
+      if (mindmapColorBrushState) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      if (e.button === 2) {
+        if (currentMode() === 'decor' && hasActiveDecorTool()) {
+          e.preventDefault();
+          e.stopPropagation();
+          clearActiveDecorTool();
+          return;
+        }
+        if (editingNodeId !== null) commitNodeEdit();
+        if (editingEdgeId !== null) commitEdgeEdit();
+        e.preventDefault();
+        startColorBlockCreate(e);
+        return;
+      }
+      if (e.button !== 0) return;
+      if (currentMode() === 'decor' && hasActiveDecorTool()) {
+        e.preventDefault();
+        if (editingNodeId !== null) commitNodeEdit();
+        if (editingEdgeId !== null) commitEdgeEdit();
+        if (editingTextBoxId !== null) commitTextBoxEdit();
+        hideNodeMenu();
+        hideEdgeMenu();
+        if (activeDecorTextPreset) startDecorTextPresetCreate(e, activeDecorTextPreset);
+        else startSketchShapeCreate(e, activeDecorShapeType);
+        return;
+      }
+      if (handleDrawToolMouseDown(e)) return;
+      if (editingNodeId !== null) commitNodeEdit();
+      if (editingEdgeId !== null) commitEdgeEdit();
+      startFrameSelect(e);
+    }
+
+    // Z 轮：viewport 上 capture-phase 拦截——空格按住时所有 mousedown 都启动 pan
+    // 即使鼠标按在节点上也走 pan（不让节点拖动抢到这次 mousedown）
+    function onViewportMouseDownCapture(e) {
+      // 折叠按钮是瞬时点击，必须在视口收尾前放行，避免重绘替换按下时的按钮。
+      if (e.target.closest && e.target.closest('.group-collapse-btn')) return;
+      cancelPanInertia();   // W 轮：任何在画布内按下都立即停掉平移惯性（抓手感，像 Figma/Miro）
+      freezeViewportForInteraction();
+      finishMindmapGlide(); // 脑图滑行中按下（拖节点/平移）→ 立即贴到终态，避免与拖动抢 transform
+      if (e.button !== 0) return;
+      // 标题拖动 / 尺寸手柄需要上面的动画收尾，但不能继续落入绘图工具捕获。
+      if (e.target.closest && e.target.closest('.decor-box-title, .decor-resize-handle')) return;
+      // 套索工具：捕获相接管（早于节点自身 mousedown），画布任意处起手都进矩形框选、不拖动节点。
+      // 但放行工具栏 / 设置浮层的点击（否则切不了工具、点不了设置）。空格按住时让位给平移。
+      if (drawTool === 'lasso' && !spaceHeld) {
+        if (drawToolbar && (e.target === drawToolbar || drawToolbar.contains(e.target))) return;
+        if (e.target.closest && e.target.closest('.tool-config-pop, .search-bar, .viewport-hud-bl, .help-fab, .settings-fab, .settings-pop')) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (editingNodeId !== null) commitNodeEdit();
+        if (editingEdgeId !== null) commitEdgeEdit();
+        startFrameSelect(e);
+        return;
+      }
+      if (handleDrawToolMouseDown(e)) return;
+      if (!spaceHeld) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (editingNodeId !== null) commitNodeEdit();
+      if (editingEdgeId !== null) commitEdgeEdit();
+      startPan(e);
+    }
+
+    // ── 手写笔/数位板：绘图统一走 Pointer Events ────────────
+    // 选择模式（drawTool==='select'）完全不接管，交给原鼠标链路（拖节点/框选/平移不变）。
+    // 绘图工具激活时由 pointerdown 起笔 + setPointerCapture，move/up 复用 onWindowMouseMove/Up。
+    let drawPointerId = null;
+    let lastPointerType = 'mouse';   // 记录最近一次指针类型，用于「手写笔不建节点」
+    function onViewportPointerDownCapture(e) {
+      if (e.target.closest && e.target.closest('.group-collapse-btn')) return;
+      lastPointerType = e.pointerType || 'mouse';
+      freezeViewportForInteraction();
+      if (e.target.closest && e.target.closest('.decor-box-title, .decor-resize-handle')) return;
+      if (drawTool === 'select' || drawTool === 'lasso') return;   // 选择/套索不走指针绘图链路
+      if (e.button !== 0) return;
+      if (drag && drag.viaPointer) { e.preventDefault(); return; }  // 已有笔画进行中，忽略额外指针（防手掌误触）
+      const handled = handleDrawToolMouseDown(e);   // e.type==='pointerdown' → 真正起笔
+      if (handled && drag) {
+        drag.viaPointer = true;
+        drawPointerId = e.pointerId;
+        try { viewport.setPointerCapture(e.pointerId); } catch (_) {}
+      }
+    }
+    function onViewportPointerMove(e) {
+      if (!drag || !drag.viaPointer || e.pointerId !== drawPointerId) return;
+      onWindowMouseMove(e);
+    }
+    function onViewportPointerUp(e) {
+      if (!drag || !drag.viaPointer || e.pointerId !== drawPointerId) return;
+      onWindowMouseUp(e);
+      try { viewport.releasePointerCapture(e.pointerId); } catch (_) {}
+      drawPointerId = null;
+    }
+
+    // ── 撤销 / 重做 ────────────────────────
+    function applySnapshot(snap) {
+      data.nodes = snap.nodes.map(cloneNode);
+      rebuildNodeIndex();
+      data.edges = snap.edges.map(cloneEdge);   // 5-3：深拷 waypoints，避免与快照共享
+      data.ink = cloneInk(snap.ink);
+      // 撤销/重做重建 DOM 前先推导隐藏集合，避免折叠分支先闪现一帧再隐藏。
+      hiddenMindmapNodeIds = computeHiddenMindmapNodeIds();
+      hiddenGroupNodeIds = computeHiddenGroupNodeIds();
+      // 全部 DOM 推倒重建（最稳）
+      nodeMap.forEach((el) => {
+        if (nodeSizeObserver) nodeSizeObserver.unobserve(el);   // 旧元素退订，避免观察器攒游离 DOM
+        el.remove();
+      });
+      nodeMap.clear();
+      nodeSizeCache.clear();   // reconcileAll 会按新节点重新观察、cachedNodeSize 兜底过渡
+      edgeMap.forEach((refs) => {
+        refs.path.remove();
+        refs.hit.remove();
+        refs.labelEl.remove();
+      });
+      edgeMap.clear();
+      edgePathCache.clear();
+      edgeMidpointCache.clear();
+      edgeCanvasLiveCoords = null;
+      selectedNodeIds.clear();
+      selectedEdgeIds.clear();
+      renderInk();
+      reconcileAll();
+      // 阶段 4：DOM 推倒重建后高亮 class 没了，搜索开着就重算（撤销/重做）
+      if (searchOpen) runSearch(searchInput ? searchInput.value : '', false);
+      redrawMinimap();   // 阶段 4：撤销/重做后刷新小地图
+      onChange();
+    }
+
+    function undo() {
+      if (history.length <= 1) return;
+      const current = history.pop();
+      redoStack.push(current);
+      applySnapshot(history[history.length - 1]);
+      refreshHistoryButtons();
+    }
+
+    function redo() {
+      if (redoStack.length === 0) return;
+      const next = redoStack.pop();
+      history.push(next);
+      applySnapshot(next);
+      refreshHistoryButtons();
+    }
+
+    // ── 键盘 ──────────────────────────────────
+    // 数字键「快速切新建默认类型」：直接点一下 editor.js 里对应的「新建默认」按钮，
+    // 复用它写 localStorage + 高亮的逻辑，避免在两处各写一套。键位按模式分工见下表。
+    const QUICK_TYPE_MAP = {
+      normal: {
+        clean: {
+          '3': { sel: '[data-role="normal-kind"] .nkf-btn[data-kind="card"]', toast: '新建 · 卡片' },
+          '4': { sel: '[data-role="normal-kind"] .nkf-btn[data-kind="sticky"]', toast: '新建 · 便签' },
+        },
+        full: {
+          '3': { sel: '[data-role="pro-kind"] button[data-kind="index"]', toast: '新建 · 索引' },
+          '4': { sel: '[data-role="pro-kind"] button[data-kind="preview"]', toast: '新建 · 预览' },
+          '5': { sel: '[data-role="pro-kind"] button[data-kind="card"]', toast: '新建 · 卡片' },
+          '6': { sel: '[data-role="pro-kind"] button[data-kind="code"]', toast: '新建 · 代码' },
+        },
+      },
+    };
+    function quickPickNewType(mode, key) {
+      const submode = document.body.dataset.modeSubmode || 'clean';
+      const entry = QUICK_TYPE_MAP[mode] && QUICK_TYPE_MAP[mode][submode]
+        && QUICK_TYPE_MAP[mode][submode][key];
+      if (!entry) return false;
+      const btn = document.querySelector(entry.sel);
+      if (!btn) return false;
+      btn.click();   // 复用 editor.js 的点击处理：写默认值 + 面板高亮（按钮隐藏也能触发）
+      showCanvasToast(entry.toast);
+      return true;
+    }
+
+    function onKeyDown(e) {
+      if (externalOverlayOpen) return;
+
+      if (mindmapColorBrushState && e.key === 'Escape') {
+        e.preventDefault();
+        cancelMindmapColorBrush(true);
+        return;
+      }
+
+      // 任务清单输入框打字时：所有键交给输入框本身，画布快捷键一律让位
+      if (e.target && e.target.classList && e.target.classList.contains('checklist-edit')) return;
+
+      // 工具配置浮层打开时，Esc 先关它
+      if (toolConfigPop && e.key === 'Escape') {
+        e.preventDefault();
+        closeToolConfig();
+        return;
+      }
+
+      // Y1 轮：速查表打开时，吞掉所有键，只允许 Esc / ? 关闭
+      if (shortcutsOpen) {
+        if (e.key === 'Escape' || e.key === '?') {
+          e.preventDefault();
+          closeShortcuts();
+        }
+        return;
+      }
+
+      // C1 轮：右键菜单打开时，Esc 先关菜单
+      if (nodeMenu && !nodeMenu.hidden && e.key === 'Escape') {
+        e.preventDefault();
+        hideNodeMenu();
+        return;
+      }
+      if (edgeMenu && !edgeMenu.hidden && e.key === 'Escape') {
+        e.preventDefault();
+        hideEdgeMenu();
+        return;
+      }
+
+      // C2 轮：确认框打开时，Esc 关闭（不打开）
+      if (confirmOverlay && !confirmOverlay.hidden && e.key === 'Escape') {
+        e.preventDefault();
+        hideConfirm();
+        return;
+      }
+
+      if (editingDecorTitleId !== null) {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          commitDecorTitleEdit();
+          return;
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          cancelDecorTitleEdit();
+          return;
+        }
+        return;
+      }
+
+      if (editingTextBoxId !== null) {
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          cancelTextBoxEdit();
+          return;
+        }
+        if (e.key === 'Tab' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          e.preventDefault();
+          toggleTextBoxBulletLine(textBoxContentEl(editingTextBoxId), e.shiftKey);
+          return;
+        }
+        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+          e.preventDefault();
+          commitTextBoxEdit();
+          return;
+        }
+        return;
+      }
+
+      // PDF 阅读 + 批注浮层：保留滚动/复制等浏览器行为，只接管退出与工具切换键。
+      if (pdfReaderOpen) {
+        // Ctrl+Z / Ctrl+Y（或 Ctrl+Shift+Z）撤销重做批注；正在编辑便签文字时让位给浏览器文字撤销
+        if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z') && !e.shiftKey) {
+          if (isEditingPdfNote()) return;
+          e.preventDefault(); pdfUndo(); return;
+        }
+        if ((e.ctrlKey || e.metaKey) && ((e.key === 'y' || e.key === 'Y') || ((e.key === 'z' || e.key === 'Z') && e.shiftKey))) {
+          if (isEditingPdfNote()) return;
+          e.preventDefault(); pdfRedoAction(); return;
+        }
+        if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+          // 编辑便签文字时，除 Esc 失焦外不抢按键
+          if (isEditingPdfNote()) {
+            if (e.key === 'Escape') { e.preventDefault(); document.activeElement.blur(); }
+            return;
+          }
+          if (e.key === 'Escape' && pdfSelAnnot) { e.preventDefault(); clearPdfAnnotSelection(); return; }
+          if (e.key === 'Escape' || e.key === 'f' || e.key === 'F') { e.preventDefault(); closePdfReader(); return; }
+          const setTool = (t) => { e.preventDefault(); setPdfAnnotTool(t); };
+          if (e.key === '1') { setTool('thl'); return; }
+          if (e.key === '2') { setTool('tul'); return; }
+          if (e.key === '3') { setTool('pen'); return; }
+          if (e.key === '4') { setTool('hl'); return; }
+          if (e.key === '5') { setTool('box'); return; }
+          if (e.key === '6') { setTool('note'); return; }
+          if (e.key === '7') { setTool('eraser'); return; }
+        }
+        return;
+      }
+
+      // MD 附件阅读态：保留正文滚动 / 选区 / 复制等浏览器行为，只接管退出按键。
+      // （选区高光仍走选区浮动工具栏，无需在这里处理；其余画布快捷键一律不触发。）
+      if (mdReaderOpen) {
+        const typing = /^(INPUT|TEXTAREA)$/.test((e.target && e.target.tagName) || '');
+        // Ctrl+Z 撤销 / Ctrl+Y（或 Ctrl+Shift+Z）重做 MD 批注（笔迹 + 文字标注统一）
+        if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z') && !e.shiftKey && !typing) {
+          e.preventDefault(); mdUndo(); return;
+        }
+        if ((e.ctrlKey || e.metaKey) && ((e.key === 'y' || e.key === 'Y') || ((e.key === 'z' || e.key === 'Z') && e.shiftKey)) && !typing) {
+          e.preventDefault(); mdRedoAction(); return;
+        }
+        if (!e.ctrlKey && !e.metaKey && !e.altKey && !typing) {
+          if ((e.key === 'Delete' || e.key === 'Backspace') && mdSelBox) { e.preventDefault(); deleteSelectedMdBox(); return; }
+          if (e.key === 'Escape' && mdSelBox) { e.preventDefault(); mdSelBox = null; redrawMdStrokes(); return; }
+          if (e.key === '1' || e.key === 'p' || e.key === 'P') { e.preventDefault(); mdSetTool('pen'); return; }
+          if (e.key === '2' || e.key === 'b' || e.key === 'B') { e.preventDefault(); mdSetTool('box'); return; }
+          if (e.key === '3' || e.key === 'e' || e.key === 'E') { e.preventDefault(); mdSetTool('eraser'); return; }
+          if (e.key === 'Escape' && mdAnnotTool) { e.preventDefault(); mdAnnotTool = null; refreshMdToolButtons(); armMdAnnotSvg(); return; }  // 先退工具态
+          if (e.key === 'Escape' || e.key === 'f' || e.key === 'F') { e.preventDefault(); closeMdReader(); return; }
+        }
+        return;
+      }
+
+      // 文本节点阅读态：保留正文滚动与复制等浏览器行为，只接管退出按键。
+      if (textReaderOpen) {
+        const readerEditor = textReader && textReader.querySelector('[data-role="text-reader-editor"]');
+        const readerRichEditor = textReader && textReader.querySelector('[data-role="text-reader-rich-editor"]');
+        const editingHere = textReaderEditing && ((readerEditor && document.activeElement === readerEditor)
+          || (readerRichEditor && document.activeElement === readerRichEditor));
+        const codeReader = isCodeNode(findNode(readingNodeId));
+        if (editingHere) {
+          if (e.key === 'Escape') {
+            e.preventDefault();
+            finishTextReaderEdit();
+            const scroll = textReader.querySelector('[data-role="text-reader-scroll"]');
+            if (scroll) scroll.focus({ preventScroll: true });
+          }
+          // 含 F 在内的正文输入、Ctrl+S 等都交给输入框/编辑器壳处理。
+          return;
+        }
+        if (textReaderEditing) finishTextReaderEdit();
+        if (codeReader) {
+          if ((e.key === 'Escape' || e.key === 'f' || e.key === 'F')
+              && !e.ctrlKey && !e.metaKey && !e.altKey) {
+            e.preventDefault();
+            closeTextReader();
+          }
+          return;
+        }
+        if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z') && !e.shiftKey) {
+          e.preventDefault(); nodeAnnotUndo(); return;
+        }
+        if ((e.ctrlKey || e.metaKey) && ((e.key === 'y' || e.key === 'Y') || ((e.key === 'z' || e.key === 'Z') && e.shiftKey))) {
+          e.preventDefault(); nodeAnnotRedoAction(); return;
+        }
+        if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+          if (e.key === '1' || e.key === 'p' || e.key === 'P') { e.preventDefault(); setNodeAnnotTool('pen'); return; }
+          if (e.key === '2' || e.key === 'b' || e.key === 'B') { e.preventDefault(); setNodeAnnotTool('box'); return; }
+          if (e.key === '3' || e.key === 'e' || e.key === 'E') { e.preventDefault(); setNodeAnnotTool('eraser'); return; }
+          if (e.key === 'Escape' && nodeAnnotTool) { e.preventDefault(); nodeAnnotTool = null; refreshNodeAnnotTools(); return; }
+        }
+        if ((e.key === 'Escape' || e.key === 'f' || e.key === 'F')
+            && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          e.preventDefault();
+          closeTextReader();
+        }
+        return;
+      }
+
+      // 阶段 4：Ctrl/Cmd+F 打开节点搜索（拦截浏览器原生查找；编辑态会先提交）
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'f' || e.key === 'F') && searchBar
+          && !/^(INPUT|TEXTAREA)$/.test((e.target && e.target.tagName) || '')) {
+        e.preventDefault();
+        openSearch();
+        return;
+      }
+
+      // 编辑文字时：少量按键拦截，其他交给 contenteditable
+      if (editingNodeId !== null || editingEdgeId !== null) {
+        // 节点编辑：多行——Ctrl/Cmd+Enter 提交、Enter 自然插入换行
+        if (editingNodeId !== null) {
+          if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+            e.preventDefault();
+            commitNodeEdit();
+            return;
+          }
+          if (e.key === 'Escape') {
+            e.preventDefault();
+            cancelNodeEdit();
+            return;
+          }
+          const editingNode = findNode(editingNodeId);
+          if (isCodeNode(editingNode) && e.key === 'Tab' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+            e.preventDefault();
+            const el = nodeMap.get(editingNodeId);
+            if (el) indentCodeEditable(el.querySelector('.node-text'), e.shiftKey);
+            return;
+          }
+          // 编辑态 Tab → 提交当前 + 在右侧建子节点（思维导图丝滑流；X 轮 fix）
+          if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+            e.preventDefault();
+            const id = editingNodeId;
+            commitNodeEdit();
+            const parent = findNode(id);
+            if (parent && canCreate()) createChildOf(parent);
+            return;
+          }
+          return;
+        }
+        // 连线标签编辑：单行——Enter 提交
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          commitEdgeEdit();
+          return;
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          cancelEdgeEdit();
+          return;
+        }
+        return;
+      }
+
+      const active = document.activeElement;
+      const inEditable = !!(active && (
+        active.isContentEditable
+        || active.tagName === 'INPUT'
+        || active.tagName === 'TEXTAREA'
+      ));
+
+      if (e.key === 'Escape' && !inEditable && !drag && currentMode() === 'decor' && hasActiveDecorTool()) {
+        e.preventDefault();
+        clearActiveDecorTool();
+        return;
+      }
+
+      if ((e.key === 'Delete' || e.key === 'Backspace') && !inEditable) {
+        if (selectedArrowId) {
+          e.preventDefault();
+          deleteSelectedArrow();
+          return;
+        }
+        if (selectedNodeIds.size > 0 || selectedEdgeIds.size > 0) {
+          e.preventDefault();
+          deleteSelected();
+        }
+        return;
+      }
+
+      // 折线箭头选中时 Esc 取消选中（无进行中拖动时）
+      if (e.key === 'Escape' && !drag && selectedArrowId) {
+        e.preventDefault();
+        clearArrowSelection();
+        return;
+      }
+
+      if (e.key === 'Escape') {
+        // 取消正在进行的拖动 / 拉线 / 框选
+        if (drag) {
+          if (drag.mode === 'node' && drag.moved) {
+            // 节点回到起点
+            drag.starts.forEach((start, id) => {
+              const elN = nodeMap.get(id);
+              if (elN) applyTransform(elN, start.x, start.y);
+            });
+            (drag.affectedEdges || edgesIncidentTo(new Set(drag.starts.keys()))).forEach(updateEdgePath);
+            redrawMinimap();
+          }
+          if (drag.mode === 'node') {
+            drag.starts.forEach((_, id) => {
+              const elN = nodeMap.get(id);
+              if (elN) elN.classList.remove('dragging', 'mindmap-subtree-dragging', 'mindmap-drag-anchor');
+            });
+            if (drag.followingTextBoxIds) drag.followingTextBoxIds.forEach(function (id) {
+              const elN = nodeMap.get(id);
+              if (elN) elN.classList.remove('dragging');
+            });
+            syncBoundTextBoxes();
+            hideTextSnapGuides();
+            edgeCanvasLiveCoords = null;
+            renderEdgesCanvas();
+            setEdgesSvgLive(false);
+          }
+          if (drag.mode === 'decor-resize') {
+            const node = findNode(drag.nodeId);
+            if (node) {
+              node.x = drag.startX;
+              node.y = drag.startY;
+              node.width = drag.startW;
+              node.height = drag.startH;
+              const elN = nodeMap.get(node.id);
+              if (elN) {
+                elN.classList.remove('resizing');
+                applyTransform(elN, node.x, node.y);
+                renderEditedDecoration(node);
+              }
+              refreshDecorPanel();
+              redrawMinimap();
+            }
+          }
+          if (drag.mode === 'body-resize') {
+            const node = findNode(drag.nodeId);
+            const elN = node ? nodeMap.get(node.id) : null;
+            if (node) {
+              node.x = drag.startX;
+              node.y = drag.startY;
+              if (drag.startStoredW == null) delete node.width;
+              else node.width = drag.startStoredW;
+              if (drag.startStoredBodyH == null) delete node.bodyHeight;
+              else node.bodyHeight = drag.startStoredBodyH;
+              if (drag.startStoredMindmapMinHeight == null) delete node.mindmapMinHeight;
+              else node.mindmapMinHeight = drag.startStoredMindmapMinHeight;
+              if (drag.startMindmapSizeMode == null) delete node.mindmapSizeMode;
+              else node.mindmapSizeMode = drag.startMindmapSizeMode;
+            }
+            if (elN && node) {
+              elN.classList.remove('resizing-x', 'resizing-y', 'body-height-active');
+              applyNodeStyle(elN, node);
+              applyTransform(elN, node.x, node.y);
+              edgesIncidentTo(new Set([node.id])).forEach(updateEdgePath);
+              redrawMinimap();
+            }
+          }
+          if ((drag.mode === 'ink-stroke' || drag.mode === 'free-arrow' || drag.mode === 'poly-arrow-create') && drag.path) {
+            drag.path.remove();
+          }
+          if (drag.mode === 'arrow-waypoint' || drag.mode === 'arrow-endpoint') {
+            // 拖拐点/端点中途 Esc：还未入历史，重放栈顶快照即丢弃本次实时改动
+            if (drag.moved) applySnapshot(history[history.length - 1]);
+          }
+          if (drag.mode === 'ink-erase') {
+            eraserChanged = false;
+          }
+          clearPreviewPath();
+          clearFrameEl();
+          drag = null;
+        } else {
+          if (drawTool !== 'select') setDrawTool('select');
+          else clearSelection();
+        }
+        return;
+      }
+
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && (e.key === 'z' || e.key === 'Z')) {
+        if (inEditable) return;
+        e.preventDefault();
+        if (e.shiftKey) redo(); else undo();
+        return;
+      }
+      if (mod && (e.key === 'y' || e.key === 'Y')) {
+        if (inEditable) return;
+        e.preventDefault();
+        redo();
+        return;
+      }
+
+      // Y1 轮：Ctrl+D 复制选中节点
+      if (mod && (e.key === 'd' || e.key === 'D')) {
+        if (inEditable) return;
+        e.preventDefault();
+        duplicateSelected();
+        return;
+      }
+      // Y1 轮：Ctrl+A 全选（编辑态让浏览器全选文字）
+      if (mod && (e.key === 'a' || e.key === 'A')) {
+        if (inEditable) return;
+        e.preventDefault();
+        selectAll();
+        return;
+      }
+
+      // Z 轮：Ctrl+0 重置到 100%、Ctrl+1 fit-to-content
+      if (mod && e.key === '0' && !e.shiftKey) {
+        if (inEditable) return;
+        e.preventDefault();
+        resetViewport();
+        return;
+      }
+      if (mod && e.key === '1' && !e.shiftKey) {
+        if (inEditable) return;
+        e.preventDefault();
+        fitToContent(false);
+        return;
+      }
+
+      // Z 轮：空格按住 → 进入"等待平移"模式（光标变 grab）
+      // 注意 e.code === 'Space' 比 e.key === ' ' 更稳（不受输入法干扰）
+      if (e.code === 'Space' && !(e.ctrlKey || e.metaKey || e.altKey) && !inEditable) {
+        // 防止页面默认行为（页面滚动）
+        e.preventDefault();
+        if (!spaceHeld) {
+          spaceHeld = true;
+          spaceUsedForPan = false;   // W 轮：新一轮空格，重置"是否拖过"
+          viewport.classList.add('space-held');
+        }
+        return;
+      }
+
+      // W 轮：方向键持续平移画布（非编辑态、无修饰键时生效）
+      if (!inEditable && (e.key === 'ArrowUp' || e.key === 'ArrowDown'
+          || e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+        if (e.ctrlKey || e.metaKey || e.altKey) return; // 修饰键留给系统
+        e.preventDefault();
+        if (!arrowKeys[e.key]) {
+          arrowKeys[e.key] = true;
+          cancelPanInertia();   // 方向键平移直接写 pan，先停惯性免互相打架
+          if (arrowPanRaf == null) arrowPanRaf = requestAnimationFrame(arrowTick);
+        }
+        return;
+      }
+
+      // ── X 轮快捷键大礼包 ──────────────
+      // 在编辑态以外 + 不在其他可编辑元素里
+      if (inEditable) return;
+
+      const onlyNode = selectedNodeIds.size === 1 && selectedEdgeIds.size === 0;
+      const selNode = onlyNode ? findNode([...selectedNodeIds][0]) : null;
+      const noSel = selectedNodeIds.size === 0 && selectedEdgeIds.size === 0;
+      const anyMod = e.ctrlKey || e.metaKey || e.altKey;
+
+      // W 轮补充：WASD 平移镜头（方向键的字母别名，复用 arrowTick 循环）。
+      // 方案 B：选中单张可编辑卡片时让位给「按字母即进编辑替换标题」(Figma 字母键)，其余一律平移。
+      if (!anyMod) {
+        const wasdDir = e.key.length === 1 ? WASD_TO_ARROW[e.key.toLowerCase()] : null;
+        if (wasdDir && !(selNode && !isDecorationNode(selNode))) {
+          e.preventDefault();
+          if (!arrowKeys[wasdDir]) {
+            arrowKeys[wasdDir] = true;
+            cancelPanInertia();   // 与方向键一致：先停惯性免打架
+            if (arrowPanRaf == null) arrowPanRaf = requestAnimationFrame(arrowTick);
+          }
+          return;
+        }
+      }
+
+      if (selNode && isTextBoxNode(selNode) && !anyMod) {
+        if (e.key === '+' || e.key === '=') {
+          e.preventDefault();
+          adjustTextBoxFontSize(selNode, 4);
+          return;
+        }
+        if (e.key === '-' || e.key === '_') {
+          e.preventDefault();
+          adjustTextBoxFontSize(selNode, -4);
+          return;
+        }
+        if (e.key === '0') {
+          e.preventDefault();
+          resetTextBoxFontSize(selNode);
+          return;
+        }
+      }
+
+      // Y1 轮：? 打开速查表（非编辑态；优先于 Figma 字母键）
+      if (e.key === '?' && !anyMod) {
+        e.preventDefault();
+        toggleShortcuts();
+        return;
+      }
+
+      // 主键盘 1 / 2 → 切换左侧工具（1=选择、2=画笔），全局生效。
+      // 放在 Figma 字母键之前，所以即使选中了节点按 1/2 也是切工具（同原 1 的全局语义）。
+      // Ctrl+1（fit-to-content）已在前面处理并 return，故这里一定是无修饰键。
+      if (e.key === '1' && !anyMod) {
+        e.preventDefault();
+        setDrawTool('select');
+        return;
+      }
+      if (e.key === '2' && !anyMod) {
+        e.preventDefault();
+        // 反复按 2 在「画笔 ↔ 橡皮」间切换；从其它工具按 2 先到画笔
+        const next = drawTool === 'pen' ? 'eraser' : 'pen';
+        setDrawTool(next);
+        showCanvasToast(next === 'eraser' ? '橡皮擦' : '画笔');   // 工具栏会自动隐藏，给个提示确认
+        return;
+      }
+      if ((e.key === 'v' || e.key === 'V') && !anyMod && drawTool !== 'select') {
+        e.preventDefault();
+        setDrawTool('select');
+        return;
+      }
+      // 主键盘数字键切普通模式新建类型：简洁 3/4=卡片/便签；正常 3/4/5/6=索引/预览/卡片/代码。
+      // 未映射的数字键照旧落到打字替换链路。
+      if (!anyMod && !inEditable && e.key >= '3' && e.key <= '9') {
+        const mode = currentMode();
+        if (mode === 'normal' && quickPickNewType(mode, e.key)) {
+          e.preventDefault();
+          return;
+        }
+      }
+
+      // 索引 / 预览 / 卡片节点：单选后按 F 打开阅读浮层，不走"打字覆盖标题"。
+      // 索引自动生成目录；预览/卡片/便签/代码提供统一的专注阅读 / 编辑入口。
+      if (selNode && isReadableNode(selNode) && (e.key === 'f' || e.key === 'F') && !anyMod) {
+        e.preventDefault();
+        openTextReader(selNode);
+        return;
+      }
+
+      // 单选 PDF 附件后按 F → 打开放大阅读 + 批注浮层
+      if (selNode && isPdfNode(selNode) && (e.key === 'f' || e.key === 'F') && !anyMod) {
+        e.preventDefault();
+        openPdfReader(selNode);
+        return;
+      }
+
+      // 单选 MD 附件后按 F → 打开放大阅读浮层（只读 + 复用选区高光）
+      if (selNode && isMdNode(selNode) && (e.key === 'f' || e.key === 'F') && !anyMod) {
+        e.preventDefault();
+        openMdReader(selNode);
+        return;
+      }
+
+      // F2（单选节点）→ 进编辑（光标在末尾）
+      if (selNode && e.key === 'F2' && !anyMod) {
+        e.preventDefault();
+        enterNodeEdit(selNode, false);
+        return;
+      }
+
+      // Tab（单选节点）→ 右侧建子节点 + 自动连线（思维导图）
+      if (selNode && e.key === 'Tab' && !anyMod && e.shiftKey) {
+        e.preventDefault();
+        if (canCreate()) promoteMindmapNode(selNode);
+        return;
+      }
+      if (selNode && e.key === 'Tab' && !anyMod && !e.shiftKey) {
+        e.preventDefault();
+        if (canCreate()) createChildOf(selNode);
+        return;
+      }
+
+      // 无选中对象时 Tab → 临时收起/展开当前模式右侧浮窗；选中节点时仍保留 Tab 建子节点。
+      if (noSel && !selectedArrowId && e.key === 'Tab' && !anyMod && !e.shiftKey
+          && (currentMode() === 'mindmap' || currentMode() === 'decor' || !!document.body.dataset.inspectorView
+              || (currentMode() === 'normal' && document.body.dataset.modeSubmode === 'clean'))) {
+        e.preventDefault();
+        document.dispatchEvent(new CustomEvent('editor:toggle-side-panel'));
+        return;
+      }
+
+      // Enter（单选节点）→ 下方建兄弟节点
+      if (selNode && e.key === 'Enter' && !anyMod && e.shiftKey) {
+        e.preventDefault();
+        if (canCreate()) createSiblingAboveOf(selNode);
+        return;
+      }
+      if (selNode && e.key === 'Enter' && !anyMod && !e.shiftKey) {
+        e.preventDefault();
+        if (canCreate()) createSiblingOf(selNode);
+        return;
+      }
+
+      // Figma 风格：单选节点时按任意可打印单字符 → 进编辑 + 替换为该字符
+      // 排除空格（留给未来"空格+拖动平移画布"）
+      if (selNode && !isDecorationNode(selNode) && !anyMod && e.key.length === 1 && e.key !== ' ') {
+        e.preventDefault();
+        enterNodeEditWithChar(selNode, e.key);
+        return;
+      }
+
+      // N（未选中任何东西）→ 鼠标悬停位置建新节点 + 进编辑（鼠标不在 viewport 时回退到视口中央）
+      if (noSel && !anyMod && (e.key === 'n' || e.key === 'N')) {
+        e.preventDefault();
+        if (!canCreate()) return;            // 图案模式不新建内容节点
+        const p = defaultNewNodePosition();
+        createNode(p.x, p.y, '', { startEditing: true });
+        return;
+      }
+    }
+
+    function onBeforeInput(e) {
+      // 只拦截连线标签里的换行（连线标签仍是单行）
+      // 节点 plaintext-only 模式下 Enter 自然插 \n，不拦
+      if (editingEdgeId === null) return;
+      if (e.inputType === 'insertParagraph' || e.inputType === 'insertLineBreak') {
+        e.preventDefault();
+      }
+    }
+
+    // Z 轮：空格松开 → 退出"等待平移"模式；W 轮：方向键松开 → 标记停止
+    function onKeyUp(e) {
+      if (e.code === 'Space' && spaceHeld) {
+        spaceHeld = false;
+        viewport.classList.remove('space-held');
+        // 如果正在 pan 中（极少见的 mouseup 前先 keyup），mouseup 时再清理 .panning
+        // W 轮：本次空格按住期间没拖动过 → 视为"短按"，定位最近新建节点
+        if (spaceLocateEnabled && !spaceUsedForPan && (!drag || drag.mode !== 'pan')) {
+          locateRecent();
+        }
+      }
+      const panUp = Object.prototype.hasOwnProperty.call(arrowKeys, e.key) ? e.key
+        : (e.key.length === 1 ? WASD_TO_ARROW[e.key.toLowerCase()] : null);
+      if (panUp) {
+        arrowKeys[panUp] = false;
+        // 不主动取消 raf——arrowTick 自己检测到 dx=dy=0 会停
+      }
+    }
+    // 窗口失焦时一并清理空格态 + 方向键态——否则 Alt-Tab 切走会卡住
+    function onWindowBlur() {
+      if (spaceHeld) {
+        spaceHeld = false;
+        viewport.classList.remove('space-held');
+      }
+      Object.keys(arrowKeys).forEach(function (k) { arrowKeys[k] = false; });
+    }
+
+    function onFocusOut(e) {
+      if (editingDecorTitleId !== null) {
+        const title = decorTitleEl(editingDecorTitleId);
+        if (title && (!e.relatedTarget || !title.contains(e.relatedTarget))) {
+          commitDecorTitleEdit();
+          return;
+        }
+      }
+      if (editingTextBoxId !== null) {
+        const text = textBoxContentEl(editingTextBoxId);
+        if (text && (!e.relatedTarget || !text.contains(e.relatedTarget))) {
+          commitTextBoxEdit();
+          return;
+        }
+      }
+      if (editingNodeId !== null) {
+        const el = nodeMap.get(editingNodeId);
+        if (el && (!e.relatedTarget || !el.contains(e.relatedTarget))) {
+          commitNodeEdit();
+          return;
+        }
+      }
+      if (editingEdgeId !== null) {
+        const refs = edgeMap.get(editingEdgeId);
+        if (refs && (!e.relatedTarget || !refs.labelEl.contains(e.relatedTarget))) {
+          commitEdgeEdit();
+        }
+      }
+    }
+
+    // ── 装配事件 ─────────────────────────────
+    // 绑在 viewport（不是 surface）：这样 surface 框以外、平移露出的空白区也能建节点/框选
+    viewport.addEventListener('dblclick', onSurfaceDblClick);
+    viewport.addEventListener('click', onSemanticGroupControlClick, true);
+    viewport.addEventListener('mousedown', onSurfaceMouseDown);
+    // Z 轮：capture-phase 在 viewport 上拦截空格+拖（要比节点的 mousedown 先看到）
+    viewport.addEventListener('mousedown', onViewportMouseDownCapture, true);
+    // 手写笔/数位板：绘图工具激活时由 pointerdown（capture，早于节点 mousedown）接管起笔
+    if (window.PointerEvent) {
+      viewport.addEventListener('pointerdown', onViewportPointerDownCapture, true);
+      viewport.addEventListener('pointermove', onViewportPointerMove);
+      viewport.addEventListener('pointerup', onViewportPointerUp);
+      viewport.addEventListener('pointercancel', onViewportPointerUp);
+    }
+    // Z 轮：滚轮缩放（passive:false 才能 preventDefault）
+    viewport.addEventListener('wheel', onWheel, { passive: false });
+    viewport.addEventListener('dragover', onViewportDragOver);
+    viewport.addEventListener('dragleave', onViewportDragLeave);
+    viewport.addEventListener('drop', onViewportDrop);
+    window.addEventListener('mousemove', onWindowMouseMove);
+    window.addEventListener('mouseup', onWindowMouseUp);
+    window.addEventListener('dragover', onWindowFileDragOver, true);
+    window.addEventListener('drop', onWindowFileDrop, true);
+    window.addEventListener('keydown', onKeyDown, true);
+    window.addEventListener('keyup', onKeyUp, true);
+    window.addEventListener('paste', onPaste, true);
+    window.addEventListener('blur', onWindowBlur);
+    window.addEventListener('resize', keepRememberedViewportCentered);
+    window.addEventListener('resize', requestEdgesCanvasRender);
+    // 从外部编辑器改完 MD 回到画布：重渲那几篇附件（重新校验内容指纹，失效标注自动判废）。
+    window.addEventListener('focus', function () {
+      if (!mdExternalPending.size) return;
+      const ids = Array.from(mdExternalPending);
+      mdExternalPending.clear();
+      ids.forEach(forceReloadMdNode);
+    });
+    surface.addEventListener('beforeinput', onBeforeInput, true);
+    surface.addEventListener('input', onEditingInput);
+    surface.addEventListener('compositionstart', onCompositionStart);
+    surface.addEventListener('compositionend', onCompositionEnd);
+    document.addEventListener('focusout', onFocusOut);
+    // Z 轮：点击左下角缩放指示器 → 回到 100% 原点
+    if (zoomIndicator) {
+      zoomIndicator.addEventListener('click', function (e) {
+        e.stopPropagation();
+        resetViewport();
+      });
+    }
+
+    // ── W 轮：顶栏控件 ────────────────────
+    if (panSpeedInput) {
+      panSpeedInput.value = String(panSpeed); // 同步 localStorage 读到的初始值
+      panSpeedInput.addEventListener('input', function () {
+        const v = parseInt(panSpeedInput.value, 10);
+        if (Number.isFinite(v) && v >= 1 && v <= 20) {
+          panSpeed = v;
+          try { localStorage.setItem('canvas:panSpeed', String(v)); } catch (e) {}
+        }
+      });
+    }
+    if (panInertiaInput) {
+      const panInertiaVal = document.querySelector('[data-role="pan-inertia-val"]');
+      const syncPanInertiaLabel = function () {
+        if (panInertiaVal) panInertiaVal.textContent = Math.round(panInertia * 100) + '%';
+      };
+      panInertiaInput.value = String(panInertia); // 同步 localStorage 读到的初始值
+      syncPanInertiaLabel();
+      panInertiaInput.addEventListener('input', function () {
+        const v = parseFloat(panInertiaInput.value);
+        if (Number.isFinite(v) && v >= 0 && v <= 1) {
+          panInertia = v;
+          syncPanInertiaLabel();
+          if (panInertia === 0) cancelPanInertia();
+          try { localStorage.setItem('canvas:panInertia', String(v)); } catch (e) {}
+        }
+      });
+    }
+    if (zoomSpeedInput) {
+      zoomSpeedInput.value = String(zoomSpeed); // 同步初始值
+      zoomSpeedInput.addEventListener('input', function () {
+        const v = parseFloat(zoomSpeedInput.value);
+        if (Number.isFinite(v) && v >= 0.5 && v <= 3) {
+          zoomSpeed = v;
+          try { localStorage.setItem('canvas:zoomSpeed', String(v)); } catch (e) {}
+        }
+      });
+    }
+    if (locateBtn) {
+      locateBtn.addEventListener('click', function (e) {
+        e.preventDefault();
+        // 移开按钮焦点（否则下次按方向键会触发按钮 click）
+        locateBtn.blur();
+        locateRecent();
+      });
+    }
+    if (spaceLocateInput) {
+      spaceLocateInput.checked = spaceLocateEnabled;
+      spaceLocateInput.addEventListener('change', function () {
+        spaceLocateEnabled = !!spaceLocateInput.checked;
+        try { localStorage.setItem('canvas:spaceLocateEnabled', spaceLocateEnabled ? '1' : '0'); } catch (e) {}
+      });
+    }
+    if (zoomPresetBtn) {
+      zoomPresetBtn.addEventListener('click', function (e) {
+        e.preventDefault();
+        zoomPresetBtn.blur();
+        applyZoomPref();
+      });
+    }
+    if (zoomPrefInput) {
+      zoomPrefInput.value = Math.round(zoomPref * 100) + '%';
+      // 聚焦时全选数字，方便覆盖
+      zoomPrefInput.addEventListener('focus', function () {
+        // 进 input 期间不要让画布 keydown 拦截方向键 / Esc——浏览器原生处理就好
+        zoomPrefInput.select();
+      });
+      zoomPrefInput.addEventListener('blur', commitZoomPref);
+      zoomPrefInput.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          zoomPrefInput.blur();   // 触发 commit
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          zoomPrefInput.value = Math.round(zoomPref * 100) + '%';
+          zoomPrefInput.blur();   // commit 会把同样值写回（不变）
+        }
+      });
+    }
+    // Y1 轮：速查表浮层的开/关入口
+    if (helpBtn) {
+      helpBtn.addEventListener('click', function (e) {
+        e.preventDefault();
+        helpBtn.blur();         // 移开焦点，否则空格/方向键会再次激活按钮
+        openShortcuts();
+      });
+    }
+    if (shortcutsClose) {
+      shortcutsClose.addEventListener('click', function (e) {
+        e.preventDefault();
+        closeShortcuts();
+      });
+    }
+    if (onboardingReset) {
+      onboardingReset.addEventListener('click', function (e) {
+        e.preventDefault();
+        resetOnboardingHints();
+      });
+    }
+    if (shortcutsOverlay) {
+      // 点击浮层背景（卡片之外）关闭
+      shortcutsOverlay.addEventListener('mousedown', function (e) {
+        if (e.target === shortcutsOverlay) closeShortcuts();
+      });
+    }
+    if (textReader) {
+      const closeReaderBtn = textReader.querySelector('[data-role="text-reader-close"]');
+      const readerContent = textReader.querySelector('[data-role="text-reader-content"]');
+      const readerEmpty = textReader.querySelector('[data-role="text-reader-empty"]');
+      const readerEditor = textReader.querySelector('[data-role="text-reader-editor"]');
+      const readerRichEditor = textReader.querySelector('[data-role="text-reader-rich-editor"]');
+      const nodePenBtn = textReader.querySelector('[data-role="node-annot-pen"]');
+      const nodeBoxBtn = textReader.querySelector('[data-role="node-annot-box"]');
+      const nodeEraserBtn = textReader.querySelector('[data-role="node-annot-eraser"]');
+      if (closeReaderBtn) closeReaderBtn.addEventListener('click', closeTextReader);
+      if (nodePenBtn) nodePenBtn.addEventListener('click', () => setNodeAnnotTool('pen'));
+      if (nodeBoxBtn) nodeBoxBtn.addEventListener('click', () => setNodeAnnotTool('box'));
+      if (nodeEraserBtn) nodeEraserBtn.addEventListener('click', () => setNodeAnnotTool('eraser'));
+      textReader.querySelectorAll('[data-node-annot-color]').forEach((b) => {
+        b.addEventListener('click', () => {
+          nodeAnnotColor = b.dataset.nodeAnnotColor || nodeAnnotColor;
+          if (!nodeAnnotTool || nodeAnnotTool === 'eraser') nodeAnnotTool = 'pen';
+          refreshNodeAnnotTools();
+        });
+      });
+      global.addEventListener('resize', () => { if (textReaderOpen) { syncNodeAnnotSvg(); syncIndexPaneMdAnnot(); } });
+      textReader.addEventListener('mousedown', function (e) {
+        const insideEditor = (readerEditor && (e.target === readerEditor || readerEditor.contains(e.target)))
+          || (readerRichEditor && (e.target === readerRichEditor || readerRichEditor.contains(e.target)));
+        const insideReadingText = (readerContent && readerContent.contains(e.target))
+          || (readerEmpty && readerEmpty.contains(e.target));
+        if (textReaderEditing && !insideEditor) finishTextReaderEdit();
+        if (e.target === textReader) closeTextReader();
+        if (insideReadingText && !textReaderEditing) {
+          // click 事件开始正文编辑；mousedown 这里只负责先结束旧焦点。
+        }
+      });
+      if (readerContent) readerContent.addEventListener('click', function (e) {
+        if (nodeAnnotTool || (e.target.closest && e.target.closest('.node-annot-svg'))) return;
+        // 索引右栏只读：正文里的 wiki / 外链仍可点；空白点击对索引节点不进编辑（beginTextReaderEdit 自会拦）
+        const wiki = e.target.closest ? e.target.closest('.node-wikilink') : null;
+        if (wiki && readerContent.contains(wiki)) {
+          e.preventDefault();
+          jumpToWikiTarget(wiki.dataset.wikilink);
+          return;
+        }
+        const link = e.target.closest ? e.target.closest('.node-link') : null;
+        if (link && readerContent.contains(link)) {
+          e.preventDefault();
+          openExternalLink(link.dataset.href, link.dataset.kind);
+          return;
+        }
+        beginTextReaderEdit(e);
+      });
+      // 索引右栏 MD 附件宿主：双链 / 外链点击跳转（与 readerContent 同理，但 MD 渲染在独立宿主里）
+      const indexPaneMdHost = textReader.querySelector('[data-role="index-pane-md-host"]');
+      if (indexPaneMdHost) indexPaneMdHost.addEventListener('click', function (e) {
+        if (nodeAnnotTool) return;
+        const wiki = e.target.closest ? e.target.closest('.node-wikilink') : null;
+        if (wiki && indexPaneMdHost.contains(wiki)) {
+          e.preventDefault();
+          jumpToWikiTarget(wiki.dataset.wikilink);
+          return;
+        }
+        const link = e.target.closest ? e.target.closest('.node-link') : null;
+        if (link && indexPaneMdHost.contains(link)) {
+          e.preventDefault();
+          openExternalLink(link.dataset.href, link.dataset.kind);
+          return;
+        }
+      });
+      // 索引左栏目录：单击 → 右栏阅读该项；双击 → 跳到画布节点；悬停 → 高亮画布上整条路径
+      const indexNav = textReader && textReader.querySelector('[data-role="index-reader-nav"]');
+      if (indexNav) {
+        indexNav.addEventListener('click', function (e) {
+          const item = e.target.closest ? e.target.closest('[data-index-node-id]') : null;
+          if (!item || !indexNav.contains(item)) return;
+          const node = findNode(readingNodeId);
+          if (!node || !isIndexNode(node)) return;
+          indexReaderTargetId = item.dataset.indexNodeId;
+          // 只更新右栏 + 当前项高亮，不重建整棵目录（避免目录滚动位置跳回顶部）
+          indexNav.querySelectorAll('.index-reader-nav-item').forEach(function (b) {
+            b.classList.toggle('active', b.dataset.indexNodeId === indexReaderTargetId);
+          });
+          renderIndexReaderPane(node);
+          const sc = textReader.querySelector('[data-role="text-reader-scroll"]');
+          if (sc) sc.scrollTop = 0;   // 新一项从头读
+        });
+        indexNav.addEventListener('dblclick', function (e) {
+          const item = e.target.closest ? e.target.closest('[data-index-node-id]') : null;
+          if (!item || !indexNav.contains(item)) return;
+          e.preventDefault();
+          jumpToIndexNode(item.dataset.indexNodeId);
+        });
+        indexNav.addEventListener('mouseover', function (e) {
+          const item = e.target.closest ? e.target.closest('[data-index-node-id]') : null;
+          if (item && indexNav.contains(item)) setIndexReaderPath(item.dataset.indexPath || item.dataset.indexNodeId);
+        });
+        indexNav.addEventListener('mouseout', function (e) {
+          const item = e.target.closest ? e.target.closest('[data-index-node-id]') : null;
+          if (!item || !indexNav.contains(item)) return;
+          const next = e.relatedTarget && e.relatedTarget.closest ? e.relatedTarget.closest('[data-index-node-id]') : null;
+          if (!next || next !== item) clearIndexReaderTarget();
+        });
+      }
+      // ③ 目录最大层级选择器：点 2/3/4/全部 改 node.indexDepth，即时重算目录与画布 meta
+      const indexDepthSwitch = textReader && textReader.querySelector('[data-role="index-depth-switch"]');
+      if (indexDepthSwitch) indexDepthSwitch.addEventListener('click', function (e) {
+        const btn = e.target.closest ? e.target.closest('.index-depth-opt') : null;
+        if (!btn) return;
+        const node = findNode(readingNodeId);
+        if (!node || !isIndexNode(node)) return;
+        const d = Math.max(1, Math.min(6, Number(btn.dataset.depth) || 4));
+        if (Math.round(Number(node.indexDepth) || 4) === d) return;
+        node.indexDepth = d;
+        renderTextReader(node);
+        refreshAllIndexNodes();
+        pushHistory();
+        notify();
+      });
+      setupIndexHoverPreview();
+      // 阅读浮层透明度滑条：正文 / 索引 / MD 三处头部共用同一份偏好，拖动实时改、立即存盘
+      document.querySelectorAll('[data-role="reader-opacity"]').forEach(function (el) {
+        el.addEventListener('input', function () { applyReaderOpacity(el.value); });
+      });
+      applyReaderOpacity(readReaderOpacity());   // 首屏按存储值同步变量 + 两个滑条显示
+      if (readerEmpty) readerEmpty.addEventListener('click', beginTextReaderEdit);
+      if (readerEditor) {
+        readerEditor.addEventListener('keydown', function (e) {
+          const node = findNode(readingNodeId);
+          if (!node) return;
+          // Ctrl/Cmd+Shift+K：在 Markdown 正文（预览/卡片/便签等）光标处插入代码块；代码节点本身是代码，跳过
+          if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.code === 'KeyK' || e.key === 'k' || e.key === 'K')) {
+            if (isBodyNode(node) && !isCodeNode(node)) {
+              e.preventDefault();
+              insertReaderCodeBlock(readerEditor);
+            }
+            return;
+          }
+          if (!isCodeNode(node) || e.key !== 'Tab') return;
+          e.preventDefault();
+          indentCodeTextarea(readerEditor, e.shiftKey);
+        });
+        readerEditor.addEventListener('select', scheduleSelToolbar);
+        readerEditor.addEventListener('keyup', scheduleSelToolbar);
+        readerEditor.addEventListener('blur', scheduleSelToolbar);
+        readerEditor.addEventListener('input', function () {
+          const node = findNode(readingNodeId);
+          if (node && isBodyNode(node) && textReaderEditing) {
+            // 只更新源码 + 标记未保存；不在每次按键都重渲染/重排画布上的卡片
+            // （那会让半透明浮层背后的卡片不停动 + 反复触发 MathJax，造成"打字时屏幕乱动"）。
+            // 卡片正文会在退出编辑（finishTextReaderEdit）时一次性同步。
+            if (readerEditor.value) node.body = readerEditor.value; else delete node.body;
+            notify();
+            autoGrowEditor(readerEditor);     // 随输入增高，保持单一容器滚动条（已保护外层滚动位置）
+          }
+        });
+      }
+      if (readerRichEditor) {
+        prepareRichEditable(readerRichEditor);
+        readerRichEditor.addEventListener('keyup', scheduleTextDock);
+        readerRichEditor.addEventListener('blur', scheduleTextDock);
+        readerRichEditor.addEventListener('keydown', function (e) {
+          if (!((e.ctrlKey || e.metaKey) && e.shiftKey && (e.code === 'KeyK' || e.key === 'k' || e.key === 'K'))) return;
+          const node = findNode(readingNodeId);
+          if (!node || !isBodyNode(node) || isCodeNode(node) || !textReaderEditing) return;
+          e.preventDefault();
+          insertReaderRichCodeBlock(readerRichEditor);
+        });
+        readerRichEditor.addEventListener('input', function () {
+          const node = findNode(readingNodeId);
+          if (!node || !isBodyNode(node) || isCodeNode(node) || !textReaderEditing) return;
+          const draft = readRichEditable(readerRichEditor);
+          if (draft.text) node.body = draft.text;
+          else delete node.body;
+          storeRichMarks(node, 'body', draft.marks);
+          notify();
+        });
+      }
+    }
+    // C1 轮：节点右键菜单
+    surface.addEventListener('contextmenu', onContextMenu);
+    viewport.addEventListener('contextmenu', onContextMenu);
+    if (nodeMenu) {
+      nodeMenu.addEventListener('click', function (e) {
+        const stickyColorBtn = e.target.closest('[data-sticky-color]');
+        if (stickyColorBtn) {
+          setNodeColor(stickyColorBtn.getAttribute('data-sticky-color'));
+          hideNodeMenu();
+          return;
+        }
+        const colorBtn = e.target.closest('[data-color]');
+        if (colorBtn) {
+          if (nodeMenu.classList.contains('decor-color-mode')) {
+            setColorBlockMenuColor(colorBtn.getAttribute('data-color'));
+          } else {
+            setNodeColor(colorBtn.getAttribute('data-color'));
+          }
+          hideNodeMenu();
+          return;
+        }
+        const actionBtn = e.target.closest('[data-action]');
+        if (actionBtn) {
+          const act = actionBtn.getAttribute('data-action');
+          if (act === 'sticky-random') setNodeColor('', { random: true });
+          else if (act === 'duplicate') duplicateSelected();
+          else if (act === 'delete') deleteSelected();
+          hideNodeMenu();
+        }
+      });
+    }
+    // 连线右键菜单：编辑文字 / 删除连线
+    if (edgeMenu) {
+      edgeMenu.addEventListener('click', function (e) {
+        const actionBtn = e.target.closest('[data-action]');
+        if (!actionBtn) return;
+        const act = actionBtn.getAttribute('data-action');
+        const edge = data.edges.find(function (x) { return x.id === menuEdgeId; });
+        hideEdgeMenu();
+        if (!edge) return;
+        if (act === 'edge-edit') enterEdgeEdit(edge);
+        else if (act === 'edge-delete') { selectEdges([edge.id], false); deleteSelected(); }
+      });
+    }
+    // 点菜单以外的任何地方（含节点——它的 mousedown 会 stopPropagation，所以这里用 capture）
+    // → 关菜单。capture + contains 判断：点菜单内不关，点外面才关。
+    window.addEventListener('mousedown', function (e) {
+      if (nodeMenu && !nodeMenu.hidden && !nodeMenu.contains(e.target)) {
+        hideNodeMenu();
+      }
+      if (edgeMenu && !edgeMenu.hidden && !edgeMenu.contains(e.target)) {
+        hideEdgeMenu();
+      }
+      // 点浮层和工具栏以外的地方 → 关配置浮层（点工具栏交给它自己的 toggle 逻辑）
+      if (toolConfigPop && !toolConfigPop.contains(e.target)
+        && !(drawToolbar && drawToolbar.contains(e.target))) {
+        closeToolConfig();
+      }
+    }, true);
+    // C2：确认框按钮
+    if (confirmOverlay) {
+      const okBtn = confirmOverlay.querySelector('[data-role="confirm-ok"]');
+      const cancelBtn = confirmOverlay.querySelector('[data-role="confirm-cancel"]');
+      if (okBtn) okBtn.addEventListener('click', function () {
+        const cb = confirmCallback;
+        hideConfirm();
+        if (cb) cb();
+      });
+      if (cancelBtn) cancelBtn.addEventListener('click', hideConfirm);
+      // 点遮罩背景关闭
+      confirmOverlay.addEventListener('mousedown', function (e) {
+        if (e.target === confirmOverlay) hideConfirm();
+      });
+    }
+
+    // ── 阶段 4：搜索栏事件 ────────────────
+    if (searchInput) {
+      // 实时匹配（输入时归零指针并居中第一个命中）
+      searchInput.addEventListener('input', function () {
+        runSearch(searchInput.value, true);
+      });
+      // Enter 下一个、Shift+Enter 上一个、Esc 关闭。
+      // stopPropagation 避免 window 上的 onKeyDown 把 Enter/Esc 当成画布快捷键。
+      searchInput.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          e.stopPropagation();
+          gotoMatch(e.shiftKey ? -1 : 1);
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          e.stopPropagation();
+          closeSearch();
+        }
+      });
+    }
+    if (searchPrev) {
+      searchPrev.addEventListener('click', function (e) {
+        e.preventDefault();
+        gotoMatch(-1);
+        if (searchInput) searchInput.focus();
+      });
+    }
+    if (searchNext) {
+      searchNext.addEventListener('click', function (e) {
+        e.preventDefault();
+        gotoMatch(1);
+        if (searchInput) searchInput.focus();
+      });
+    }
+    if (searchClose) {
+      searchClose.addEventListener('click', function (e) {
+        e.preventDefault();
+        closeSearch();
+      });
+    }
+
+    // ── 阶段 4：小地图交互 ────────────────
+    if (minimap) {
+      minimap.addEventListener('mousedown', onMinimapMouseDown);
+    }
+
+    // 5-4：编辑抽屉控件接线（一次）
+    setupEditPanel();
+    setupDecorPanel();
+
+    // ── 初始渲染 + 视口适配 ──────────────────
+    reconcileAll();
+    if (opts.fresh) window.setTimeout(showRelevantOnboardingHint, 360);
+    // 有保存的观看位置时优先恢复；首次打开才自动适配内容。
+    if (!restoreViewport()) fitToContent(/* immediate */ true);
+
+    // MathJax 由首个公式源按需触发；无公式画布不下载、不轮询。
+
+    // 5-3/5-4：暴露 setMode 给顶栏模式开关——切到/离开编辑模式时刷新拐点手柄 + 编辑抽屉
+    global.CanvasModule.setMode = function (mode) {
+      // 模式切换是明确边界：先把尚未完成的脑图滑行动画结算到数据终点，
+      // 避免切回普通后第一次拖动节点/分组时从动画中间位置突然跳走。
+      finishMindmapGlide();
+      if (mode !== 'mindmap') cancelMindmapColorBrush(false);
+      clearTransientMovableDecor();
+      if (mode === 'decor') {
+        const hasContentSelection = selectedEdgeIds.size > 0
+          || [...selectedNodeIds].some((id) => !isDecorationNode(findNode(id)));
+        if (hasContentSelection) clearSelection();
+      } else {
+        setActiveDecorShapeTool(null);
+        if (isSketchShapeTool(drawTool)) setDrawTool('select');
+        const hasDecorSelection = [...selectedNodeIds].some((id) => isDecorationNode(findNode(id)));
+        if (hasDecorSelection) clearSelection();
+      }
+      if (mode === 'decor') clearArrowSelection();
+      renderEdgeHandles();
+      renderArrowHandles();   // 进/出编辑模式时显示/隐藏折线箭头手柄
+      refreshEditPanel();
+      refreshDecorPanel();
+      refreshDecorToolButtons();
+    };
+    global.CanvasModule.setFilePath = function (nextPath) {
+      filePath = nextPath || filePath;
+      data.nodes.filter(isImageNode).forEach(function (node) {
+        const el = nodeMap.get(node.id);
+        if (el) renderDecoration(el, node);
+      });
+    };
+    // 导出前收束正在输入的节点/连线正文，保证导出的是用户眼前这一刻的内容。
+    global.CanvasModule.commitPendingEdits = function () {
+      if (editingNodeId !== null) commitNodeEdit();
+      if (editingEdgeId !== null) commitEdgeEdit();
+      if (editingTextBoxId !== null) commitTextBoxEdit();
+      if (textReaderEditing) finishTextReaderEdit();
+    };
+    // 是否有正在进行的就地编辑（与 commitPendingEdits 会 commit 的集合一一对应）。
+    // 自动保存据此礼让：commit 会退出编辑态、关掉 contentEditable，在用户打字途中触发会吞掉后续输入。
+    global.CanvasModule.isEditing = function () {
+      return editingNodeId !== null
+        || editingEdgeId !== null
+        || editingTextBoxId !== null
+        || textReaderEditing;
+    };
+    global.CanvasModule.getSelectedCardIds = function () {
+      const ids = [];
+      selectedNodeIds.forEach(function (id) {
+        const node = findNode(id);
+        if (isCardNode(node)) ids.push(id);
+      });
+      return ids;
+    };
+    global.CanvasModule.removeArchivedNodes = removeArchivedNodes;
+    global.CanvasModule.revealNode = function (nodeId) {
+      const node = findNode(nodeId);
+      if (!node || (isDecorationNode(node) && !isAttachmentNode(node))) return false;   // 附件可定位，图案/图片不行
+      selectNodes([nodeId], false);
+      centerOnNode(nodeId);
+      return true;
+    };
+    global.CanvasModule.setExternalOverlayOpen = function (open) {
+      externalOverlayOpen = !!open;
+    };
+
+    // ── 阶段 2：注入 AI 生成的「卡片 + 连线」到当前画布 ───────────────
+    // payload.nodes：后端力导向已排好的相对坐标（带 text/body/kind/color/language/indexDepth）；
+    // payload.edges：from/to 是 nodes 的下标（不是 id），方向 = 父→子。
+    // 全程复用既有的建节点/建连线/撤销/保存路径——注入 = 一次可整体 Ctrl+Z 撤销的批量新建。
+    global.CanvasModule.injectCanvas = function (payload, opts) {
+      payload = payload || {};
+      opts = opts || {};
+      const inNodes = Array.isArray(payload.nodes) ? payload.nodes : [];
+      const inEdges = Array.isArray(payload.edges) ? payload.edges : [];
+      if (!inNodes.length) return { ok: false, count: 0 };
+      if (editingNodeId !== null) commitNodeEdit();
+      if (editingEdgeId !== null) commitEdgeEdit();
+      if (textReaderEditing) finishTextReaderEdit();
+
+      const ALLOWED_KINDS = { card: 1, index: 1, preview: 1, sticky: 1, code: 1 };
+      const NAMED_COLORS = { gray: 1, blue: 1, green: 1, yellow: 1, red: 1, purple: 1 };
+
+      // 量后端给的相对坐标包围盒，整体平移到当前视野中央；rightInset 让出右侧 AI 面板宽度，避免落在面板下面。
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      inNodes.forEach(function (n) {
+        const x = Number(n.x) || 0, y = Number(n.y) || 0;
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+      });
+      if (!isFinite(minX)) { minX = minY = maxX = maxY = 0; }
+      const vRect = viewport.getBoundingClientRect();
+      const rightInset = Math.max(0, Number(opts.rightInset) || 0);
+      const center = clientToSurface(vRect.left + (vRect.width - rightInset) / 2,
+                                     vRect.top + vRect.height / 2);
+      const offX = center.x - (minX + maxX) / 2;
+      const offY = center.y - (minY + maxY) / 2;
+
+      const newIds = [];
+      const idByIndex = [];
+      inNodes.forEach(function (raw, i) {
+        const kind = ALLOWED_KINDS[raw.kind] ? raw.kind : 'card';
+        const node = {
+          id: newNodeId(),
+          x: Math.round((Number(raw.x) || 0) + offX),
+          y: Math.round((Number(raw.y) || 0) + offY),
+          text: String(raw.text || ''),
+          kind: kind,
+        };
+        if (raw.body) node.body = String(raw.body);
+        if (NAMED_COLORS[raw.color]) node.color = raw.color;
+        if (kind === 'code') {
+          node.language = normalizeCodeLanguage(raw.language);
+          if (!node.text) node.text = codeTitleFromBody(node.body || '', node.language);
+        }
+        if (kind === 'index') {
+          const d = parseInt(raw.indexDepth, 10);
+          if (Number.isFinite(d) && d >= 1 && d <= 6) node.indexDepth = d;
+        }
+        if (isStickyNode(node) && !node.bgColor) node.bgColor = randomStickyColor();
+        data.nodes.push(node);
+        indexNodeData(node);
+        const el = createNodeEl(node);     // 内部已渲染标题+正文+公式+配色
+        surface.appendChild(el);
+        nodeMap.set(node.id, el);
+        spawnNodeEl(el);
+        idByIndex[i] = node.id;
+        newIds.push(node.id);
+      });
+
+      // 端点：数字=本批新节点的下标；字符串=画布上已有节点的 id（阶段3"基于画布补充"用，连回已有卡片）。
+      function resolveEndpoint(ep) {
+        if (typeof ep === 'number') return idByIndex[ep] || null;
+        if (typeof ep === 'string') return findNode(ep) ? ep : null;
+        return null;
+      }
+      inEdges.forEach(function (e) {
+        const from = resolveEndpoint(e.from);
+        const to = resolveEndpoint(e.to);
+        if (!from || !to || from === to) return;
+        const edge = {
+          id: newEdgeId(), from: from, to: to,
+          text: String(e.text || ''), curve: 'smooth', color: '#bcbcbc',
+        };
+        data.edges.push(edge);
+        const refs = createEdgeEls(edge);
+        edgeMap.set(edge.id, refs);
+        updateEdgePath(edge);
+        spawnEdgeEls(refs);
+      });
+
+      data.edges.forEach(updateEdgePath);
+      redrawMinimap();
+      if (newIds.length) {
+        selectNodes(newIds, false);
+        lastCreatedNodeId = newIds[newIds.length - 1];
+      }
+      hideOnboardingHint();
+      pushHistory();      // 整批进撤销栈：不满意一次 Ctrl+Z 撤掉
+      notify();           // 触发自动保存 + 刷新索引/小地图
+      return { ok: true, count: newIds.length };
+    };
+
+    // ── 模板落地：把存好的模板（一段 .canvas 身体）保真克隆进当前画布，模板中心对到落点 ──
+    // 与 injectCanvas 同骨架，但**保留全部样式字段**（injectCanvas 是给 AI 用、故意剥样式）；
+    // 每次落地都重生成 id 并按映射改写连线 from/to，所以同一模板拖多次互不串扰，整批一次 Ctrl+Z 撤掉。
+    global.CanvasModule.instantiateTemplate = function (tpl, clientPt) {
+      if (!tpl || !Array.isArray(tpl.nodes) || !tpl.nodes.length) return { ok: false, count: 0 };
+      if (editingNodeId !== null) commitNodeEdit();
+      if (editingEdgeId !== null) commitEdgeEdit();
+      if (textReaderEditing) finishTextReaderEdit();
+
+      let dropSurf;
+      if (clientPt && typeof clientPt.x === 'number' && typeof clientPt.y === 'number') {
+        dropSurf = clientToSurface(clientPt.x, clientPt.y);
+      } else {
+        const vRect = viewport.getBoundingClientRect();
+        dropSurf = clientToSurface(vRect.left + vRect.width / 2, vRect.top + vRect.height / 2);
+      }
+      const offX = dropSurf.x - (Number(tpl.w) || 0) / 2;   // 模板中心对到落点
+      const offY = dropSurf.y - (Number(tpl.h) || 0) / 2;
+
+      const idMap = {};
+      const newIds = [];
+      tpl.nodes.forEach(function (raw) {
+        if (!raw || typeof raw !== 'object') return;
+        if (!isTemplateEligibleNode(raw)) return;   // 防御：落地范围与模板套索白名单保持一致
+        const node = JSON.parse(JSON.stringify(raw));
+        const nid = newNodeId();
+        idMap[raw.id] = nid;
+        node.id = nid;
+        node.x = Math.round((Number(raw.x) || 0) + offX);
+        node.y = Math.round((Number(raw.y) || 0) + offY);
+        delete node.assetPath;
+        delete node.review;
+        prepareNewDecorationNode(node);
+        data.nodes.push(node);
+        indexNodeData(node);
+        const el = createNodeEl(node);     // 通用建元素入口，正文/形状/盒子/色块/文字框都能渲染
+        surface.appendChild(el);
+        nodeMap.set(node.id, el);
+        spawnNodeEl(el);
+        newIds.push(node.id);
+      });
+      newIds.forEach(function (id) {
+        const node = findNode(id);
+        if (!isTextBoxNode(node) || !node.textBindTarget) return;
+        if (idMap[node.textBindTarget]) node.textBindTarget = idMap[node.textBindTarget];
+        else clearTextBinding(node);
+      });
+
+      if (Array.isArray(tpl.edges)) {
+        tpl.edges.forEach(function (raw) {
+          if (!raw || typeof raw !== 'object') return;
+          const from = idMap[raw.from], to = idMap[raw.to];
+          if (!from || !to || from === to) return;
+          const edge = JSON.parse(JSON.stringify(raw));
+          edge.id = newEdgeId();
+          edge.from = from; edge.to = to;
+          if (Array.isArray(edge.waypoints)) {
+            edge.waypoints = edge.waypoints.map(function (p) {
+              return { x: Math.round((Number(p.x) || 0) + offX), y: Math.round((Number(p.y) || 0) + offY) };
+            });
+          }
+          data.edges.push(edge);
+          const refs = createEdgeEls(edge);
+          edgeMap.set(edge.id, refs);
+          updateEdgePath(edge);
+          spawnEdgeEls(refs);
+        });
+      }
+
+      data.edges.forEach(updateEdgePath);
+      redrawMinimap();
+      if (newIds.length) {
+        selectNodes(newIds, false);
+        lastCreatedNodeId = newIds[newIds.length - 1];
+      }
+      hideOnboardingHint();
+      pushHistory();
+      notify();
+      return { ok: true, count: newIds.length };
+    };
+
+    // ── 阶段 3：把当前画布内容打包给 AI（"基于这张图补充 / 美化"用）──────
+    // 只摘正文节点(index/preview/card/sticky/code，不含装饰/图片/附件)，带 id 让 AI 能用 edges 连回已有卡片；
+    // 正文截断控制请求体大小。装饰、坐标、样式都不发——AI 只需要"有哪些卡片、讲什么、谁连谁"。
+    global.CanvasModule.describeCanvas = function (opts) {
+      opts = opts || {};
+      const maxNodes = opts.maxNodes || 60;
+      const excerptLen = opts.excerptLen || 200;
+      const outNodes = [];
+      const idSet = {};
+      const selectedOnly = !!opts.selectedOnly;
+      const selectedReadable = [];
+      if (selectedOnly) {
+        selectedNodeIds.forEach(function (id) {
+          const n = findNode(id);
+          if (isReadableNode(n)) selectedReadable.push(n);
+        });
+      }
+      const sourceNodes = selectedOnly ? selectedReadable : data.nodes;
+      for (let i = 0; i < sourceNodes.length && outNodes.length < maxNodes; i++) {
+        const n = sourceNodes[i];
+        if (!isReadableNode(n)) continue;
+        let body = String(n.body || '').trim();
+        if (body.length > excerptLen) body = body.slice(0, excerptLen) + '…';
+        outNodes.push({ id: n.id, kind: n.kind || 'card', title: String(n.text || '').trim(), excerpt: body });
+        idSet[n.id] = 1;
+      }
+      const outEdges = [];
+      data.edges.forEach(function (e) {
+        if (idSet[e.from] && idSet[e.to]) outEdges.push({ from: e.from, to: e.to, text: String(e.text || '') });
+      });
+      return { nodes: outNodes, edges: outEdges, scope: selectedOnly ? 'selection' : 'canvas' };
+    };
+
+    // ── 导出整张画布为 PNG（Phase 1）─────────────────────────────
+    // 收录：节点 / 连线 / 墨迹 / 图片 / 盒子 / 色块 / 背景；跳过 PDF 附件；数学公式暂作降级。
+    // 原理：克隆 surface → 内联图片与 styles.css → 塞进 <svg><foreignObject> → 画到 canvas → toBlob。
+    // （已实测本机 WebView2/Edge 下 foreignObject→canvas 不污染、可正常导出 PNG。）
+    global.CanvasModule.exportImage = function (opts) {
+      opts = opts || {};
+      if (editingNodeId !== null) commitNodeEdit();
+      if (editingEdgeId !== null) commitEdgeEdit();
+      if (textReaderEditing) finishTextReaderEdit();
+
+      // 1) 内容包围盒（节点 + 墨迹 + 连线，跳过 PDF）
+      const inkBox = inkBounds();
+      let minX = inkBox ? inkBox.minX : Infinity, minY = inkBox ? inkBox.minY : Infinity;
+      let maxX = inkBox ? inkBox.maxX : -Infinity, maxY = inkBox ? inkBox.maxY : -Infinity;
+      function includeExportBounds(box) {
+        if (!box) return;
+        const bx0 = Number(box.minX), by0 = Number(box.minY);
+        const bx1 = Number(box.maxX), by1 = Number(box.maxY);
+        if (!isFinite(bx0) || !isFinite(by0) || !isFinite(bx1) || !isFinite(by1)) return;
+        if (bx0 < minX) minX = bx0;
+        if (by0 < minY) minY = by0;
+        if (bx1 > maxX) maxX = bx1;
+        if (by1 > maxY) maxY = by1;
+      }
+      data.nodes.forEach(function (n) {
+        if (n.kind === 'pdf') return;
+        const el = nodeMap.get(n.id);
+        const w = el ? el.offsetWidth : 160;
+        const h = el ? el.offsetHeight : 36;
+        includeExportBounds({ minX: n.x, minY: n.y, maxX: n.x + w, maxY: n.y + h });
+      });
+
+      const exportEdges = [];
+      data.edges.forEach(function (edge) {
+        const src = findNode(edge.from);
+        const tgt = findNode(edge.to);
+        if (!src || !tgt || src.kind === 'pdf' || tgt.kind === 'pdf') return;
+        if (hiddenMindmapNodeIds.has(edge.from) || hiddenMindmapNodeIds.has(edge.to)
+            || hiddenGroupNodeIds.has(edge.from) || hiddenGroupNodeIds.has(edge.to)) return;
+        const rects = edgeCanvasRects(edge);
+        if (!rects) return;
+        const geom = edgeGeom(edge, rects.srcRect, rects.tgtRect);
+        const midpoint = cachedEdgeMidpoint(edge, geom);
+        const points = edgeCanvasPoints(edge, rects);
+        const bounds = edgeCanvasBounds(edge, rects, points);
+        exportEdges.push({ edge: edge, geom: geom, midpoint: midpoint, points: points, bounds: bounds });
+        includeExportBounds(bounds);
+        const refs = edgeMap.get(edge.id);
+        const label = refs && refs.labelEl;
+        if (label && !label.classList.contains('empty') && label.offsetWidth && label.offsetHeight) {
+          includeExportBounds({
+            minX: midpoint.x - label.offsetWidth / 2,
+            minY: midpoint.y - label.offsetHeight / 2,
+            maxX: midpoint.x + label.offsetWidth / 2,
+            maxY: midpoint.y + label.offsetHeight / 2,
+          });
+        }
+      });
+      if (!isFinite(minX) || !isFinite(minY) || maxX <= minX || maxY <= minY) {
+        return Promise.reject(new Error('画布是空的，没有可导出的内容'));
+      }
+      const PAD = 64;
+      const W = Math.ceil(maxX - minX) + PAD * 2;
+      const H = Math.ceil(maxY - minY) + PAD * 2;
+      // 高清倍率，限制最大边防超大 canvas 崩
+      const MAX_EDGE = 8000;
+      let scale = opts.scale || 2;
+      scale = Math.min(scale, MAX_EDGE / W, MAX_EDGE / H);
+      if (!(scale > 0)) scale = 1;
+
+      // 2) 克隆 surface，重置 transform 让内容落到 (PAD,PAD)
+      const clone = surface.cloneNode(true);
+      clone.style.transform = 'translate(' + (PAD - minX) + 'px,' + (PAD - minY) + 'px)';
+      clone.style.transformOrigin = '0 0';
+      clone.style.transition = 'none';
+      clone.style.animation = 'none';
+      clone.querySelectorAll('[data-attach-kind="pdf"]').forEach(function (e) { e.remove(); });
+      clone.querySelectorAll(
+        '.canvas-empty-hint, .decor-resize-handle, .edge-handle, .canvas-edge-hit, .frame-rect, .node-mindmap-fold'
+      ).forEach(function (e) { e.remove(); });
+      clone.querySelectorAll('.selected, .is-selected, .editing, .dragging').forEach(function (e) {
+        e.classList.remove('selected', 'is-selected', 'editing', 'dragging');
+      });
+      // 连线/墨迹 SVG 层固定 4000×3000，导出可能超出 → 不裁切
+      clone.querySelectorAll('.canvas-edges-layer, .canvas-ink-layer').forEach(function (svg) {
+        svg.style.overflow = 'visible';
+      });
+      materializeExportEdges(clone);
+
+      function exportMarker(layer, index, suffix, size, orient, color) {
+        let defs = layer.querySelector('defs');
+        if (!defs) {
+          defs = document.createElementNS(SVG_NS, 'defs');
+          layer.insertBefore(defs, layer.firstChild);
+        }
+        const id = 'export-mk-' + index + '-' + suffix;
+        const m = document.createElementNS(SVG_NS, 'marker');
+        m.setAttribute('id', id);
+        m.setAttribute('markerUnits', 'userSpaceOnUse');
+        m.setAttribute('markerWidth', size);
+        m.setAttribute('markerHeight', size);
+        m.setAttribute('refX', size * 0.9);
+        m.setAttribute('refY', size / 2);
+        m.setAttribute('orient', orient);
+        const tri = document.createElementNS(SVG_NS, 'path');
+        tri.setAttribute('d', 'M0,0 L' + size + ',' + (size / 2) + ' L0,' + size + ' Z');
+        tri.setAttribute('fill', color || '#000');
+        m.appendChild(tri);
+        defs.appendChild(m);
+        return id;
+      }
+
+      function materializeExportEdges(root) {
+        const layer = root.querySelector('.canvas-edges-layer');
+        if (!layer) return;
+        const paths = new Map();
+        Array.prototype.forEach.call(layer.querySelectorAll('.canvas-edge'), function (path) {
+          paths.set(path.dataset.id || '', path);
+        });
+        exportEdges.forEach(function (item, index) {
+          const edge = item.edge;
+          let path = paths.get(edge.id);
+          if (!path) {
+            path = document.createElementNS(SVG_NS, 'path');
+            path.setAttribute('class', 'canvas-edge');
+            path.dataset.id = edge.id;
+            layer.appendChild(path);
+          }
+          path.setAttribute('d', item.geom.d);
+          path.classList.remove('selected', 'edge-style-dashed', 'edge-style-dotted', 'edge-style-glow');
+          if (edge.width) path.style.setProperty('--edge-w', edge.width);
+          else path.style.removeProperty('--edge-w');
+          const style = edgeVisualLineStyle(edge);
+          if (style !== 'solid') path.classList.add('edge-style-' + style);
+          const color = edgeStrokeColor(edge);
+          path.style.stroke = color;
+          path.style.opacity = '1';
+          path.style.pointerEvents = 'none';
+          path.style.setProperty('--edge-color', color);
+          path.removeAttribute('marker-start');
+          path.removeAttribute('marker-end');
+          const arrow = edge.arrow || 'none';
+          if (arrow !== 'none') {
+            const size = Number(edge.arrowSize) || 12;
+            path.setAttribute('marker-end', 'url(#' + exportMarker(layer, index, 'e', size, 'auto', color) + ')');
+            if (arrow === 'both') {
+              path.setAttribute('marker-start', 'url(#' + exportMarker(layer, index, 's', size, 'auto-start-reverse', color) + ')');
+            }
+          }
+        });
+      }
+
+      // 3) 工具：内联所有 <img> 为 dataURI（data:SVG 里加载不到外部 URL）
+      function inlineImages(root) {
+        const imgs = Array.prototype.slice.call(root.querySelectorAll('img'));
+        return Promise.all(imgs.map(function (im) {
+          const src = im.getAttribute('src') || '';
+          if (!src || src.indexOf('data:') === 0) return Promise.resolve();
+          return fetch(src).then(function (r) { return r.blob(); }).then(function (b) {
+            return new Promise(function (res) {
+              const fr = new FileReader();
+              fr.onload = function () { im.setAttribute('src', fr.result); res(); };
+              fr.onerror = function () { res(); };
+              fr.readAsDataURL(b);
+            });
+          }).catch(function () {});
+        }));
+      }
+      // 背景：底色 + 尽力还原画布背景（纯色/渐变直接用，图片内联）。
+      // 背景图可能在 viewport::before（“画布背景”模式）或 immersive 元素::before（“沉浸背景”模式）。
+      function readBgImage(el, pseudo) {
+        try {
+          const bi = getComputedStyle(el, pseudo).backgroundImage;
+          if (bi && bi !== 'none') return bi;
+        } catch (e) {}
+        return '';
+      }
+      function exportBackground() {
+        let fill = '';
+        try { fill = getComputedStyle(viewport).getPropertyValue('--canvas-background-fill').trim(); } catch (e) {}
+        if (!fill || fill === 'transparent' || fill === 'rgba(0, 0, 0, 0)') {
+          try { fill = getComputedStyle(document.body).getPropertyValue('--bg').trim(); } catch (e) {}
+        }
+        if (!fill) fill = '#fbfbfa';
+        let image = readBgImage(viewport, '::before');
+        let opacity = '1';
+        if (!image) {
+          const imm = document.querySelector('[data-role="editor-immersive-background"]');
+          if (imm && getComputedStyle(imm).display !== 'none') {
+            image = readBgImage(imm, '::before');
+            try { opacity = (getComputedStyle(imm).getPropertyValue('--immersive-background-opacity').trim() || '1'); } catch (e) {}
+          }
+        }
+        const m = image && image.match(/url\(["']?([^"')]+)["']?\)/);
+        if (!m) return Promise.resolve({ fill: fill, image: image, opacity: opacity });
+        // 背景原图可能数 MB，直接内联会把 data:URL 撑爆（本机 img 约 7MB 上限）。
+        // 同源图片画到 canvas 不污染 → 重采样到导出尺寸（长边 ≤2000）并压成 JPEG，几百 KB。
+        return new Promise(function (res) {
+          const bgImg = new Image();
+          bgImg.onload = function () {
+            try {
+              const cap = 2000;
+              const sc = Math.min(1, cap / Math.max(W, H));
+              const tw = Math.max(1, Math.round(W * sc));
+              const th = Math.max(1, Math.round(H * sc));
+              const bc = document.createElement('canvas');
+              bc.width = tw; bc.height = th;
+              const bx = bc.getContext('2d');
+              bx.fillStyle = fill; bx.fillRect(0, 0, tw, th);   // 打底，避免 JPEG 无 alpha 处发黑
+              const iw = bgImg.naturalWidth || tw, ih = bgImg.naturalHeight || th;
+              const cover = Math.max(tw / iw, th / ih);          // object-fit: cover
+              const dw = iw * cover, dh = ih * cover;
+              bx.drawImage(bgImg, (tw - dw) / 2, (th - dh) / 2, dw, dh);
+              // 单引号包 url——bgLayer 的 style 属性用双引号，内层不能再用双引号否则截断 XML
+              res({ fill: fill, image: "url('" + bc.toDataURL('image/jpeg', 0.82) + "')", opacity: opacity });
+            } catch (e) { res({ fill: fill, image: '', opacity: opacity }); }
+          };
+          bgImg.onerror = function () { res({ fill: fill, image: '', opacity: opacity }); };
+          bgImg.src = m[1];
+        });
+      }
+
+      return Promise.all([
+        fetch('styles.css').then(function (r) { return r.text(); }),
+        inlineImages(clone),
+        exportBackground(),
+      ]).then(function (arr) {
+        const css = arr[0];
+        const bg = arr[2];
+        const cloneHtml = new XMLSerializer().serializeToString(clone);
+        const bgLayer = '<div style="position:absolute;inset:0;background-color:' + bg.fill + ';"></div>'
+          + (bg.image ? '<div style="position:absolute;inset:0;background-image:' + bg.image
+              + ';background-size:cover;background-position:center;opacity:' + (bg.opacity || '1') + ';"></div>' : '');
+        const root = '<div xmlns="http://www.w3.org/1999/xhtml" style="position:relative;width:'
+          + W + 'px;height:' + H + 'px;overflow:hidden;">'
+          + '<style><![CDATA[' + css + ']]></style>' + bgLayer + cloneHtml + '</div>';
+        const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H + '">'
+          + '<foreignObject x="0" y="0" width="' + W + '" height="' + H + '">' + root + '</foreignObject></svg>';
+        // 必须用 data: URL，不能用 blob: URL——本机 WebView2/Edge 下含 foreignObject 的
+        // SVG 经 blob: 加载会污染 canvas（toBlob 抛 SecurityError），data: 则干净。已实测确认。
+        const dataUrl = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+        return new Promise(function (resolve, reject) {
+          const img = new Image();
+          img.onload = function () {
+            try {
+              const cnv = document.createElement('canvas');
+              cnv.width = Math.round(W * scale);
+              cnv.height = Math.round(H * scale);
+              const ctx = cnv.getContext('2d');
+              ctx.scale(scale, scale);
+              ctx.drawImage(img, 0, 0);
+              cnv.toBlob(function (blob) {
+                if (blob) resolve({ blob: blob, width: cnv.width, height: cnv.height });
+                else reject(new Error('PNG 生成失败'));
+              }, 'image/png');
+            } catch (e) { reject(e); }
+          };
+          img.onerror = function () { reject(new Error('画布快照渲染失败')); };
+          img.src = dataUrl;
+        });
+      });
+    };
+
+    // ── 脑图自动排版（#2）──────────────────────
+    // 选中心（选区里连线最多者，平局取最靠近选区中心）→ 沿已有连线 BFS 建多层树
+    // → 按布局算坐标 → 锚定中心、移动其余节点；复用既有连线渲染。
+    // 选中单个 = 展开其整个连通分量；多选 = 只排选中集合，未连线的散节点自动连到中心。
+    function mindmapPickCenter(sel, nodeSet) {
+      const deg = new Map();
+      sel.forEach(function (n) { deg.set(n.id, 0); });
+      data.edges.forEach(function (e) {
+        if (e.from !== e.to && nodeSet.has(e.from) && nodeSet.has(e.to)) {
+          deg.set(e.from, (deg.get(e.from) || 0) + 1);
+          deg.set(e.to, (deg.get(e.to) || 0) + 1);
+        }
+      });
+      let cx = 0, cy = 0;
+      sel.forEach(function (n) { const r = nodeRect(n); cx += r.x + r.w / 2; cy += r.y + r.h / 2; });
+      cx /= sel.length; cy /= sel.length;
+      let best = sel[0], bestDeg = -1, bestDist = Infinity;
+      sel.forEach(function (n) {
+        const d = deg.get(n.id) || 0;
+        const r = nodeRect(n);
+        const dist = Math.hypot(r.x + r.w / 2 - cx, r.y + r.h / 2 - cy);
+        if (d > bestDeg || (d === bestDeg && dist < bestDist)) { best = n; bestDeg = d; bestDist = dist; }
+      });
+      return best;
+    }
+    function buildMindmapTree() {
+      const sel = [...selectedNodeIds].map(findNode).filter(function (n) { return n && !isDecorationNode(n); });
+      if (sel.length === 0) return null;
+      const neighborIndex = buildMindmapNeighborIndex();
+      let nodeSet, center;
+      if (sel.length === 1) {
+        center = sel[0];
+        const visited = new Set([center.id]);
+        const queue = [center.id];
+        for (let queueIndex = 0; queueIndex < queue.length; queueIndex++) {
+          const id = queue[queueIndex];
+          (neighborIndex.get(id) || []).forEach(function (other) {
+            if (!visited.has(other)) { visited.add(other); queue.push(other); }
+          });
+        }
+        nodeSet = visited;
+      } else {
+        nodeSet = new Set(sel.map(function (n) { return n.id; }));
+        center = mindmapPickCenter(sel, nodeSet);
+      }
+      const adj = new Map();
+      nodeSet.forEach(function (id) { adj.set(id, []); });
+      nodeSet.forEach(function (id) {
+        (neighborIndex.get(id) || []).forEach(function (other) {
+          if (nodeSet.has(other)) adj.get(id).push(other);
+        });
+      });
+      const depth = new Map([[center.id, 0]]);
+      const childrenOf = new Map();
+      nodeSet.forEach(function (id) { childrenOf.set(id, []); });
+      const visited = new Set([center.id]);
+      const q = [center.id];
+      for (let qi = 0; qi < q.length; qi++) {
+        const id = q[qi];
+        (adj.get(id) || []).forEach(function (other) {
+          if (!visited.has(other)) {
+            visited.add(other);
+            depth.set(other, depth.get(id) + 1);
+            childrenOf.get(id).push(other);
+            q.push(other);
+          }
+        });
+      }
+      const newEdges = [];
+      nodeSet.forEach(function (id) {            // 未连线的散节点 → 自动连到中心
+        if (!visited.has(id)) {
+          visited.add(id);
+          depth.set(id, 1);
+          childrenOf.get(center.id).push(id);
+          newEdges.push({ from: center.id, to: id });
+        }
+      });
+      return { center: center, nodeSet: nodeSet, childrenOf: childrenOf, depth: depth, newEdges: newEdges };
+    }
+    // 连续录入脑图时使用：以当前单选节点为根，只沿 parent → child 方向整理后代。
+    // 自由连线和祖先分支不会被卷进来，适合随手把某一枝重新排整齐。
+    function buildMindmapBranchTree() {
+      const sel = [...selectedNodeIds].map(findNode).filter(function (n) { return n && !isDecorationNode(n); });
+      if (sel.length !== 1) return null;
+      const center = sel[0];
+      const childrenIndex = buildMindmapChildrenIndex();
+      const nodeSet = new Set([center.id]);
+      const childrenOf = new Map([[center.id, []]]);
+      const depth = new Map([[center.id, 0]]);
+      const q = [center.id];
+      for (let qi = 0; qi < q.length; qi++) {
+        const id = q[qi];
+        const parent = findNode(id);
+        directMindmapChildrenOf(parent, childrenIndex).forEach(function (child) {
+          if (nodeSet.has(child.id)) return;
+          nodeSet.add(child.id);
+          childrenOf.set(child.id, []);
+          childrenOf.get(id).push(child.id);
+          depth.set(child.id, depth.get(id) + 1);
+          q.push(child.id);
+        });
+      }
+      return { center: center, nodeSet: nodeSet, childrenOf: childrenOf, depth: depth, newEdges: [] };
+    }
+    function buildMindmapTreeForScope(scope) {
+      return scope === 'branch' ? buildMindmapBranchTree() : buildMindmapTree();
+    }
+
+    function markMindmapRoot(tree) {
+      if (!tree || !tree.center || !tree.nodeSet) return;
+      tree.nodeSet.forEach(function (id) {
+        const node = findNode(id);
+        if (!node) return;
+        if (id === tree.center.id) node.mindmapRoot = true;
+        else delete node.mindmapRoot;
+      });
+    }
+
+    // “预设”只负责外观；脑图中心是独立的轻量结构标记。套用脑图样式时把
+    // BFS 树边统一为 parent → child，后续 Tab、折叠与结构拖拽都可稳定复用。
+    function orientMindmapTreeEdges(tree) {
+      if (!tree || !tree.childrenOf) return;
+      const edgesByEndpoint = new Map();
+      data.edges.forEach(function (edge) {
+        let from = edgesByEndpoint.get(edge.from);
+        if (!from) { from = new Map(); edgesByEndpoint.set(edge.from, from); }
+        if (!from.has(edge.to)) from.set(edge.to, edge);
+        let to = edgesByEndpoint.get(edge.to);
+        if (!to) { to = new Map(); edgesByEndpoint.set(edge.to, to); }
+        if (!to.has(edge.from)) to.set(edge.from, edge);
+      });
+      tree.childrenOf.forEach(function (kids, parentId) {
+        kids.forEach(function (childId) {
+          const endpoints = edgesByEndpoint.get(parentId);
+          const edge = endpoints && endpoints.get(childId);
+          if (!edge || edge.from === parentId) return;
+          edge.from = parentId;
+          edge.to = childId;
+          updateEdgePath(edge);
+        });
+      });
+    }
+
+    function mindmapConnectedComponent(node) {
+      const nodeSet = new Set();
+      if (!node || isDecorationNode(node)) return nodeSet;
+      const neighborIndex = buildMindmapNeighborIndex();
+      const queue = [node.id];
+      nodeSet.add(node.id);
+      for (let queueIndex = 0; queueIndex < queue.length; queueIndex++) {
+        const id = queue[queueIndex];
+        (neighborIndex.get(id) || []).forEach(function (otherId) {
+          if (nodeSet.has(otherId)) return;
+          nodeSet.add(otherId);
+          queue.push(otherId);
+        });
+      }
+      return nodeSet;
+    }
+
+    // 结构拖拽只接管真正的有向树。旧画布没有 mindmapRoot 时，可从唯一入度 0
+    // 的节点推断中心；循环、重复父级或交叉连接留给普通模式自由处理。
+    function buildManagedMindmapTree(node) {
+      const nodeSet = mindmapConnectedComponent(node);
+      if (!nodeSet.size) return { valid: false, reason: 'empty', nodeSet: nodeSet };
+      const internalEdges = data.edges.filter(function (edge) {
+        return edge.from !== edge.to && nodeSet.has(edge.from) && nodeSet.has(edge.to);
+      });
+      if (internalEdges.length !== Math.max(0, nodeSet.size - 1)) {
+        return { valid: false, reason: 'cross-links', nodeSet: nodeSet };
+      }
+      const marked = [];
+      const indegree = new Map();
+      nodeSet.forEach(function (id) {
+        indegree.set(id, 0);
+        const candidate = findNode(id);
+        if (candidate && candidate.mindmapRoot) marked.push(candidate);
+      });
+      internalEdges.forEach(function (edge) {
+        indegree.set(edge.to, (indegree.get(edge.to) || 0) + 1);
+      });
+      let center = marked.length === 1 ? marked[0] : null;
+      if (!center) {
+        const roots = [];
+        nodeSet.forEach(function (id) {
+          if ((indegree.get(id) || 0) === 0) roots.push(findNode(id));
+        });
+        if (roots.length === 1) center = roots[0];
+      }
+      if (!center) return { valid: false, reason: 'no-root', nodeSet: nodeSet };
+      if ((indegree.get(center.id) || 0) !== 0) {
+        return { valid: false, reason: 'root-has-parent', nodeSet: nodeSet };
+      }
+      const childrenOf = new Map();
+      const parentOf = new Map();
+      const depth = new Map([[center.id, 0]]);
+      nodeSet.forEach(function (id) { childrenOf.set(id, []); });
+      let invalidParent = false;
+      internalEdges.forEach(function (edge) {
+        if ((indegree.get(edge.to) || 0) !== 1) invalidParent = true;
+        childrenOf.get(edge.from).push(edge.to);
+        parentOf.set(edge.to, edge.from);
+      });
+      if (invalidParent) return { valid: false, reason: 'multiple-parents', nodeSet: nodeSet };
+      const visited = new Set([center.id]);
+      const queue = [center.id];
+      for (let queueIndex = 0; queueIndex < queue.length; queueIndex++) {
+        const id = queue[queueIndex];
+        (childrenOf.get(id) || []).forEach(function (childId) {
+          if (visited.has(childId)) return;
+          visited.add(childId);
+          depth.set(childId, (depth.get(id) || 0) + 1);
+          queue.push(childId);
+        });
+      }
+      if (visited.size !== nodeSet.size) {
+        return { valid: false, reason: 'disconnected-direction', nodeSet: nodeSet };
+      }
+      return {
+        valid: true,
+        center: center,
+        nodeSet: nodeSet,
+        childrenOf: childrenOf,
+        parentOf: parentOf,
+        depth: depth,
+        newEdges: [],
+        inferredRoot: marked.length !== 1,
+      };
+    }
+
+    function mindmapSubtreeNodeIds(tree, rootId) {
+      const ids = new Set();
+      function collect(id) {
+        if (ids.has(id)) return;
+        ids.add(id);
+        (tree.childrenOf.get(id) || []).forEach(collect);
+      }
+      collect(rootId);
+      return ids;
+    }
+
+    function mindmapSubtreeTree(tree, rootId) {
+      const nodeSet = mindmapSubtreeNodeIds(tree, rootId);
+      const childrenOf = new Map();
+      const depth = new Map([[rootId, 0]]);
+      function copy(id, d) {
+        const kids = (tree.childrenOf.get(id) || []).filter(function (kid) { return nodeSet.has(kid); });
+        childrenOf.set(id, kids.slice());
+        kids.forEach(function (kid) {
+          depth.set(kid, d + 1);
+          copy(kid, d + 1);
+        });
+      }
+      copy(rootId, 0);
+      return {
+        center: findNode(rootId),
+        nodeSet: nodeSet,
+        childrenOf: childrenOf,
+        depth: depth,
+        newEdges: [],
+      };
+    }
+
+    // 保留用户肉眼看到的顺序：横向树按上下排，纵向树按左右排。
+    // 这样重复整理不会因为 edge 的存储顺序而让枝条换位。
+    function sortMindmapChildren(tree, horizontal) {
+      tree.childrenOf.forEach(function (kids, parentId) {
+        const override = tree.orderOverrides && tree.orderOverrides.get(parentId);
+        if (override && override.length) {
+          const rank = new Map();
+          override.forEach(function (id, idx) { rank.set(id, idx); });
+          kids.sort(function (a, b) {
+            const ar = rank.has(a) ? rank.get(a) : Number.MAX_SAFE_INTEGER;
+            const br = rank.has(b) ? rank.get(b) : Number.MAX_SAFE_INTEGER;
+            if (ar !== br) return ar - br;
+            const ap = nodeRect(findNode(a)), bp = nodeRect(findNode(b));
+            return horizontal
+              ? (ap.y + ap.h / 2) - (bp.y + bp.h / 2)
+              : (ap.x + ap.w / 2) - (bp.x + bp.w / 2);
+          });
+          return;
+        }
+        kids.sort(function (a, b) {
+          const ar = nodeRect(findNode(a)), br = nodeRect(findNode(b));
+          const ap = horizontal ? ar.y + ar.h / 2 : ar.x + ar.w / 2;
+          const bp = horizontal ? br.y + br.h / 2 : br.x + br.w / 2;
+          return ap - bp;
+        });
+      });
+    }
+    function mindmapLayoutOptions(options) {
+      options = options || {};
+      const densityDefaults = {
+        compact: { branchGap: 20, levelGap: 68, radialGap: 180 },
+        balanced: { branchGap: 32, levelGap: 92, radialGap: 220 },
+        relaxed: { branchGap: 46, levelGap: 122, radialGap: 270 },
+      };
+      const density = densityDefaults[options.density] ? options.density : 'balanced';
+      const base = densityDefaults[density];
+      const read = function (key, min, max) {
+        const n = Number(options[key]);
+        return Number.isFinite(n) ? clampValue(n, min, max) : base[key];
+      };
+      return {
+        branchGap: read('branchGap', 14, 96),
+        levelGap: read('levelGap', 56, 180),
+        radialGap: read('radialGap', 140, 360),
+      };
+    }
+    function mindmapSubtreeSpread(tree, id, horizontal, opts) {
+      const kids = tree.childrenOf.get(id) || [];
+      const r = nodeRect(findNode(id));
+      const own = horizontal ? r.h : r.w;
+      if (!kids.length) return own;
+      let total = 0;
+      kids.forEach(function (kid, idx) {
+        total += mindmapSubtreeSpread(tree, kid, horizontal, opts);
+        if (idx > 0) total += opts.branchGap;
+      });
+      return Math.max(own, total);
+    }
+    function mindmapSideTree(tree, rootKids) {
+      const nodeSet = new Set([tree.center.id]);
+      const childrenOf = new Map([[tree.center.id, rootKids.slice()]]);
+      const depth = new Map([[tree.center.id, 0]]);
+      function copy(id) {
+        nodeSet.add(id);
+        depth.set(id, tree.depth.get(id) || 1);
+        const kids = (tree.childrenOf.get(id) || []).slice();
+        childrenOf.set(id, kids);
+        kids.forEach(copy);
+      }
+      rootKids.forEach(copy);
+      const orderOverrides = new Map();
+      if (tree.orderOverrides) {
+        tree.orderOverrides.forEach(function (order, parentId) {
+          if (!nodeSet.has(parentId)) return;
+          const filtered = order.filter(function (id) { return nodeSet.has(id); });
+          if (filtered.length) orderOverrides.set(parentId, filtered);
+        });
+      }
+      return {
+        center: tree.center,
+        nodeSet: nodeSet,
+        childrenOf: childrenOf,
+        depth: depth,
+        newEdges: [],
+        orderOverrides: orderOverrides,
+      };
+    }
+    function layoutMindmapTree(tree, orient, options) {
+      const horizontal = (orient === 'right' || orient === 'left');
+      const opts = mindmapLayoutOptions(options);
+      sortMindmapChildren(tree, horizontal);
+      const sizeSpread = function (id) { const r = nodeRect(findNode(id)); return horizontal ? r.h : r.w; };
+      const sizeDepth = function (id) { const r = nodeRect(findNode(id)); return horizontal ? r.w : r.h; };
+      const maxByDepth = [];
+      tree.nodeSet.forEach(function (id) {
+        const d = tree.depth.get(id);
+        maxByDepth[d] = Math.max(maxByDepth[d] || 0, sizeDepth(id));
+      });
+      const depthCenter = [];
+      let acc = 0;
+      for (let d = 0; d < maxByDepth.length; d++) {
+        depthCenter[d] = acc + (maxByDepth[d] || 0) / 2;
+        acc += (maxByDepth[d] || 0) + opts.levelGap;
+      }
+      const spreadPos = new Map();
+      let cursor = 0;
+      function place(id) {
+        const kids = tree.childrenOf.get(id) || [];
+        if (kids.length === 0) {
+          const sz = sizeSpread(id);
+          spreadPos.set(id, cursor + sz / 2);
+          cursor += sz + opts.branchGap;
+        } else {
+          kids.forEach(place);
+          spreadPos.set(id, (spreadPos.get(kids[0]) + spreadPos.get(kids[kids.length - 1])) / 2);
+        }
+      }
+      place(tree.center.id);
+      const local = new Map();
+      tree.nodeSet.forEach(function (id) {
+        let depthC = depthCenter[tree.depth.get(id)];
+        if (orient === 'left') depthC = -depthC;
+        const spreadC = spreadPos.get(id);
+        local.set(id, horizontal ? { cx: depthC, cy: spreadC } : { cx: spreadC, cy: depthC });
+      });
+      return local;
+    }
+    function layoutMindmapRadial(tree, options) {
+      const opts = mindmapLayoutOptions(options);
+      sortMindmapChildren(tree, true);
+      const leaves = new Map();
+      function countLeaves(id) {
+        const kids = tree.childrenOf.get(id) || [];
+        if (!kids.length) { leaves.set(id, 1); return 1; }
+        let s = 0; kids.forEach(function (k) { s += countLeaves(k); });
+        leaves.set(id, s); return s;
+      }
+      countLeaves(tree.center.id);
+      const local = new Map([[tree.center.id, { cx: 0, cy: 0 }]]);
+      function assign(id, a0, a1) {
+        const kids = tree.childrenOf.get(id) || [];
+        const total = leaves.get(id) || 1;
+        let a = a0;
+        kids.forEach(function (k) {
+          const frac = (leaves.get(k) || 1) / total;
+          const ka1 = a + (a1 - a0) * frac;
+          const mid = (a + ka1) / 2;
+          const r = tree.depth.get(k) * opts.radialGap;
+          local.set(k, { cx: r * Math.cos(mid), cy: r * Math.sin(mid) });
+          assign(k, a, ka1);
+          a = ka1;
+        });
+      }
+      assign(tree.center.id, -Math.PI / 2, Math.PI * 1.5);
+      return local;
+    }
+    function layoutMindmapBalanced(tree, options) {
+      const opts = mindmapLayoutOptions(options);
+      sortMindmapChildren(tree, true);
+      const rootKids = (tree.childrenOf.get(tree.center.id) || []).slice();
+      const local = new Map([[tree.center.id, { cx: 0, cy: 0 }]]);
+      if (!rootKids.length) return local;
+      const weights = new Map();
+      rootKids.forEach(function (kid) {
+        weights.set(kid, mindmapSubtreeSpread(tree, kid, true, opts));
+      });
+      const leftKids = [];
+      const rightKids = [];
+      let leftTotal = 0;
+      let rightTotal = 0;
+      const centerRect = nodeRect(tree.center);
+      const centerX = centerRect.x + centerRect.w / 2;
+      const existingLeft = [];
+      const existingRight = [];
+      rootKids.forEach(function (kid) {
+        const forcedSide = tree.sideOverrides && tree.sideOverrides.get(kid);
+        if (forcedSide === -1) { existingLeft.push(kid); return; }
+        if (forcedSide === 1) { existingRight.push(kid); return; }
+        const r = nodeRect(findNode(kid));
+        (r.x + r.w / 2 < centerX ? existingLeft : existingRight).push(kid);
+      });
+      if (options && options.preserveSides !== false && (existingLeft.length || existingRight.length)) {
+        existingLeft.forEach(function (kid) { leftKids.push(kid); leftTotal += weights.get(kid) || 1; });
+        existingRight.forEach(function (kid) { rightKids.push(kid); rightTotal += weights.get(kid) || 1; });
+      } else {
+        rootKids.forEach(function (kid) {
+          const w = weights.get(kid) || 1;
+          if (!rightKids.length || rightTotal <= leftTotal) {
+            rightKids.push(kid);
+            rightTotal += w;
+          } else {
+            leftKids.push(kid);
+            leftTotal += w;
+          }
+        });
+      }
+      if (!leftKids.length && rightKids.length > 1 && !(options && options.allowSingleSide)) {
+        const moved = rightKids.pop();
+        leftKids.push(moved);
+      }
+      if (!rightKids.length && leftKids.length > 1 && !(options && options.allowSingleSide)) {
+        const moved = leftKids.pop();
+        rightKids.push(moved);
+      }
+      function mergeSide(source) {
+        const root = source.get(tree.center.id) || { cx: 0, cy: 0 };
+        source.forEach(function (pt, id) {
+          if (id === tree.center.id) return;
+          local.set(id, { cx: pt.cx - root.cx, cy: pt.cy - root.cy });
+        });
+      }
+      if (rightKids.length) mergeSide(layoutMindmapTree(mindmapSideTree(tree, rightKids), 'right', options));
+      if (leftKids.length) mergeSide(layoutMindmapTree(mindmapSideTree(tree, leftKids), 'left', options));
+      return local;
+    }
+    function resolveMindmapLayout(tree, layout) {
+      if (layout === 'right' || layout === 'left' || layout === 'down' || layout === 'radial' || layout === 'balanced') {
+        return layout;
+      }
+      const parent = mindmapParentOf(tree.center);
+      if (!parent) return 'balanced';
+      return mindmapChildDirection(parent, tree.center);
+    }
+    function mindmapDepthOffsets(tree, horizontal, options) {
+      const opts = mindmapLayoutOptions(options);
+      const maxByDepth = [];
+      tree.nodeSet.forEach(function (id) {
+        const r = nodeRect(findNode(id));
+        const d = tree.depth.get(id) || 0;
+        const size = horizontal ? r.w : r.h;
+        maxByDepth[d] = Math.max(maxByDepth[d] || 0, size);
+      });
+      const centers = [];
+      let acc = 0;
+      for (let d = 0; d < maxByDepth.length; d++) {
+        centers[d] = acc + (maxByDepth[d] || 0) / 2;
+        acc += (maxByDepth[d] || 0) + opts.levelGap;
+      }
+      const rootCenter = centers[0] || 0;
+      return centers.map(function (value) { return value - rootCenter; });
+    }
+    function alignMindmapLocal(tree, layout, options) {
+      const resolved = resolveMindmapLayout(tree, layout);
+      const rootRect = nodeRect(tree.center);
+      const anchorX = rootRect.x + rootRect.w / 2;
+      const anchorY = rootRect.y + rootRect.h / 2;
+      const local = new Map([[tree.center.id, { cx: 0, cy: 0 }]]);
+      if (resolved === 'radial') {
+        const opts = mindmapLayoutOptions(options);
+        const fallback = layoutMindmapRadial(tree, options);
+        tree.nodeSet.forEach(function (id) {
+          if (id === tree.center.id) return;
+          const r = nodeRect(findNode(id));
+          let dx = r.x + r.w / 2 - anchorX;
+          let dy = r.y + r.h / 2 - anchorY;
+          if (Math.hypot(dx, dy) < 1) {
+            const pt = fallback.get(id) || { cx: 1, cy: 0 };
+            dx = pt.cx; dy = pt.cy;
+          }
+          const angle = Math.atan2(dy, dx);
+          const radius = (tree.depth.get(id) || 0) * opts.radialGap;
+          local.set(id, { cx: Math.cos(angle) * radius, cy: Math.sin(angle) * radius });
+        });
+        return local;
+      }
+      const horizontal = resolved !== 'down';
+      const offsets = mindmapDepthOffsets(tree, horizontal, options);
+      const sideOf = new Map([[tree.center.id, 0]]);
+      if (resolved === 'balanced') {
+        (tree.childrenOf.get(tree.center.id) || []).forEach(function markBranch(kid) {
+          const r = nodeRect(findNode(kid));
+          const side = r.x + r.w / 2 < anchorX ? -1 : 1;
+          const mark = function (id) {
+            sideOf.set(id, side);
+            (tree.childrenOf.get(id) || []).forEach(mark);
+          };
+          mark(kid);
+        });
+      }
+      tree.nodeSet.forEach(function (id) {
+        if (id === tree.center.id) return;
+        const r = nodeRect(findNode(id));
+        const d = tree.depth.get(id) || 0;
+        const offset = offsets[d] || 0;
+        if (resolved === 'down') {
+          local.set(id, { cx: r.x + r.w / 2 - anchorX, cy: offset });
+        } else {
+          const side = resolved === 'left' ? -1 : (resolved === 'right' ? 1 : (sideOf.get(id) || 1));
+          local.set(id, { cx: side * offset, cy: r.y + r.h / 2 - anchorY });
+        }
+      });
+      return local;
+    }
+    // 脑图滑行收尾：把会动的节点贴到终态、连线全部重算、刷新小地图。中断或动画结束都走它。
+    function finishMindmapGlide() {
+      if (mindmapGlideRaf != null) { cancelAnimationFrame(mindmapGlideRaf); mindmapGlideRaf = null; }
+      const st = mindmapGlideState;
+      mindmapGlideState = null;
+      if (!st) return;
+      st.moves.forEach(function (m) { m.el.classList.remove('mm-gliding'); applyTransform(m.el, m.toX, m.toY); });
+      edgeCanvasLiveCoords = null;
+      data.edges.forEach(updateEdgePath);
+      renderEdgesCanvas();
+      setEdgesSvgLive(false);
+      redrawMinimap();
+    }
+
+    const MINDMAP_DEFAULT_SIZE_PERCENT = Object.freeze({ center: 110, branch: 100, leaf: 85 });
+    const MINDMAP_STYLE_PRESETS = {
+      paper: {
+        colors: ['#5a9eab', '#d0ad4e', '#b66c82', '#6f8a61', '#8e6bc2', '#c98562'],
+        center: { bgColor: '#f8fbfa', borderColor: '#305b62', opacity: 0.98, scale: 1.06, nodeWidth: 240, minWidth: 132, maxWidth: 300, fontWeight: 650, radius: 8, textAlign: 'center' },
+        branch: { bgMix: 0.88, opacity: 0.96, scale: 0.95, nodeWidth: 198, minWidth: 104, maxWidth: 240, fontWeight: 590, radius: 7, textAlign: 'left', width: 2.4, curve: 'branch', lineStyle: 'solid' },
+        leaf: { bgMix: 0.94, opacity: 0.92, scale: 0.86, nodeWidth: 168, minWidth: 72, maxWidth: 210, fontWeight: 470, radius: 6, textAlign: 'left', width: 1.8, curve: 'branch', lineStyle: 'solid' },
+      },
+      scholar: {
+        colors: ['#526c92', '#6f8a61', '#a77252', '#7b6ea8', '#9d6d73', '#4f8080'],
+        center: { bgColor: '#f5f2ea', borderColor: '#2f3437', opacity: 0.98, scale: 1.04, nodeWidth: 244, minWidth: 154, maxWidth: 324, fontWeight: 680, radius: 4, textAlign: 'left' },
+        branch: { bgMix: 0.90, opacity: 0.94, scale: 0.94, nodeWidth: 204, minWidth: 118, maxWidth: 260, fontWeight: 620, radius: 4, textAlign: 'left', width: 2.2, curve: 'bezier', lineStyle: 'solid' },
+        leaf: { bgMix: 0.96, opacity: 0.90, scale: 0.85, nodeWidth: 172, minWidth: 82, maxWidth: 230, fontWeight: 460, radius: 3, textAlign: 'left', width: 1.6, curve: 'bezier', lineStyle: 'soft' },
+      },
+      journal: {
+        colors: ['#e49488', '#77b9a9', '#d6b96a', '#9aaed6', '#c692b4', '#8fb783'],
+        center: { bgColor: '#fff8ed', borderColor: '#b67f59', opacity: 0.98, scale: 1.06, nodeWidth: 236, minWidth: 128, maxWidth: 286, fontWeight: 650, radius: 8, textAlign: 'center' },
+        branch: { bgMix: 0.82, opacity: 0.96, scale: 0.96, nodeWidth: 196, minWidth: 96, maxWidth: 232, fontWeight: 590, radius: 8, textAlign: 'left', width: 2.6, curve: 'organic', lineStyle: 'solid' },
+        leaf: { bgMix: 0.91, opacity: 0.92, scale: 0.87, nodeWidth: 166, minWidth: 68, maxWidth: 204, fontWeight: 470, radius: 7, textAlign: 'left', width: 1.8, curve: 'organic', lineStyle: 'soft' },
+      },
+      ink: {
+        colors: ['#2f3437', '#6f777c', '#8d8378', '#57676a', '#7a6f87', '#75806b'],
+        center: { bgColor: '#fbfbfa', borderColor: '#1f2325', opacity: 1, scale: 1.03, nodeWidth: 232, minWidth: 142, maxWidth: 300, fontWeight: 690, radius: 3, textAlign: 'left' },
+        branch: { bgMix: 0.96, opacity: 0.94, scale: 0.93, nodeWidth: 192, minWidth: 108, maxWidth: 248, fontWeight: 620, radius: 2, textAlign: 'left', width: 2, curve: 'straight', lineStyle: 'solid' },
+        leaf: { bgMix: 0.985, opacity: 0.90, scale: 0.84, nodeWidth: 162, minWidth: 74, maxWidth: 220, fontWeight: 460, radius: 2, textAlign: 'left', width: 1.4, curve: 'straight', lineStyle: 'soft' },
+      },
+      forest: {
+        colors: ['#4f7b62', '#bb8e3d', '#9b5f5f', '#4d7f86', '#786b48', '#74628a'],
+        center: { bgColor: '#f3f6f0', borderColor: '#315945', opacity: 1, scale: 1.08, nodeWidth: 242, minWidth: 160, maxWidth: 326, fontWeight: 720, radius: 5, textAlign: 'left' },
+        branch: { bgMix: 0.78, opacity: 0.98, scale: 0.97, nodeWidth: 200, minWidth: 132, maxWidth: 270, fontWeight: 660, radius: 5, textAlign: 'left', width: 2.8, curve: 'branch', lineStyle: 'solid' },
+        leaf: { bgMix: 0.94, opacity: 0.96, scale: 0.86, nodeWidth: 168, minWidth: 64, maxWidth: 224, fontWeight: 490, radius: 4, textAlign: 'left', width: 1.7, curve: 'branch', lineStyle: 'soft' },
+      },
+      blueprint: {
+        colors: ['#3d648f', '#3f8c8c', '#d07b5d', '#c3a33b', '#6c73a6', '#658553'],
+        center: { bgColor: '#f3f7fa', borderColor: '#294d73', opacity: 0.99, scale: 1.06, nodeWidth: 246, minWidth: 148, maxWidth: 316, fontWeight: 690, radius: 6, textAlign: 'center' },
+        branch: { bgMix: 0.86, opacity: 0.97, scale: 0.95, nodeWidth: 202, minWidth: 112, maxWidth: 252, fontWeight: 610, radius: 6, textAlign: 'left', width: 2.5, curve: 's-curve', lineStyle: 'solid' },
+        leaf: { bgMix: 0.94, opacity: 0.92, scale: 0.85, nodeWidth: 170, minWidth: 76, maxWidth: 220, fontWeight: 470, radius: 5, textAlign: 'left', width: 1.7, curve: 'branch', lineStyle: 'soft' },
+      },
+      classroom: {
+        colors: ['#d94f4f', '#e7a62d', '#2f9b77', '#337dc1', '#8d5eb5', '#d66d9a'],
+        center: { bgColor: '#fffdf8', borderColor: '#33383c', opacity: 1, scale: 1.08, nodeWidth: 250, minWidth: 154, maxWidth: 330, fontWeight: 760, radius: 7, textAlign: 'center' },
+        branch: { bgMix: 0.76, opacity: 0.98, scale: 0.97, nodeWidth: 206, minWidth: 126, maxWidth: 276, fontWeight: 700, radius: 6, textAlign: 'center', width: 3, curve: 'elbow', lineStyle: 'solid' },
+        leaf: { bgMix: 0.90, opacity: 0.94, scale: 0.87, nodeWidth: 172, minWidth: 82, maxWidth: 228, fontWeight: 520, radius: 5, textAlign: 'left', width: 1.9, curve: 'rounded-elbow', lineStyle: 'solid' },
+      },
+      editorial: {
+        colors: ['#25282b', '#c5534f', '#4f8fa3', '#c0953d', '#66805a', '#88678b'],
+        center: { bgColor: '#faf9f5', borderColor: '#25282b', opacity: 1, scale: 1.05, nodeWidth: 238, minWidth: 170, maxWidth: 340, fontWeight: 740, radius: 2, textAlign: 'left' },
+        branch: { bgMix: 0.91, opacity: 0.97, scale: 0.94, nodeWidth: 198, minWidth: 124, maxWidth: 272, fontWeight: 660, radius: 2, textAlign: 'left', width: 2.4, curve: 'arc', lineStyle: 'solid' },
+        leaf: { bgMix: 0.97, opacity: 0.91, scale: 0.84, nodeWidth: 164, minWidth: 70, maxWidth: 224, fontWeight: 460, radius: 2, textAlign: 'left', width: 1.5, curve: 'straight', lineStyle: 'soft' },
+      },
+    };
+
+    function mindmapPreset(id) {
+      return MINDMAP_STYLE_PRESETS[id] || MINDMAP_STYLE_PRESETS.paper;
+    }
+    function mindmapPercentFactor(value, fallback) {
+      if (value == null || value === '') return fallback;
+      const n = Number(value);
+      return Number.isFinite(n) ? clampValue(n, 65, 155) / 100 : fallback;
+    }
+    function mindmapDefaultSizeFactor(depth) {
+      return MINDMAP_DEFAULT_SIZE_PERCENT[mindmapStyleRole(depth)] / 100;
+    }
+    function mindmapSizeFactorFromOptions(options, depth) {
+      options = options || {};
+      let value = depth === 0
+        ? options.centerSize
+        : (depth === 1 ? options.branchSize : options.leafSize);
+      if (depth > 0 && (value == null || value === '')) value = options.nodeSize;
+      return mindmapPercentFactor(value, mindmapDefaultSizeFactor(depth));
+    }
+    function mindmapSizeFactorFromDataset(depth) {
+      const dataset = document.body && document.body.dataset ? document.body.dataset : {};
+      let value = depth === 0
+        ? dataset.mindmapCenterSize
+        : (depth === 1 ? dataset.mindmapBranchSize : dataset.mindmapLeafSize);
+      if (depth > 0 && (value == null || value === '')) value = dataset.mindmapNodeSize;
+      return mindmapPercentFactor(value, mindmapDefaultSizeFactor(depth));
+    }
+    function mindmapLevelForDepth(preset, depth) {
+      return depth === 0 ? preset.center : (depth === 1 ? preset.branch : preset.leaf);
+    }
+    function mindmapSizeStyle(level, depth, factor, autoSize) {
+      return {
+        scale: Number(level.scale) * factor,
+        nodeWidth: level.nodeWidth,
+        minWidth: level.minWidth,
+        maxWidth: level.maxWidth,
+        fontWeight: level.fontWeight,
+        radius: level.radius,
+        textAlign: level.textAlign,
+        mindmapRole: mindmapStyleRole(depth),
+        sizeFactor: factor,
+        autoSize: autoSize,
+      };
+    }
+    function writeMindmapNodeSize(node, presetId, depth, factor, forceAuto) {
+      if (!node || isDecorationNode(node)) return;
+      const preset = mindmapPreset(presetId);
+      const level = mindmapLevelForDepth(preset, depth);
+      const next = mindmapSizeStyle(level, depth, factor, forceAuto !== false);
+      node.mindmapStylePreset = MINDMAP_STYLE_PRESETS[presetId] ? presetId : 'paper';
+      node.scale = next.scale;
+      node.mindmapStyleRole = next.mindmapRole;
+      node.mindmapMinWidth = next.minWidth;
+      node.mindmapMaxWidth = next.maxWidth;
+      node.mindmapFontWeight = next.fontWeight;
+      node.mindmapRadius = next.radius;
+      node.mindmapTextAlign = next.textAlign;
+      node.mindmapSizeFactor = next.sizeFactor;
+      if (forceAuto !== false) {
+        node.mindmapSizeMode = 'auto';
+        delete node.width;
+        delete node.mindmapMinHeight;
+      }
+      nodeSizeCache.delete(node.id);
+      const el = nodeMap.get(node.id);
+      if (el) applyNodeStyle(el, node);
+    }
+    function parseHexForMindmap(hex) {
+      const raw = String(hex || '').replace('#', '');
+      if (!/^[0-9a-f]{6}$/i.test(raw)) return null;
+      return {
+        r: parseInt(raw.slice(0, 2), 16),
+        g: parseInt(raw.slice(2, 4), 16),
+        b: parseInt(raw.slice(4, 6), 16),
+      };
+    }
+    function mixMindmapHex(a, b, amountB) {
+      const ca = parseHexForMindmap(a);
+      const cb = parseHexForMindmap(b);
+      if (!ca || !cb) return a || b || '#ffffff';
+      const t = clampValue(Number(amountB) || 0, 0, 1);
+      const h = function (n) { return Math.round(n).toString(16).padStart(2, '0'); };
+      return '#' + h(ca.r * (1 - t) + cb.r * t)
+        + h(ca.g * (1 - t) + cb.g * t)
+        + h(ca.b * (1 - t) + cb.b * t);
+    }
+    function mindmapBranchMaps(tree) {
+      const parentOf = new Map();
+      const branchOf = new Map([[tree.center.id, -1]]);
+      const rootKids = tree.childrenOf.get(tree.center.id) || [];
+      function mark(id, branchIndex) {
+        branchOf.set(id, branchIndex);
+        (tree.childrenOf.get(id) || []).forEach(function (kid) {
+          parentOf.set(kid, id);
+          mark(kid, branchIndex);
+        });
+      }
+      rootKids.forEach(function (kid, idx) {
+        parentOf.set(kid, tree.center.id);
+        mark(kid, idx);
+      });
+      return { parentOf: parentOf, branchOf: branchOf };
+    }
+    function writeMindmapNodeStyle(node, style) {
+      if (!node || isDecorationNode(node)) return;
+      node.shape = style.shape || 'rect';
+      node.bgColor = style.bgColor;
+      node.borderColor = style.borderColor;
+      node.opacity = style.opacity;
+      delete node.color;
+      if (style.hideChrome) node.hideChrome = true;
+      else delete node.hideChrome;
+      if (Number(style.scale) > 0) node.scale = style.scale;
+      if (style.mindmapRole) {
+        node.mindmapStyleRole = style.mindmapRole;
+        node.mindmapMinWidth = Number(style.minWidth) > 0 ? Number(style.minWidth) : 72;
+        node.mindmapMaxWidth = Number(style.maxWidth) > 0 ? Number(style.maxWidth) : 240;
+        node.mindmapFontWeight = Number(style.fontWeight) > 0 ? Number(style.fontWeight) : 500;
+        node.mindmapRadius = Number(style.radius) >= 0 ? Number(style.radius) : 6;
+        node.mindmapTextAlign = style.textAlign || 'left';
+        node.mindmapSizeFactor = Number(style.sizeFactor) > 0 ? Number(style.sizeFactor) : 1;
+        if (style.autoSize !== false) {
+          node.mindmapSizeMode = 'auto';
+          delete node.width;
+          delete node.mindmapMinHeight;
+        } else if (Number(style.nodeWidth) > 0) {
+          node.mindmapSizeMode = 'custom';
+          node.width = style.nodeWidth;
+        }
+      } else if (Number(style.nodeWidth) > 0) {
+        node.width = style.nodeWidth;
+      }
+      const el = nodeMap.get(node.id);
+      if (el) {
+        el.removeAttribute('data-color');
+        applyNodeStyle(el, node);
+      }
+      nodeSizeCache.delete(node.id);
+    }
+    function writeMindmapEdgeStyle(edge, style, cleanWaypoints) {
+      if (!edge) return;
+      edge.curve = style.curve || 'smooth';
+      edge.lineStyle = style.lineStyle || 'solid';
+      edge.color = style.color;
+      edge.width = style.width;
+      edge.arrow = 'none';
+      edge.arrowSize = 12;
+      if (cleanWaypoints) delete edge.waypoints;
+      const refs = edgeMap.get(edge.id);
+      if (refs) applyEdgeStyle(refs, edge);
+      updateEdgePath(edge);
+    }
+    function styleMindmapCreatedChild(parent, child, edge) {
+      if (!parent || !child || !edge || !document.body) return;
+      const presetId = MINDMAP_STYLE_PRESETS[parent.mindmapStylePreset]
+        ? parent.mindmapStylePreset
+        : (document.body.dataset.mindmapPreset || 'paper');
+      const preset = mindmapPreset(presetId);
+      const colors = preset.colors || MINDMAP_STYLE_PRESETS.paper.colors;
+      const parentScale = Number(parent.scale);
+      const scaleMatchesCenter = Number.isFinite(parentScale) && Number.isFinite(Number(preset.center.scale))
+        && Math.abs(parentScale - Number(preset.center.scale)) < 0.025;
+      const colorMatchesCenter = String(parent.borderColor || '').toLowerCase() === String(preset.center.borderColor || '').toLowerCase();
+      const hasPresetLevelStyle = Number.isFinite(parentScale) || !!parent.borderColor;
+      const rootChild = !!parent.mindmapRoot || scaleMatchesCenter || colorMatchesCenter || (!hasPresetLevelStyle && !mindmapParentOf(parent));
+      const siblings = directMindmapChildrenOf(parent);
+      const siblingIndex = Math.max(0, siblings.findIndex(function (node) { return node.id === child.id; }));
+      let branchColor = parent.borderColor || colors[0];
+      if (rootChild) branchColor = colors[siblingIndex % colors.length];
+      else {
+        const incoming = data.edges.find(function (candidate) { return candidate.to === parent.id && candidate.from !== parent.id; });
+        if (incoming && incoming.color) branchColor = incoming.color;
+      }
+      const level = rootChild ? preset.branch : preset.leaf;
+      const hierarchySize = document.body.dataset.mindmapHierarchySize !== '0';
+      const sizeFactor = mindmapSizeFactorFromDataset(rootChild ? 1 : 2);
+      const curveRaw = document.body.dataset.mindmapCurve;
+      const lineStyleRaw = document.body.dataset.mindmapLineStyle;
+      const curve = EDGE_CURVES.indexOf(curveRaw) >= 0 ? curveRaw : level.curve;
+      const lineStyle = EDGE_LINE_STYLES.indexOf(lineStyleRaw) >= 0 ? lineStyleRaw : level.lineStyle;
+      writeMindmapNodeStyle(child, Object.assign({
+        bgColor: mixMindmapHex(branchColor, '#ffffff', level.bgMix),
+        borderColor: branchColor,
+        opacity: level.opacity,
+        shape: 'rect',
+        hideChrome: !!level.hideChrome,
+      }, hierarchySize ? mindmapSizeStyle(level, rootChild ? 1 : 2, sizeFactor, true) : {}));
+      writeMindmapColorMeta(child, presetId, branchColor, rootChild ? 1 : 2, 'auto');
+      writeMindmapEdgeStyle(edge, {
+        color: branchColor,
+        width: level.width,
+        curve: curve,
+        lineStyle: lineStyle,
+      }, true);
+    }
+    function applyMindmapStyle(presetId, options) {
+      if (editingNodeId !== null) commitNodeEdit();
+      if (editingEdgeId !== null) commitEdgeEdit();
+      if (textReaderEditing) finishTextReaderEdit();
+      finishMindmapGlide();
+      options = options || {};
+      const tree = buildMindmapTreeForScope(options.scope);
+      if (!tree || tree.nodeSet.size < 1) return false;
+      markMindmapRoot(tree);
+      orientMindmapTreeEdges(tree);
+      const preset = mindmapPreset(presetId);
+      const maps = mindmapBranchMaps(tree);
+      const colors = preset.colors || MINDMAP_STYLE_PRESETS.paper.colors;
+      const hierarchySize = options.hierarchySize !== false;
+      const centerSizeFactor = mindmapSizeFactorFromOptions(options, 0);
+      const branchSizeFactor = mindmapSizeFactorFromOptions(options, 1);
+      const leafSizeFactor = mindmapSizeFactorFromOptions(options, 2);
+      const curveOverride = EDGE_CURVES.indexOf(options.curveOverride) >= 0 ? options.curveOverride : '';
+      const lineStyleOverride = EDGE_LINE_STYLES.indexOf(options.lineStyleOverride) >= 0 ? options.lineStyleOverride : '';
+      // 暂停 CSS transition：避免样式变更触发过渡动画，导致紧接着的
+      // offsetWidth / offsetHeight 读到过渡起始值而非最终尺寸，使布局错位。
+      document.body.classList.add('mindmap-styling');
+      tree.nodeSet.forEach(function (id) {
+        const node = findNode(id);
+        const depth = tree.depth.get(id) || 0;
+        const branchIdx = maps.branchOf.get(id);
+        const branchColor = depth === 0 ? preset.center.borderColor : colors[((branchIdx || 0) % colors.length + colors.length) % colors.length];
+        if (depth === 0) {
+          writeMindmapNodeStyle(node, Object.assign({
+            bgColor: preset.center.bgColor,
+            borderColor: preset.center.borderColor,
+            opacity: preset.center.opacity,
+            shape: 'rect',
+            hideChrome: !!preset.center.hideChrome,
+          }, hierarchySize ? mindmapSizeStyle(preset.center, 0, centerSizeFactor, true) : {}));
+          writeMindmapColorMeta(node, presetId, preset.center.borderColor, 0, 'auto');
+        } else {
+          const level = depth === 1 ? preset.branch : preset.leaf;
+          writeMindmapNodeStyle(node, Object.assign({
+            bgColor: mixMindmapHex(branchColor, '#ffffff', level.bgMix),
+            borderColor: branchColor,
+            opacity: level.opacity,
+            shape: 'rect',
+            hideChrome: !!level.hideChrome,
+          }, hierarchySize ? mindmapSizeStyle(level, depth, depth === 1 ? branchSizeFactor : leafSizeFactor, true) : {}));
+          writeMindmapColorMeta(node, presetId, branchColor, depth, 'auto');
+        }
+      });
+      data.edges.forEach(function (edge) {
+        if (!tree.nodeSet.has(edge.from) || !tree.nodeSet.has(edge.to)) return;
+        const fromParent = maps.parentOf.get(edge.from) === edge.to;
+        const toParent = maps.parentOf.get(edge.to) === edge.from;
+        if (!fromParent && !toParent) return;
+        const childId = toParent ? edge.to : edge.from;
+        const childDepth = tree.depth.get(childId) || 1;
+        const branchIdx = maps.branchOf.get(childId);
+        const branchColor = colors[((branchIdx || 0) % colors.length + colors.length) % colors.length];
+        const level = childDepth <= 1 ? preset.branch : preset.leaf;
+        writeMindmapEdgeStyle(edge, {
+          color: branchColor,
+          width: level.width,
+          curve: curveOverride || level.curve,
+          lineStyle: lineStyleOverride || level.lineStyle,
+        }, !!options.cleanWaypoints);
+      });
+      // 强制重排：在恢复 transition 前让所有节点以最终尺寸完成布局计算，
+      // 确保后续 nodeRect / cachedNodeSize 读到的是过渡终点值。
+      tree.nodeSet.forEach(function (id) {
+        const el = nodeMap.get(id);
+        if (el) { void el.offsetWidth; }
+      });
+      document.body.classList.remove('mindmap-styling');
+      if (options.history !== false) pushHistory();
+      if (options.notify !== false) notify();
+      else redrawMinimap();
+      dispatchMindmapColorState();
+      dispatchMindmapSizeState();
+      return true;
+    }
+
+    function selectedMindmapOperationTree() {
+      const selected = [...selectedNodeIds].map(findNode).filter(function (node) {
+        return node && !isDecorationNode(node);
+      });
+      if (!selected.length) return null;
+      if (selected.length === 1) {
+        const managed = buildManagedMindmapTree(selected[0]);
+        if (managed.valid) return managed;
+      }
+      return buildMindmapTreeForScope('selection');
+    }
+
+    function mindmapLocalForOptions(tree, options) {
+      const layout = options.layout || 'auto';
+      const resolved = resolveMindmapLayout(tree, layout);
+      if (resolved === 'radial') return layoutMindmapRadial(tree, options);
+      if (resolved === 'balanced') return layoutMindmapBalanced(tree, options);
+      return layoutMindmapTree(tree, resolved, options);
+    }
+
+    function setSelectedMindmapNodeSizes(options) {
+      if (currentMode() !== 'mindmap') return false;
+      if (editingNodeId !== null) commitNodeEdit();
+      finishMindmapGlide();
+      options = options || {};
+      const tree = selectedMindmapOperationTree();
+      if (!tree || !tree.nodeSet || !tree.nodeSet.size) return false;
+      const centerFactor = mindmapSizeFactorFromOptions(options, 0);
+      const branchFactor = mindmapSizeFactorFromOptions(options, 1);
+      const leafFactor = mindmapSizeFactorFromOptions(options, 2);
+      tree.nodeSet.forEach(function (id) {
+        const node = findNode(id);
+        const depth = tree.depth.get(id) || 0;
+        if (!node || isDecorationNode(node)) return;
+        const presetId = MINDMAP_STYLE_PRESETS[node.mindmapStylePreset]
+          ? node.mindmapStylePreset
+          : ((document.body && document.body.dataset.mindmapPreset) || 'paper');
+        const forceAuto = options.forceAuto === true || node.mindmapSizeMode !== 'custom';
+        const factor = depth === 0 ? centerFactor : (depth === 1 ? branchFactor : leafFactor);
+        writeMindmapNodeSize(node, presetId, depth, factor, forceAuto);
+      });
+      data.edges.forEach(updateEdgePath);
+      if (options.reflow !== false && tree.nodeSet.size > 1) {
+        applyMindmapPositions(tree, mindmapLocalForOptions(tree, options), true, {
+          history: false,
+          notify: false,
+          duration: options.preview ? 190 : 360,
+        });
+      }
+      if (options.history !== false) pushHistory();
+      if (options.notify !== false) notify();
+      else redrawMinimap();
+      dispatchMindmapSizeState();
+      return true;
+    }
+
+    function restoreSelectedMindmapNodeSizes(options) {
+      options = Object.assign({}, options || {}, { forceAuto: true, history: true, notify: true, reflow: true });
+      const ok = setSelectedMindmapNodeSizes(options);
+      if (ok) showCanvasToast('已恢复自动文字尺寸');
+      return ok;
+    }
+
+    function mindmapContentWidth(el) {
+      if (!el) return 120;
+      const css = getComputedStyle(el);
+      const inset = (parseFloat(css.paddingLeft) || 0) + (parseFloat(css.paddingRight) || 0)
+        + (parseFloat(css.borderLeftWidth) || 0) + (parseFloat(css.borderRightWidth) || 0);
+      return Math.max(48, el.offsetWidth - inset);
+    }
+
+    function equalizeSelectedMindmapLevelWidths(options) {
+      if (currentMode() !== 'mindmap') return false;
+      if (editingNodeId !== null) commitNodeEdit();
+      finishMindmapGlide();
+      options = options || {};
+      const tree = selectedMindmapOperationTree();
+      if (!tree || !tree.nodeSet || !tree.nodeSet.size) return false;
+      const selectedOnly = selectedNodeIds.size > 1;
+      const groups = new Map();
+      tree.nodeSet.forEach(function (id) {
+        if (selectedOnly && !selectedNodeIds.has(id)) return;
+        const node = findNode(id);
+        if (!node || isDecorationNode(node)) return;
+        const depth = tree.depth.get(id) || 0;
+        if (!groups.has(depth)) groups.set(depth, []);
+        groups.get(depth).push(node);
+      });
+      let changed = 0;
+      groups.forEach(function (nodes) {
+        if (nodes.length < 2) return;
+        let target = 0;
+        nodes.forEach(function (node) { target = Math.max(target, mindmapContentWidth(nodeMap.get(node.id))); });
+        target = Math.max(72, Math.min(420, Math.round(target)));
+        nodes.forEach(function (node) {
+          node.width = target;
+          node.mindmapSizeMode = 'custom';
+          nodeSizeCache.delete(node.id);
+          const el = nodeMap.get(node.id);
+          if (el) applyNodeStyle(el, node);
+          changed += 1;
+        });
+      });
+      if (!changed) {
+        showCanvasToast('同一层级至少需要两个节点');
+        return true;
+      }
+      applyMindmapPositions(tree, mindmapLocalForOptions(tree, options), true, { history: false, notify: false, duration: 360 });
+      pushHistory();
+      notify();
+      dispatchMindmapSizeState();
+      showCanvasToast('已统一同级节点宽度');
+      return true;
+    }
+
+    function mindmapNodeBoundsOverlap(a, b, gap) {
+      const ar = nodeRect(a), br = nodeRect(b);
+      return ar.x < br.x + br.w + gap && ar.x + ar.w + gap > br.x
+        && ar.y < br.y + br.h + gap && ar.y + ar.h + gap > br.y;
+    }
+
+    function repairMindmapNodeSpacing(node, options) {
+      options = options || {};
+      const tree = buildManagedMindmapTree(node);
+      if (!tree.valid || tree.nodeSet.size < 2) return false;
+      const ids = [...tree.nodeSet];
+      const affectedTops = new Set();
+      const rootKids = tree.childrenOf.get(tree.center.id) || [];
+      const gap = Math.max(6, Number(options.branchGap) * 0.2 || 8);
+      for (let i = 0; i < ids.length; i++) {
+        for (let j = i + 1; j < ids.length; j++) {
+          const a = findNode(ids[i]), b = findNode(ids[j]);
+          if (!a || !b || !mindmapNodeBoundsOverlap(a, b, gap)) continue;
+          const aTop = mindmapTopBranchId(tree, a.id);
+          const bTop = mindmapTopBranchId(tree, b.id);
+          if (!aTop || !bTop) rootKids.forEach(function (id) { affectedTops.add(id); });
+          else { affectedTops.add(aTop); affectedTops.add(bTop); }
+        }
+      }
+      if (!affectedTops.size) return false;
+      const layoutOptions = Object.assign({ layout: 'auto', density: 'balanced' }, options);
+      const local = layoutOptions.layout === 'radial'
+        ? mindmapLocalForOptions(tree, layoutOptions)
+        : (localMindmapTopBranchLayout(tree, affectedTops, layoutOptions)
+          || mindmapLocalForOptions(tree, layoutOptions));
+      const moved = applyMindmapPositions(tree, local, false, { history: false, notify: false, duration: 320 });
+      if (!moved) return false;
+      if (options.history !== false) pushHistory();
+      if (options.notify !== false) notify();
+      return true;
+    }
+
+    function repairSelectedMindmapOverlaps(options) {
+      const node = [...selectedNodeIds].map(findNode).find(function (candidate) {
+        return candidate && !isDecorationNode(candidate);
+      });
+      if (!node) return false;
+      const changed = repairMindmapNodeSpacing(node, Object.assign({}, options || {}, { history: true, notify: true }));
+      showCanvasToast(changed ? '已整理重叠节点' : '当前没有重叠节点');
+      return true;
+    }
+
+    function applyMindmapPositions(tree, local, forceCommit, commitOptions) {
+      commitOptions = commitOptions || {};
+      const cRect = nodeRect(tree.center);
+      const anchorX = cRect.x + cRect.w / 2;               // 中心节点保持原位，其余相对它排布
+      const anchorY = cRect.y + cRect.h / 2;
+      const cl = local.get(tree.center.id) || { cx: 0, cy: 0 };
+      // 收集移动：fromX/Y=动画前位置，toX/Y=目标位置；数据 n.x/n.y 直接置为终态（撤销/保存与动画无关）。
+      const moves = [];
+      const movingIds = new Set();
+      tree.nodeSet.forEach(function (id) {
+        const n = findNode(id);
+        const r = nodeRect(n);
+        const lc = local.get(id);
+        if (!lc) return;
+        const fromX = n.x, fromY = n.y;
+        const toX = anchorX + (lc.cx - cl.cx) - r.w / 2;
+        const toY = anchorY + (lc.cy - cl.cy) - r.h / 2;
+        n.x = toX; n.y = toY;
+        const el = nodeMap.get(id);
+        if (!el) return;
+        if (Math.abs(toX - fromX) > 0.5 || Math.abs(toY - fromY) > 0.5) {
+          moves.push({ el: el, id: id, fromX: fromX, fromY: fromY, toX: toX, toY: toY });
+          movingIds.add(id);
+        } else {
+          applyTransform(el, toX, toY);
+        }
+      });
+      // 与树节点显式绑定的文本框参加同一段滑行动画；数据先写终态，视觉逐帧跟随。
+      appendBoundTextBoxMoves(tree.nodeSet, moves, movingIds);
+      if (!moves.length && !forceCommit) return false;
+      if (commitOptions.history !== false) pushHistory();
+      if (commitOptions.notify !== false) notify();
+      // 无需动画（reduced-motion / 没有节点真正移动）→ 一次到位
+      if (prefersReducedMotion() || moves.length === 0) {
+        moves.forEach(function (m) { applyTransform(m.el, m.toX, m.toY); });
+        data.edges.forEach(updateEdgePath);
+        redrawMinimap();
+        return true;
+      }
+      // 逐帧插值滑行：同时驱动节点 transform 与连线（复用 updateEdgePathLive），连线全程跟随不脱节。
+      const affectedEdges = edgesIncidentTo(movingIds);
+      setEdgesSvgLive(true);
+      data.edges.forEach(function (e) {                    // 两端都不动的连线一次到位
+        if (!movingIds.has(e.from) && !movingIds.has(e.to)) updateEdgePath(e);
+      });
+      moves.forEach(function (m) { m.el.classList.add('mm-gliding'); });
+      mindmapGlideState = { moves: moves, affectedEdges: affectedEdges };
+      const DUR = Number.isFinite(Number(commitOptions.duration)) ? Number(commitOptions.duration) : 460;
+      const start = performance.now();
+      function glideFrame(ts) {
+        const t = Math.min(1, (ts - start) / DUR);
+        const e = 1 - Math.pow(1 - t, 3);                  // easeOutCubic：快出慢收，稳重高级
+        const live = new Map();
+        moves.forEach(function (m) {
+          const x = m.fromX + (m.toX - m.fromX) * e;
+          const y = m.fromY + (m.toY - m.fromY) * e;
+          applyTransform(m.el, x, y);
+          live.set(m.id, { x: x, y: y });
+        });
+        affectedEdges.forEach(function (edge) { updateEdgePathLive(edge, live); });
+        if (t < 1) mindmapGlideRaf = requestAnimationFrame(glideFrame);
+        else finishMindmapGlide();
+      }
+      mindmapGlideRaf = requestAnimationFrame(glideFrame);
+      return true;
+    }
+    function applyMindmap(layout, options) {
+      if (editingNodeId !== null) commitNodeEdit();
+      if (editingEdgeId !== null) commitEdgeEdit();
+      if (textReaderEditing) finishTextReaderEdit();
+      finishMindmapGlide();   // 上一次滑行未停则先收尾到终态
+      options = options || {};
+      const tree = buildMindmapTreeForScope(options.scope);
+      if (!tree || tree.nodeSet.size < 2) return false;   // 至少 2 个节点才有意义
+      markMindmapRoot(tree);
+      orientMindmapTreeEdges(tree);
+      const resolved = resolveMindmapLayout(tree, layout);
+      tree.newEdges.forEach(function (ne) {
+        const edge = { id: newEdgeId(), from: ne.from, to: ne.to, text: '' };
+        data.edges.push(edge);
+        const refs = createEdgeEls(edge);
+        edgeMap.set(edge.id, refs);
+      });
+      if (options.stylePreset) {
+        applyMindmapStyle(options.stylePreset, {
+          scope: options.scope,
+          history: false,
+          notify: false,
+          cleanWaypoints: !!options.cleanWaypoints,
+          hierarchySize: options.hierarchySize !== false,
+          centerSize: options.centerSize,
+          branchSize: options.branchSize,
+          leafSize: options.leafSize,
+          nodeSize: options.nodeSize,
+          curveOverride: options.curveOverride,
+          lineStyleOverride: options.lineStyleOverride,
+        });
+      }
+      const local = resolved === 'radial'
+        ? layoutMindmapRadial(tree, options)
+        : (resolved === 'balanced' ? layoutMindmapBalanced(tree, options) : layoutMindmapTree(tree, resolved, options));
+      return applyMindmapPositions(tree, local, tree.newEdges.length > 0 || !!options.stylePreset);
+    }
+    function alignMindmapLevels(layout, options) {
+      if (editingNodeId !== null) commitNodeEdit();
+      if (editingEdgeId !== null) commitEdgeEdit();
+      if (textReaderEditing) finishTextReaderEdit();
+      finishMindmapGlide();
+      options = options || {};
+      const tree = buildMindmapTreeForScope(options.scope);
+      if (!tree || tree.nodeSet.size < 2) return false;
+      return applyMindmapPositions(tree, alignMindmapLocal(tree, layout, options), false);
+    }
+    global.CanvasModule.applyMindmap = applyMindmap;
+    global.CanvasModule.applyMindmapStyle = applyMindmapStyle;
+    global.CanvasModule.alignMindmapLevels = alignMindmapLevels;
+    global.CanvasModule.startMindmapColorBrush = startMindmapColorBrush;
+    global.CanvasModule.cancelMindmapColorBrush = function () { return cancelMindmapColorBrush(false); };
+    global.CanvasModule.matchMindmapParentColor = matchSelectedMindmapParentColor;
+    global.CanvasModule.getMindmapColorState = getSelectedMindmapColorState;
+    global.CanvasModule.getMindmapSizeState = getSelectedMindmapSizeState;
+    global.CanvasModule.setMindmapNodeSizes = setSelectedMindmapNodeSizes;
+    global.CanvasModule.restoreMindmapNodeSizes = restoreSelectedMindmapNodeSizes;
+    global.CanvasModule.equalizeMindmapLevelWidths = equalizeSelectedMindmapLevelWidths;
+    global.CanvasModule.repairMindmapOverlaps = repairSelectedMindmapOverlaps;
+
+    // ── 供新建面板单选节点时直接编辑节点属性 ──
+    global.CanvasModule.findNode = findNode;
+    global.CanvasModule.pushHistory = pushHistory;
+    global.CanvasModule.notify = notify;
+    global.CanvasModule.isIndexNode = isIndexNode;
+    global.CanvasModule.isBodyNode = isBodyNode;
+    global.CanvasModule.isCodeNode = isCodeNode;
+    global.CanvasModule.isStickyNode = isStickyNode;
+    global.CanvasModule.isCardNode = isCardNode;
+    global.CanvasModule.isPreviewNode = isPreviewNode;
+    global.CanvasModule.isReadableNode = isReadableNode;
+    global.CanvasModule.isDecorationNode = isDecorationNode;
+    global.CanvasModule.applySelectedStickyColor = function (color, random) {
+      if (!selectedNodesAllSticky()) return false;
+      setNodeColor(color, { random: !!random });
+      return true;
+    };
+    global.CanvasModule.applySelectedNodeColorPreset = applySelectedNodeColorPreset;
+    global.CanvasModule.applySelectedEdgeColorPreset = applySelectedEdgeColorPreset;
+    global.CanvasModule.resetSelectedNodeAppearanceSection = resetSelectedNodeAppearanceSection;
+    global.CanvasModule.applyCurrentNodeDefaultsToSelection = applyCurrentNodeDefaultsToSelection;
+    global.CanvasModule.applyCurrentEdgeDefaultsToSelection = applyCurrentEdgeDefaultsToSelection;
+
+    global.CanvasModule.editSingleNodeField = function (nodeId, prop, value, isDefault) {
+      const node = findNode(nodeId);
+      if (!node) return;
+      if (isDefault) delete node[prop]; else node[prop] = value;
+      if ((prop === 'bgColor' || prop === 'borderColor' || prop === 'opacity' || prop === 'hideChrome')
+          && (node.mindmapColorMode || node.mindmapStylePreset)) {
+        markMindmapNodeColorCustom(node);
+      }
+      if ((prop === 'scale' || prop === 'shape') && (node.mindmapSizeMode || node.mindmapStylePreset)) {
+        node.mindmapSizeMode = 'custom';
+      }
+      const el = nodeMap.get(nodeId);
+      if (el) applyNodeStyle(el, node);
+      if (prop === 'scale') {
+        nodeSizeCache.delete(nodeId);
+        edgesIncidentTo(new Set([nodeId])).forEach(updateEdgePath);
+      }
+      notifyEditStyleChange();
+    };
+
+    global.CanvasModule.editSingleNodeContextField = function (nodeId, kind, value) {
+      const node = findNode(nodeId);
+      if (!node) return;
+      const mindmap = !!(node && (node.mindmapStyleRole || node.mindmapStylePreset || node.mindmapRoot));
+      if (kind === 'radius') {
+        if (mindmap) node.mindmapRadius = value; else node.radius = value;
+      } else if (kind === 'fontWeight') {
+        if (mindmap) node.mindmapFontWeight = value; else node.fontWeight = value;
+      } else if (kind === 'textAlign') {
+        if (mindmap) node.mindmapTextAlign = value; else node.textAlign = value;
+      } else if (kind === 'fontScale') {
+        if (Number(value) === 1) delete node.fontScale; else node.fontScale = value;
+      }
+      if (mindmap) node.mindmapSizeMode = 'custom';
+      const el = nodeMap.get(nodeId);
+      if (el) applyNodeStyle(el, node);
+      notifyEditStyleChange();
+    };
+
+    global.CanvasModule.getSingleNodeDefaultFontWeight = function (nodeId) {
+      const node = findNode(nodeId);
+      return node ? editDefaultFontWeightForNode(node) : null;
+    };
+
+    global.CanvasModule.resetSingleNodeFontWeight = function (nodeId) {
+      const node = findNode(nodeId);
+      if (!node) return false;
+      if (editIsMindmapNode(node)) {
+        const next = editDefaultFontWeightForNode(node);
+        if (Number(node.mindmapFontWeight) === next) return false;
+        node.mindmapFontWeight = next;
+        node.mindmapSizeMode = 'custom';
+      } else {
+        if (!Object.prototype.hasOwnProperty.call(node, 'fontWeight')) return false;
+        delete node.fontWeight;
+      }
+      const el = nodeMap.get(nodeId);
+      if (el) applyNodeStyle(el, node);
+      nodeSizeCache.delete(nodeId);
+      edgesIncidentTo(new Set([nodeId])).forEach(updateEdgePath);
+      notifyEditStyleChange();
+      refreshEditPanel();
+      document.dispatchEvent(new CustomEvent('editor:nodestylechange', { detail: { nodeId: nodeId } }));
+      return true;
+    };
+
+    global.CanvasModule.applySingleNodeBody = function (nodeId, value, marks) {
+      const node = findNode(nodeId);
+      if (!node || !isBodyNode(node)) return;
+      if (!isCodeNode(node) && marks != null) {
+        const draft = canonicalRichDraft({ text: value, marks: marks });
+        value = draft.text;
+        marks = draft.marks;
+      }
+      if (value) node.body = value; else delete node.body;
+      if (isCodeNode(node)) {
+        delete node.bodyMarks;
+        node.text = codeTitleFromBody(value, node.language);
+        delete node.textMarks;
+      } else if (marks != null) storeRichMarks(node, 'body', marks);
+      if (!isCodeNode(node) && isStickyNode(node)) syncStickyTitleFromBody(node, value);
+      const el = nodeMap.get(nodeId);
+      if (el) {
+        renderTextNodeMeta(el, node);
+        if (isPreviewNode(node) || isCardNode(node) || isStickyNode(node)) animatePreviewNodeGeometry(nodeId);
+      }
+      notify();
+    };
+
+    global.CanvasModule.switchSingleNodeKind = function (nodeId, kind) {
+      const node = findNode(nodeId);
+      if (!node || !isReadableNode(node) || (isIndexNode(node) ? kind === 'index' : node.kind === kind) || currentMode() === 'decor') return;
+      var prevKind = node.kind;
+
+      // ── 内容迁移：标题不在转换中丢失或重复 ──
+      // 卡片/预览 → 便签/代码：便签和代码只展示 body，标题 text 在画布上不可见
+      if ((prevKind === 'card' || prevKind === 'preview') && (kind === 'sticky' || kind === 'code')) {
+        prependNodeTitleToBody(node);
+      }
+
+      // 便签/代码 → 卡片/预览：text 是 body 首行的自动提取，转换为卡片后标题和正文首行重复
+      if ((prevKind === 'sticky' || prevKind === 'code') && (kind === 'card' || kind === 'preview')) {
+        stripDuplicateTitleFromBody(node);
+      }
+
+      node.kind = kind;
+      ensureStickyNodeColor(node);
+      if (kind === 'index') { delete node.body; delete node.bodyMarks; delete node.language; }
+      if (kind === 'code') {
+        node.language = normalizeCodeLanguage(node.language || readDefaultCodeLanguage());
+        delete node.bodyMarks;
+      }
+      const el = nodeMap.get(nodeId);
+      if (el) {
+        applyNodeStyle(el, node);
+        const textEl = el.querySelector('.node-text');
+        delete textEl.dataset.source;
+        if (isCodeNode(node)) renderCodeNodeText(textEl, node.body || '', node.language);
+        else renderBodyNodeContent(textEl, node);
+        renderTextNodeMeta(el, node);
+      }
+      edgesIncidentTo(new Set([nodeId])).forEach(updateEdgePath);
+    };
+
+    global.CanvasModule.convertSingleToBodyNode = function (nodeId, kind) {
+      const node = findNode(nodeId);
+      if (!node || isReadableNode(node) || currentMode() === 'decor') return;
+      const body = node.text || '';
+      node.kind = kind;
+      ensureStickyNodeColor(node);
+      if (kind === 'code') node.language = normalizeCodeLanguage(node.language || readDefaultCodeLanguage());
+      if (kind !== 'index' && body) {
+        node.body = body;
+        if (kind === 'code') delete node.bodyMarks;
+        else storeRichMarks(node, 'body', richMarks(node, 'text'));
+      }
+      if (kind === 'index') delete node.bodyMarks;
+      node.text = kind === 'code' ? codeTitleFromBody(body, node.language) : (body || titleFromBody(body));
+      if (kind === 'code') delete node.textMarks;
+      const el = nodeMap.get(nodeId);
+      if (el) {
+        applyNodeStyle(el, node);
+        const textEl = el.querySelector('.node-text');
+        delete textEl.dataset.source;
+        renderBodyNodeContent(textEl, node);
+        renderTextNodeMeta(el, node);
+      }
+      edgesIncidentTo(new Set([nodeId])).forEach(updateEdgePath);
+    };
+
+    global.CanvasModule.resetSingleNodeAppearance = function (nodeId) {
+      const node = findNode(nodeId);
+      if (!node) return;
+      const mindmap = !!(node && (node.mindmapStyleRole || node.mindmapStylePreset || node.mindmapRoot));
+      if (mindmap) {
+        restoreEditMindmapColorForNode(node);
+        restoreEditMindmapSizeForNode(node);
+        const tree = buildManagedMindmapTree(node);
+        const depth = tree && tree.valid && tree.depth.has(node.id) ? (tree.depth.get(node.id) || 0) : 0;
+        const presetId = MINDMAP_STYLE_PRESETS[node.mindmapStylePreset]
+          ? node.mindmapStylePreset : ((document.body && document.body.dataset.mindmapPreset) || 'paper');
+        const level = mindmapLevelForDepth(mindmapPreset(presetId), depth);
+        delete node.shape;
+        if (level.hideChrome) node.hideChrome = true;
+        else delete node.hideChrome;
+      } else {
+        const previousBgColor = node.bgColor;
+        ['shape', 'borderColor', 'bgColor', 'opacity', 'hideChrome',
+         'scale', 'radius', 'fontWeight', 'fontScale', 'textAlign']
+          .forEach(function (prop) { delete node[prop]; });
+        if (isStickyNode(node)) node.bgColor = randomStickyColor(previousBgColor);
+      }
+      const el = nodeMap.get(nodeId);
+      if (el) applyNodeStyle(el, node);
+      notifyEditStyleChange();
+    };
+
+    global.CanvasModule.requestConvertSingleToNormalNode = function (nodeId) {
+      var tc = (typeof window.__tc === 'function') ? window.__tc : function(k) { return k; };
+      var node = findNode(nodeId);
+      if (!node || !isReadableNode(node) || currentMode() === 'decor') return;
+      showConfirm({
+        title: tc('epConvertConfirmTitle'),
+        detail: tc('epConvertConfirmDetail') + (node.text || 'Untitled'),
+        okLabel: tc('epConvertConfirmOk'),
+        destructive: true,
+      }, function () {
+        var n = findNode(nodeId);
+        if (!n || !isReadableNode(n)) return;
+        delete n.kind;
+        delete n.body;
+        delete n.bodyMarks;
+        delete n.language;
+        var el = nodeMap.get(nodeId);
+        if (el) {
+          applyNodeStyle(el, n);
+          var textEl = el.querySelector('.node-text');
+          delete textEl.dataset.source;
+          renderNodeText(textEl, n.text || '', richMarks(n, 'text'));
+          renderTextNodeMeta(el, n);
+        }
+        edgesIncidentTo(new Set([nodeId])).forEach(updateEdgePath);
+        pushHistory();
+        notify();
+      });
+    };
+
+    if (richMigrationChanged) {
+      // 旧语法只在加载时迁移一次；延后通知自动保存，避免在编辑器尚未完成绑定时写盘。
+      setTimeout(function () { onChange(); }, 0);
+    }
+    return {
+      undo: undo,
+      redo: redo,
+      getData: function () { return data; },
+      getSelectedCardIds: global.CanvasModule.getSelectedCardIds,
+      removeArchivedNodes: removeArchivedNodes,
+    };
+  }
+
+  global.CanvasModule = {
+    init: init,
+    normalNodeColorPresets: NORMAL_NODE_COLOR_PRESETS,
+    normalEdgeColorPresets: NORMAL_EDGE_COLOR_PRESETS,
+    stickySwatches: STICKY_SWATCHES,
+    nodeFontWeightInfo: nodeFontWeightInfo,
+    nodeFontWeightLabel: nodeFontWeightLabel,
+    nodeFontWeightDefaultInfo: nodeFontWeightDefaultInfo,
+  };
+})(window);

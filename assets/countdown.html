@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>倒数日 · Relatum</title>
+  <script>
+    (function () {
+      try {
+        var language = localStorage.getItem('canvas:toolbarLanguage') === 'en' ? 'en' : 'zh-CN';
+        document.documentElement.dataset.uiLanguage = language;
+        document.documentElement.lang = language;
+      } catch (e) {
+        document.documentElement.dataset.uiLanguage = 'zh-CN';
+      }
+    })();
+  </script>
+  <style>html { background: #0d100f; color-scheme: dark; }</style>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body class="countdown-page">
+  <header class="top-bar countdown-top-bar">
+    <div class="countdown-brand">
+      <strong>Relatum</strong>
+      <span>COUNTDOWN</span>
+    </div>
+    <button type="button" class="countdown-back" data-countdown-back aria-label="返回日历">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+      <span data-copy="back">返回日历</span>
+    </button>
+  </header>
+
+  <main class="countdown-workspace" data-countdown-root aria-busy="true">
+    <aside class="countdown-events" aria-label="倒数事件">
+      <header>
+        <div>
+          <span>EVENTS</span>
+          <h1 data-copy="eventsTitle">倒数日</h1>
+        </div>
+        <button type="button" class="countdown-icon-button" data-countdown-new aria-label="新建倒数日">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        </button>
+      </header>
+      <div class="countdown-event-list" data-countdown-list></div>
+      <p class="countdown-event-hint" data-copy="eventsHint">选择一个日子，让时间有一个方向。</p>
+    </aside>
+
+    <section class="countdown-stage" data-countdown-stage hidden>
+      <header class="countdown-stage-head">
+        <div>
+          <span data-countdown-status>距离目标还有</span>
+          <h2 data-countdown-title data-user-content role="button" tabindex="0" title="双击快速重命名"></h2>
+          <time data-countdown-date role="button" tabindex="0" title="双击快速修改日期"></time>
+        </div>
+        <div class="countdown-stage-actions">
+          <button type="button" class="countdown-focus-button" data-countdown-focus aria-pressed="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4H4v5M15 4h5v5M20 15v5h-5M4 15v5h5"/></svg>
+            <span data-countdown-focus-label>放大</span>
+          </button>
+          <button type="button" class="countdown-edit" data-countdown-edit>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19l3.5-.8L18 8.7 15.3 6 5.8 15.5zM14 7.3l2.7 2.7"/></svg>
+            <span data-copy="edit">编辑</span>
+          </button>
+        </div>
+      </header>
+      <button type="button" class="countdown-focus-exit" data-countdown-focus-exit aria-hidden="true" tabindex="-1">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 9H4M9 9V4M15 9h5M15 9V4M15 15h5M15 15v5M9 15H4M9 15v5"/></svg>
+        <span data-countdown-focus-exit-label>退出放大</span>
+      </button>
+      <div class="countdown-clock" aria-label="倒数时钟">
+        <div class="countdown-unit" data-unit="days">
+          <div class="countdown-flip"><div class="countdown-half countdown-half-top"><span></span></div><div class="countdown-half countdown-half-bottom"><span></span></div><div class="countdown-half countdown-flap countdown-flap-top"><span></span></div><div class="countdown-half countdown-flap countdown-flap-bottom"><span></span></div></div>
+          <span data-copy="days">天</span>
+        </div>
+        <div class="countdown-unit" data-unit="hours">
+          <div class="countdown-flip"><div class="countdown-half countdown-half-top"><span></span></div><div class="countdown-half countdown-half-bottom"><span></span></div><div class="countdown-half countdown-flap countdown-flap-top"><span></span></div><div class="countdown-half countdown-flap countdown-flap-bottom"><span></span></div></div>
+          <span data-copy="hours">时</span>
+        </div>
+        <div class="countdown-unit" data-unit="minutes">
+          <div class="countdown-flip"><div class="countdown-half countdown-half-top"><span></span></div><div class="countdown-half countdown-half-bottom"><span></span></div><div class="countdown-half countdown-flap countdown-flap-top"><span></span></div><div class="countdown-half countdown-flap countdown-flap-bottom"><span></span></div></div>
+          <span data-copy="minutes">分</span>
+        </div>
+        <div class="countdown-unit" data-unit="seconds">
+          <div class="countdown-flip"><div class="countdown-half countdown-half-top"><span></span></div><div class="countdown-half countdown-half-bottom"><span></span></div><div class="countdown-half countdown-flap countdown-flap-top"><span></span></div><div class="countdown-half countdown-flap countdown-flap-bottom"><span></span></div></div>
+          <span data-copy="seconds">秒</span>
+        </div>
+      </div>
+      <footer><kbd>Esc</kbd><span data-copy="exitHint">返回日历</span></footer>
+    </section>
+
+    <section class="countdown-empty" data-countdown-empty hidden>
+      <div class="countdown-empty-mark" aria-hidden="true"><i></i><i></i></div>
+      <span>COUNTDOWN</span>
+      <h2 data-copy="emptyTitle">还没有倒数日</h2>
+      <p data-copy="emptyBody">写下一个值得期待的日子，时钟会从这一秒开始陪你靠近它。</p>
+      <button type="button" data-countdown-empty-new data-copy="emptyAction">创建第一个倒数日</button>
+    </section>
+  </main>
+
+  <div class="countdown-editor-mask" data-countdown-editor hidden>
+    <form class="countdown-editor" data-countdown-form>
+      <header>
+        <div><span>COUNTDOWN</span><h2 data-countdown-editor-title>新建倒数日</h2></div>
+        <button type="button" data-countdown-editor-close aria-label="关闭">×</button>
+      </header>
+      <label><span data-copy="eventName">事件名称</span><input type="text" name="event" maxlength="80" autocomplete="off" required></label>
+      <label><span data-copy="targetDate">目标日期</span><input type="date" name="date" required></label>
+      <footer>
+        <button type="button" class="countdown-delete" data-countdown-delete hidden data-copy="delete">删除</button>
+        <span></span>
+        <button type="button" data-countdown-editor-close data-copy="cancel">取消</button>
+        <button type="submit" class="is-primary" data-copy="save">保存</button>
+      </footer>
+    </form>
+  </div>
+
+  <div class="countdown-toast" data-countdown-toast role="status"></div>
+  <script src="i18n.js" defer></script>
+  <script src="desktop-shell.js" defer></script>
+  <script src="countdown.js" defer></script>
+</body>
+</html>

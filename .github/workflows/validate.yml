@@ -1,0 +1,41 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  static-checks:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Check publish boundary
+        shell: pwsh
+        run: ./scripts/check-public.ps1
+
+      - name: Compile Python sources
+        shell: pwsh
+        run: python -m py_compile app.py desktop.py packaging/make_icon.py packaging/make_font_subset.py
+
+      - name: Parse handwritten JavaScript
+        shell: pwsh
+        run: |
+          Get-ChildItem assets -Recurse -Filter *.js |
+            Where-Object { $_.FullName -notmatch '\\vendor\\' } |
+            ForEach-Object { node --check $_.FullName }

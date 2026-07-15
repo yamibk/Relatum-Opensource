@@ -1,0 +1,464 @@
+# AGENTS.md - Relatum / 画布项目 AI 接手指南
+
+> 最后按源码校准：2026-07-14。  
+> 这份文件是给后续 AI agent 的“接手地图”，不是历史任务流水账。若本文与源码冲突，以源码为准；改动功能后，要同步更新本文对应章节。
+
+## 0. 先读这里
+
+- 项目显示名是 **Relatum**，仓库目录仍叫“画布”。它是本地知识画布 + 学习工作台 + 桌面壳，不是 Web SaaS。
+- 维护时默认用中文与用户沟通；解释要清楚、谨慎，不要假设用户知道内部实现。
+- 只改当前任务真正需要的文件。用户数据目录、示例画布、已有配置不要随手改、删、格式化。
+- 手动编辑文件时使用 `apply_patch`。运行格式化、检查、构建可以用命令，但不要用脚本偷偷重写源文件。
+- 这个项目没有 npm 构建链。前端是原生 HTML/CSS/JS，后端主体是 Python 标准库；桌面包才依赖 pywebview / PyInstaller / Pillow。
+- 不要把这份文档继续堆成杂乱备忘录。新增功能时，把“真实行为、数据位置、入口文件、验证方式”补到对应章节。
+
+## 1. 项目一句话
+
+Relatum 是一个离线优先的本地学习与知识组织工具：
+
+- `editor.html` + `assets/canvas.js` 提供无限画布、卡片/索引/代码/便签/附件、手写、连线、模板、脑图、AI 注入等核心编辑能力。
+- `index.html` + 多个页面模块提供最近画布、分组、收藏、回收站、学习任务、活跃星图、速记墙、日历日记、复习池、专注钟和每日任务。
+- `app.py` 是本地 HTTP 服务和所有持久化逻辑，监听 `127.0.0.1`，默认端口 `8765`，自动寻找空闲端口。
+- `desktop.py` 是 pywebview / WebView2 桌面外壳，启动同一个本地服务并打开桌面窗口。
+
+## 2. 绝对边界
+
+### 用户数据优先
+
+- `canvases/`、`canvases/回收站/`、`data/` 是用户数据。除非任务明确要求，不要批量改写。
+- `/api/new` 的默认文件名固定为 `Untitled-YYYY-MM-DD[-N].canvas`，与界面语言无关；不要改回中文前缀，也不要自动重命名旧画布。
+- 删除画布应走回收站逻辑：画布文件和同名 `.assets` 目录一起移动。
+- 保存 JSON / 文本时沿用后端已有的原子写入：在目标同目录写短名、进程/线程唯一的临时文件，再 `os.replace`；不要改回固定 `.tmp`，也不要给频繁自动保存额外加同步 `fsync`。
+- 打开外部文件、恢复、重命名、导入、导出都必须尊重路径授权。`app.py` 只允许 `canvases/`、回收站、最近列表里的路径、以及命令行 `--allow-dir` 传入的目录。
+- `open-external` 有危险扩展黑名单，不能为了“方便打开”绕开它。
+
+### 零依赖和离线优先
+
+- 不要引入 npm、CDN、Electron、Tauri 或前端框架。
+- 已有第三方前端库放在 `assets/vendor/`，包括 MathJax、PDF.js、Mermaid。它们是离线资产，不要把页面改成在线加载。
+- AI 是唯一主动出站能力：后端用标准库 `urllib` 调 OpenAI 兼容 `/chat/completions`，默认 DeepSeek。不要新增对外开放的 HTTP 控制面。
+
+### 协议 A / 外部打开
+
+- 外部程序若要打开画布，只传 `.canvas` 文件路径给 `app.py` 或 `desktop.py` 的命令行参数。
+- 不要新增“后台常驻远程 API”“局域网同步”“自动监听外部命令”等能力，除非用户明确要求并重新设计安全边界。
+
+### 前端性能和视觉
+
+- `styles.css` 很大，视觉语言是纸张、墨色、温和强调色。不要把界面改回大面积科技蓝、紫蓝渐变或重毛玻璃风格。
+- 避免持续 `backdrop-filter`、大面积 blur、无限 keyframe 动画、滥用 `will-change`。这些在旧优化记录里明确踩过坑。
+- 编辑器启用深色语义且背景判定为深色时，右侧完整面板、简洁样式面板与简洁节点入口统一使用高不透明度的墨绿黑表面、细亮边框和暖白选中态；这些常驻面板不使用 `backdrop-filter`，避免背景透亮发白和持续模糊开销。
+- 大画布、图谱、PDF、MathJax、Mermaid 都在热路径附近。改动 `canvas.js`、`graph-engine.js`、`graph-gl.js` 前先定位最小区域。
+- MathJax 与 Mermaid 都是本地按需运行时：前者只由真实公式源触发，后者只由 Mermaid fence 触发。普通文字/普通 Markdown 不应加载它们，也不要恢复全 `document.body` 的 Mermaid MutationObserver；所有生成 Markdown DOM 的入口必须显式调用对应渲染器。
+- 画布节点按 id 使用常驻索引供连线热路径查询；静态连线由 Canvas 绘制，拖节点和脑图滑行期间临时切到 SVG 增量更新，收尾后一次性重建 Canvas。删除或快照重建连线时必须同步清理 SVG marker 与 `edgePathCache`。
+- `prefers-reduced-motion` 已在多处使用；新增动画要考虑降级。
+
+## 3. 源码地图
+
+| 路径 | 责任 |
+| --- | --- |
+| `app.py` | 本地 HTTP 服务、路由、持久化、导入导出、AI 代理、复习池、学习/日历/速记/专注数据。 |
+| `desktop.py` | pywebview 桌面壳、WebView2 检测、无边框窗口、窗口状态、未保存关闭确认。 |
+| `build-desktop.ps1` | PyInstaller onedir 打包，输出 `Relatum-release/Relatum.exe`。脚本保持 ASCII。 |
+| `start.ps1`、`打开画布.bat` | 源码模式启动器，查找 Python 并运行 `app.py`。 |
+| `index.html` | 起步页壳，书脊导航、最近画布、学习/速记/日历/复习/专注入口。 |
+| `editor.html` | 画布编辑器壳，工具栏、各模式面板、读者浮层、AI 面板、图谱浮层。 |
+| `trash.html` | 回收站管理页。 |
+| `assets/start.js` | 起步页状态、最近/分组/收藏、页面切换、主题/背景/翻页速度。 |
+| `assets/editor.js` | 编辑器页面编排：加载/保存、模式切换、模板、导出、背景、AI/图谱入口。 |
+| `assets/editor-onboarding.js` | 编辑器首次使用引导：十一页 CSS 演示浮窗、翻页/重播、中英文案和真实画布四步练习。 |
+| `assets/i18n.js` | 起始页与编辑器共用的界面语言层；保存语言偏好、翻译静态/动态 UI，并保护用户内容区。 |
+| `assets/tooltip.js` | 全局自定义说明框层；接管静态与动态 `title`，同步中英文文案，并处理悬停/键盘焦点与视口避让。 |
+| `assets/canvas.js` | 核心画布引擎，节点/边/手写/附件/批注/选择/历史/脑图/AI 注入。 |
+| `assets/ai.js` | 右侧 AI 面板、聊天、上下文模式、生成预览、确认后注入。 |
+| `assets/richtext.js` | 画布文字的结构化局部格式层；管理 `textMarks` / `bodyMarks`、旧内联语法迁移、编辑 DOM 与导出序列化。 |
+| `assets/markdown.js` | 零依赖 Markdown 子集渲染器，支持公式占位、Callout、表格、Mermaid fence、内联增强标记。 |
+| `assets/mermaid-renderer.js` | 统一离线 Mermaid 渲染队列。 |
+| `assets/graph-engine.js` | 通用关系图引擎，Canvas2D + 可选 WebGL 几何后端。 |
+| `assets/graph-gl.js` | WebGL2 实例化渲染后端，暴露 `window.GraphGL`；只画节点/边几何，文字仍走 2D/DOM。 |
+| `assets/graph-view.js` | 当前画布关系图浮层。 |
+| `assets/study.js` | 学习任务、看板/清单、任务归档、任务关联画布、迷你编辑器。 |
+| `assets/study-graph.js` | 活跃页/学习页星图，可视化学习活动和任务结构。 |
+| `assets/notes.js` | 起步页速记墙，独立便签数据、拖拽、连线、箭头、归档。 |
+| `assets/calendar.js` | 日历、日记、任务日历、自由任务便签、倒数日。 |
+| `assets/countdown.html`、`assets/countdown.js` | 独立倒数日页面；事件管理、轻量翻页时钟、空状态与返回日历过渡。 |
+| `assets/review.js` | 间隔复习页面，从所有画布扫描启用复习的节点。 |
+| `assets/focus.js` | 专注钟、正计时/番茄钟、学习/每日任务绑定、音效/噪音、记录编辑。 |
+| `assets/trash.js` | 回收站页面，按目标分组恢复、键盘恢复、一键清空确认。 |
+| `assets/desktop-shell.js` | 前端到 pywebview 的桥接、窗口按钮、dirty 标记。 |
+| `assets/styles.css` | 全局视觉系统和所有页面样式。 |
+| `assets/editor-onboarding.css` | 编辑器新手引导的纸页浮窗、十一组有限播放演示、按钮反馈、深色与低动态适配。 |
+| `assets/vendor/` | 离线 MathJax / PDF.js / Mermaid。一般不要人工改。 |
+| `packaging/make_icon.py` | 用 Pillow 从源图生成 `assets/app-icon.ico`。 |
+| `packaging/make_font_subset.py` | 可选的 Noto Sans SC 字体子集再生成工具。 |
+
+## 4. 运行时和数据位置
+
+### 根目录选择
+
+- 源码运行时，`ROOT` 是源码目录。
+- PyInstaller 冻结运行时，静态资源来自 `_internal`，用户数据在 exe 同级目录创建。
+- `SOURCE_ROOT` / `RESOURCE_ROOT` 的区分用于寻找源码资源和打包资源，尤其是 `AI笔记创作指南.md`。
+
+### 用户数据文件
+
+| 数据 | 路径 |
+| --- | --- |
+| 画布 | `canvases/*.canvas` |
+| 回收站 | `canvases/回收站/` |
+| 画布附件 | 与画布同名的 `<stem>.assets/` |
+| 最近、分组、收藏 | `data/recent.json` |
+| 背景偏好与上传背景 | `data/background.json`、`data/backgrounds/` |
+| 画布视口 | `data/viewport.json` |
+| 学习任务 | `data/study.json` |
+| 学习归档 | `data/学习归档/` |
+| 画布归档轻量记录 | `data/画布归档/` |
+| 速记墙 | `data/notes.json` |
+| 速记归档 | `data/学习归档/<时间>-速记归档/notes.json` |
+| 专注记录 | `data/focus.json` |
+| 每日任务 | `data/daily.json`，含汇总字段与逐日历史 `doneDates` / `minutesByDate` |
+| 日记 | `data/diary/YYYY-MM-DD.md` |
+| 日历任务便签 | `data/calendar-pins.json` |
+| 倒数日 | `data/countdown.json`，v2 为 `events[] + selectedId`，并镜像当前 `event/date`；允许零事件，零事件时文件不存在；旧版单事件自动兼容迁移 |
+| 模板库 | `data/templates.json` |
+| AI 配置 | `data/ai.json`，含 Key、模型、baseUrl |
+| 桌面窗口状态 | `data/window-state.json` |
+
+全新用户尚无 `data/background.json` 且当前画布也没有旧版背景字段时，编辑器出厂默认使用“云霞”渐变、全屏沉浸、浅色背景语义，并关闭标题栏可读性保护；首次加载后会把这组全局背景偏好写入 `data/background.json`。
+
+### `.canvas` 和 `.assets`
+
+- `.canvas` 是 JSON，当前新建数据为 `version: 2`，核心字段是 `createdAt`、`updatedAt`、`nodes`、`edges`，手写数据也随画布保存。节点与文本框的局部字号/字色/高光/粗体使用 `textMarks` / `bodyMarks` 区间数组保存，文字本身始终是纯文字；代码节点不使用 `bodyMarks`。
+- 每个画布的资源目录是同名 `<stem>.assets/`。移动、重命名、删除画布时必须同步处理这个目录。
+- 图片和背景资源按后端上传接口管理。画布附件位于 `.assets/attachments/`。
+- Markdown 附件批注保存在附件旁的 `<asset>.annot.json`。文本区/阅读器手写批注保存在 `.assets/node-annotations.json`。
+- `clean-assets` 会根据画布中仍引用的资源清理孤儿文件；不要手写另一个清理逻辑。
+
+### 浏览器本地偏好
+
+很多 UI 偏好存在 `localStorage` / `sessionStorage`，不进 `.canvas`：
+
+- 起步页：当前分组、主题、背景风格、翻页速度、速记惯性、日历倒数日开关、隐藏特殊页开关（`canvas:hideSpecialPages`，**默认关闭**：只有显式存为 `'1'` 才隐藏，unset 或其他值都正常显示全部页面；开启后书脊只留最近/收藏/分组，滚轮翻页与点击都不进 6 张前置页）、帮助看过状态。
+- 编辑器：顶栏“画布 / 导图 / 图案”（内部 `canvas:mode` 仍只支持 `normal` / `mindmap` / `decor`；旧 `pro` / `edit` 读取时迁移为 `normal`）、全应用中英语言偏好 `canvas:toolbarLanguage`（由 `i18n.js` 在起始页、学习、活跃、日历、复习、专注与编辑器间共用；只翻译界面，不翻译文件名、任务名、便签、日记和画布内容）、新手引导状态 `canvas:editorOnboarding:v2`（`in-progress` / `completed` / `skipped`）、三种模式各自的 `canvas:normalSubmode` / `canvas:mindmapSubmode` / `canvas:decorSubmode` 双模式偏好、右侧面板最后一次 Tab 收放选择 `canvas:sidePanelsCollapsed`（主编辑器全局共用，内嵌编辑器不读取也不改写）、底部文字属性带的全局收起偏好 `canvas:textToolbarCollapsed`（未设置时默认收起；显式 `'0'` 展开、`'1'` 收起）、普通画布属性检查器开关 `canvas:inspectorEnabled`、导图属性检查器开关 `canvas:mindmapInspectorEnabled`、图案属性检查器开关 `canvas:decorInspectorEnabled`（三个独立偏好；画布与图案默认开启，导图默认关闭）、文本框拖动自动对齐开关 `canvas:textSnapEnabled`（默认关闭，仅显式 `'1'` 开启）、完整画布模式的 `canvas:proNodeDefaults` / `canvas:proEdgeDefaults` 与简洁画布模式独立的 `canvas:cleanNodeDefaults` / `canvas:cleanEdgeDefaults` 新建默认、文本框新建默认 `canvas:textDefaults` 以及共享柔和色栏镜像保存的高光/字色 `canvas:textHighlightColor` / `canvas:textInlineColor`、自动保存、暗色连线优化、平移/缩放/读者透明度、索引/脑图悬停延迟等。
+- 速记、学习、复习、专注各自有视图偏好和临时运行状态。
+- `sessionStorage` 的 `canvas:route-from-start` 用于从起步页进入编辑器后的返回/过渡体验。
+
+不要把这些偏好混进 `.canvas`，除非用户明确要求改变持久化设计。
+
+## 5. 后端路由总览
+
+### GET
+
+- 运行时与首页：`/api/runtime`、`/api/recent`
+- AI 配置安全视图：`/api/ai-config`
+- 学习/活跃：`/api/study`、`/api/study-activity`
+- 复习：`/api/review-pool`
+- 速记/专注/每日任务：`/api/notes`、`/api/focus`、`/api/daily`
+- 日历与倒数日：`/api/calendar`、`/api/countdown`
+- 模板：`/api/templates`
+- 画布和资源读取：`/api/load`、`/api/background-image`、`/api/canvas-asset`、`/api/canvas-annotation`、`/api/node-annotations`、`/api/background-preference`
+
+### POST
+
+- 画布文件：`/api/new`、`/api/open`、`/api/pick`、`/api/save`、`/api/remove`、`/api/rename`、`/api/clean-assets`
+- 分组/收藏/排序：`/api/group-create`、`/api/group-rename`、`/api/group-delete`、`/api/file-set-group`、`/api/favorite-toggle`、`/api/groups-reorder`、`/api/reorder-files`
+- 回收站：`/api/trash`、`/api/trash-list`、`/api/trash-empty`、`/api/restore`
+- 文件系统交互：`/api/reveal`、`/api/open-external`、`/api/open-attachment`
+- 导入导出：`/api/export-markdown`、`/api/export-png`、`/api/import-markdown`、`/api/import-canvas`
+- 背景/图片/附件：`/api/pick-background-image`、`/api/upload-background-image`、`/api/import-canvas-image`、`/api/upload-canvas-image`、`/api/upload-canvas-attachment`
+- 批注与视口：`/api/save-canvas-annotation`、`/api/save-node-annotations`、`/api/background-preference`、`/api/viewport`
+- 学习任务：`/api/study-task-create`、`/api/study-task-update`、`/api/study-task-trash`、`/api/study-task-restore`、`/api/study-task-delete`、`/api/study-trash-empty`、`/api/study-archive-done`、`/api/study-task-create-canvas`、`/api/study-reorder`
+- 跨功能：`/api/archive-canvas`、`/api/export-canvas-to-tasks`
+- 复习：`/api/review-mark`
+- 速记和模板：`/api/notes-save`、`/api/notes-archive`、`/api/templates-save`
+- 专注：`/api/focus-log`、`/api/focus-session-update`、`/api/focus-session-delete`
+- 每日任务：`/api/daily-create`、`/api/daily-update`、`/api/daily-delete`、`/api/daily-toggle`、`/api/daily-add-minutes`、`/api/daily-reorder`、`/api/daily-group-create`、`/api/daily-group-update`、`/api/daily-group-delete`、`/api/daily-tree`
+- 日历：`/api/diary-save`、`/api/diary-delete`、`/api/calendar-pins-save`、`/api/countdown-save`
+- AI：`/api/ai-chat`、`/api/ai-compose`、`/api/ai-test`、`/api/ai-config`
+
+### HTTP 与并发边界
+
+- JSON 请求体硬上限是 160MiB；超过 8MiB 的 JSON 同一时刻只接纳一个，保存时走流式原子 JSON 编码；图片/附件仍各自执行 40MiB / 100MiB 的解码后限制。Base64 协议会产生高于请求体大小的瞬时内存峰值，不要把 160MiB 误解成进程内存上限。
+- 画布资源读取由 `_send_local_file` 分块发送并支持单段 `Range`，不要重新改成 `read_bytes()` 整文件进内存。
+- 小型 `data/*.json` 读改写与画布/附件文件操作使用两把进程内锁；跨两类数据的路由固定先拿画布锁、再拿数据锁。不要倒置锁顺序，也不要让原生选择器打开期间持锁。
+- 视口状态 `data/viewport.json` 最多保留 500 张画布记录，写入时按 `updatedAt` 淘汰旧项，避免长期使用后无界增长。
+- Windows 上，共用同一 `ROOT` 的多个 Relatum 服务还会通过命名互斥锁串行化写操作，避免两个实例把同一份 JSON 相互覆盖；进程内仍使用上述两把细分锁。非 Windows 源码运行目前只有进程内锁，不要误写成全平台单实例机制。
+
+## 6. 画布编辑器契约
+
+### 首次使用引导
+
+- 起步页新建画布传入 `fresh=1`，编辑器背景、画布与顶栏完全就位后，只在 `canvas:editorOnboarding:v2` 未设置时打开十一页引导；内嵌学习页编辑器不触发。
+- 浮窗只讲编辑器核心：创建内容、连接想法、平移/缩放、画布、导图、图案、右侧面板的 `Tab` 收放与手电筒熄灭、空白处右键拖动创建纯色色块、选中节点后按 `F` 打开放大阅读、框选节点后通过右下角“+ 分组”创建语义分组，以及进入真实画布的四步练习。四步依次要求创建一个新节点、让任意内容节点的文字发生变化、再创建一个新节点、按住 `Alt` 完成一条新的节点间连线；连线可以落到画布上的任意其他节点，不强制连接教程追踪的两个节点。三种模式各占一页；导图演示固定按“旧线退场 → 节点排版并换样式 → 重绘终态连线”的顺序执行，避免节点移动时连线乱飞。起步页学习/日历/速记等不进首次引导。
+- CSS 演示进页自动播放一次后停在终态，可手动重播；不使用常驻模糊，并在 `prefers-reduced-motion` 下改为静态终态。创建页卡片内的标题线固定最终宽度并通过 `scaleX` 连续展开，不使用离散 `steps()` 或直接动画 `width`。连接页的三个节点必须从第一帧就存在，动画只演示按住 `Alt` 从左侧节点依次连向两个已有节点；`Tab` / `Enter` 只留在说明文字中，不能让右侧节点以“快捷键创建”的方式入场。面板页先用两次 `Tab` 演示收起与展开，再点击右上角手电筒把面板熄灭到近乎透明，低动态模式直接显示熄灭终态。画布模式页不展示虚构的左侧滑条工具，改为演示右键节点弹出调色板并选色；各模式演示的 SVG 连线端点要轻微伸入节点底层，不能在节点边框前留下白缝。深色画布使用高不透明度墨绿黑表面。
+- 真实练习按“新节点数量、任意内容节点文字发生变化、第二个新节点、新增任意节点间连线”依次推进；判定应允许用户偏离呼吸光圈、编辑已有节点或另一个新节点、把连线落到其他节点，只确认相应动作是否真实发生。点击完成卡片的“知道了”后，编辑器右下角“？”只播放一次有限的绿色荧光提示，随后恢复静止。该“？”快捷键面板顶部使用墨绿色主按钮重播完整引导；面板保留滚轮/触控板滚动，但隐藏浏览器原生竖向滚动条。速查内容必须使用“画布 / 导图 / 图案”和“简洁 / 完整”的现行名称，并覆盖框选分组、右键拖色块、附件阅读批注、模式子状态、右栏 Tab 收放等当前行为，不能重新出现旧“普通 / 正常”叫法。该面板也是中英界面的一部分：英文模式下，标题、操作说明、Markdown 示例与无障碍标签都由 `i18n.js` 翻译，不得混留中文界面文案。
+
+### 坐标与视口
+
+- 屏幕坐标转画布坐标只能走 `canvas.js` 的 `clientToSurface(clientX, clientY)`。不要在新代码里手写 `(client - pan) / scale`。
+- 双击普通内容节点或文字框进入编辑时，光标落在双击对应的文字位置，不默认全选全文；键盘进入编辑仍沿用各自既有的选区规则。
+- 视口由 `curPan/curScale` 与目标值驱动，保存到 `/api/viewport`。
+- 改动缩放、平移、定位、脑图、框选、拖拽、附件放置时，优先复用已有坐标工具函数。
+- 连线名称与选中锚点必须共用 SVG 真实路径的半程点，不能拿控制折线中点代替；选中锚点使用菱形，可拖拐点使用圆形。修改路径、节点拖动、导出或 Canvas/SVG 双渲染时要保持两者坐标一致。
+- 顶栏模式目前显示为“画布 / 导图 / 图案”（英文偏好下为 “Canvas / Mind Map / Shapes”，内部值仍是 `normal` / `mindmap` / `decor`）。编辑器右下角齿轮与起始页客户端设置都可切换中英语言，偏好键是 `canvas:toolbarLanguage`；`i18n.js` 负责起始页各功能页与编辑器的共用界面文案，文件名、任务名、便签、日记和画布内容保持原文。右下角 `fx`、齿轮和 `?` 三个入口始终固定在画布角落，不随右侧面板展开向左避让；右栏层级更高，展开时允许直接覆盖这些入口。三个模式按钮都可在当前模式下重复点击，在各自独立记忆的 `full` / `clean` 子模式间切换；切到其他模式时恢复该模式上次子模式。缺少偏好数据时，画布与导图默认 `clean`，图案默认 `full`；已有 `canvas:*Submode` 偏好始终优先。移动胶囊与下沿短线在浅色界面统一纯黑、深色沉浸界面统一纯白，不再用三档灰色区分模式；`full` 常驻短线，`clean` 离开按钮组时隐藏短线，鼠标悬停或键盘聚焦任一模式时短线必须出现并跟随预览位置，离开后恢复当前模式与子模式对应的显示规则。`full` 允许属性检查器随选择出现，`clean` 隐藏顶栏动作区且禁止属性检查器，但导图/图案自身的模式面板仍保留；内嵌编辑器例外，强制完整画布模式以保留编辑能力。完整画布模式常驻大型“新建样式”面板，支持类型、形状、配色、透明度、整体缩放、圆角、字重、文字比例/对齐以及完整线条默认；选中对象时自动切为属性检查器，清选后自动回到新建样式，两者不再提供重复的手动页签。简洁画布模式显示卡片/便签高频入口与独立“样式”面板；该面板不切换 `full`，支持索引、预览、卡片、便签、代码五种节点类型、三种形状、节点外观和连线默认，使用独立 clean 默认键。无单选时，简洁“样式”面板编辑之后的新建默认；单选一个内容节点时，同一组节点控件改为读取并直接编辑所选节点，类型按钮执行内容安全迁移，清除或形成非单选后立即回到默认值；连线区始终编辑 clean 新建默认。面板保持打开以便用户在选择与默认语义间切换，不因此进入 `full` 或启用属性检查器。数字键在简洁画布下 `3/4` 切卡片/便签，在完整画布下 `3/4/5/6` 切索引/预览/卡片/代码。画布按下期间的选择变化要等本次 click/drag 完成后再移动检查器，禁止侧栏在 `mousedown` 与 `mouseup` 之间抢走指针。未激活面板使用 `transform` / `opacity` / 延迟 `visibility` 完成退场，期间容器和子控件都必须禁止命中；不能用 `display:none` 截断过渡动画。属性检查器出现时优先占用当前右栏并让导图排版面板退场，清除选择后导图面板自动恢复；Tab 仍控制当前唯一右栏的收起/展开，模式切换、延迟打开检查器和 Tab 折叠状态必须同步闭环。导图模式复用 `applyMindmap` 排版和滑行动画，提供 8 套按结构效果命名的预设，并允许覆盖线型/线条样式。单选时作用于与该节点相连的整张结构，多选时只作用于所选节点；保持既有左右分支和按层级区分节点大小均为自动行为，不再暴露开关。`applyMindmap` 支持跟随分支、稳定均衡左右布局、层距/分支距/放射半径参数；`alignMindmapLevels` 只修正层级轴并保留用户手排的同层顺序。导图模式下 Tab 新建会沿当前分支方向继续向外生长，并继承当前预设的节点尺寸、颜色、线型和线条样式。
+- 脑图预设只是外观，不可用颜色/尺寸反推节点是否属于脑图。完整套用脑图样式或排版时，中心节点写入可选字段 `mindmapRoot: true`，树边统一为 `parent → child`；同一连通结构只保留一个中心标记。脑图节点的持久外观由节点上的 `mindmap*` 字段决定，切到普通模式或打开属性检查器后仍保持圆角、尺寸、字重和文字排版。思维导图模式下拖动非中心节点会移动整棵子树：插槽用于同级排序，节点高亮与加号用于把整枝改挂为该节点的子节点；一级分支可跨中心换边，中心节点拖动整图，无效落点回原位。拖动收尾必须在无 `transform` 过渡的状态下同步提交节点终点与连线，再恢复普通过渡，避免线先到而节点随后漂移；任何顶栏模式切换也必须先结算尚未完成的脑图滑行动画。改挂会复用原父子连线、清除旧拐点，并在节点仍匹配内置预设尺寸时自动切换分支/叶级尺寸；手工改过的尺寸保留。循环、多父级、交叉连接和跨两张独立脑图不会自动改挂，普通模式仍保持自由拖动。
+- 脑图改挂默认只重排旧父分支和目标分支，其他一级分支保持原位；局部结果与其他分支碰撞时才回退为整图排版。预设节点用 `mindmapStylePreset`、`mindmapColorMode`、`mindmapBranchColor` 和 `mindmapStyleRole` 记录配色来源：`auto` 节点改挂后跟随新分支，`custom` 节点保留用户颜色。配色刷只复制节点填充、边框和透明度，不修改尺寸或连线；“匹配父分支”把所选非中心节点恢复为自动配色。
+- 脑图节点尺寸默认由文字和预设层级共同决定；中心节点、一级分支、二级及以后节点三条尺寸滑条分别写入当前预设比例，内置默认依次为 110% / 100% / 85%，无选中或当前结构缺少对应层级时保持已有面板值，不把空状态当成最小值。三条轨道在各自默认值处显示无交互的灰色提示线。`mindmapSizeMode: "auto"` 不保留固定 `width`，短标题不拆字、长标题在预设最大宽度内换行；左右边缘拖宽、角点调整宽度与最小高度后改为 `custom`，双击手柄或“恢复自动”会清除手工尺寸。`mindmapSizeFactor` 和 `mindmapMinWidth`/`mindmapMaxWidth`/`mindmapFontWeight`/`mindmapRadius`/`mindmapTextAlign` 保存预设排版语义，`mindmapMinHeight` 只保存用户角点调整的最小高度。尺寸变化必须让 ResizeObserver 刷新相邻连线锚点；自动避让只整理发生碰撞的一级分支。预设卡片点击只选择，悬停后右上角勾选会立即套用并整理。
+- 属性检查器是持续工作的上下文面板，不是顶栏模式，并且只在当前顶栏模式处于 `full` 且对应偏好未关闭时启用：普通画布由 `canvas:inspectorEnabled` 控制，导图由 `canvas:mindmapInspectorEnabled` 控制，图案由 `canvas:decorInspectorEnabled` 控制；内容节点/连线选中后自动出现，装饰对象选中后显示其图案属性。切到 `clean` 或关闭当前模式的开关时不显示对象属性，恢复 `full` / 重新开启开关后若仍有选择则重新出现；导图排版与图案新建预设等模式自身面板不受对象检查器开关影响。完整画布模式的“新建样式”同样不受属性检查器开关影响：无选择、清选或关闭开关时都回到它；新建样式与当前所选之间不提供手动切换页签。完整画布右栏的“节点内容”区首次默认收起，`canvas:proContentExpanded` 只记录用户通过标题箭头选择的展开状态；单选与取消选择不能替用户展开或收起，无选择时只把内容控件置灰禁用，从而保持右栏高度稳定。简洁画布的“样式”是独立上下文浮层，不是完整属性检查器；打开时保持 `clean`，点击画布空白会清选并让面板回到新建默认，关闭按钮、Esc 或切换模式才关闭面板。单选显示对象类型，多选必须逐属性判断并显示“混合”，不可拿第一个对象的值冒充全部；选中对象时仍允许双击/N/粘贴新建、Ctrl+D 复制、Tab/Enter 连续录入和 Alt 拖线，只有图案模式禁止创建内容节点。Alt 拖线成功后保留发起前的节点选择，不自动选中新连线或把右栏切到连线属性；用户主动点选连线时才显示连线检查器。普通节点的圆角/字重/文字比例/对齐分别保存为 `radius`、`fontWeight`、`fontScale`、`textAlign`；脑图节点改这些值时写入对应 `mindmap*` 字段并把 `mindmapSizeMode` 标为 `custom`，改配色或隐藏背景时把 `mindmapColorMode` 标为 `custom`。检查器的“恢复预设配色/自动尺寸/外观”按节点自己的脑图预设和分支层级恢复；脑图连线“恢复样式”也恢复所在分支预设，不回退成普通黑线。范围控件实时预览只走轻量样式通知，鼠标释放/`change` 只产生一条历史记录。三个字重入口共用离散滑条视觉层：100–900 范围内按十位档调节，方向键每次移动 10，PageUp / PageDown 每次移动 100，轨道只绘制整百主刻度；当前节点类型或脑图预设的默认字重另用动态提示线标出，点击该提示线只恢复字重字段。拖动期间连续预览，并在 `prefers-reduced-motion` 下关闭吸附动画。`fontWeight` 缺失表示“沿用类型默认”，不是显式 `400`：普通/代码为 440，索引为 600，预览为标题 580 / 正文 400，卡片为标题 620 / 正文 400，便签为 460，文字框为 400；脑图缺少 `mindmapFontWeight` 时回退 500。右栏必须以“默认 · …”显示这类语义默认，用户拖到 400 后则保存并显示显式 400；底部 `B` 在选中文字时只改所选范围，未选中文字时按当前有效字重切换显式 400 / 700，恢复文字外观或清除整节点格式才删除覆盖字段并回到类型默认。
+
+- 完整画布“新建样式”和节点/连线属性检查器共用普通画布快速配色：节点预设是一组“较深边框 + 柔和浅背景”，连线预设只改颜色；无选择时写入 `canvas:proNodeDefaults` / `canvas:proEdgeDefaults`，单选或多选时只改所选对象，且一次预设点击只产生一条历史。节点配色不夹带形状、透明度、文字或类型；脑图节点使用快速配色后转为手工配色，仍可恢复所属分支预设。普通节点支持分别恢复配色、形状与缩放、文字与轮廓；“应用当前新建样式”只复制外观字段，绝不修改节点类型、内容、复习数据、位置和连接，脑图对象会跳过。整套恢复明确称为“恢复内置朴素外观/连线”，普通对象回程序内置值，脑图对象仍回自己的脑图预设。多选复习状态使用三态复选框，横线表示仅部分节点已加入；点击横线统一加入，再次取消则全部移出，不批量覆盖问题与答案。
+- 右下角齿轮面板的全部数值滑条、完整画布“新建样式”的七个数值滑条、简洁画布“样式”的背景透明度/圆角/字重/文字比例/线条粗细滑条，以及思维导图的三档节点尺寸滑条，都在轨道上显示内置默认值提示线；完整画布的“整体缩放”位于“文字与轮廓”，范围为 50%–200%，无选择时写入 `canvas:proNodeDefaults.scale` 并作用于之后新建的节点，单选时读取并实时修改当前节点的 `scale`，释放后只产生一条历史；“恢复形状与缩放”仍负责恢复它。普通原生滑条的提示线按滑块中心实际可移动范围定位；字重复用离散滑条自己的整百主刻度，默认提示线随节点类型或脑图预设移动，并且可点击以只恢复字重。不能再给字重外包会参与 flex 布局的普通滑条容器；除字重动态提示线外，其余提示线都没有交互、不跟随已保存偏好移动，也不修改画布或本地偏好。
+- 完整画布“新建样式”在无选择且类型为便签时，以及单选已有便签时，“快速配色”都改用与节点右键菜单相同的 14 种果冻色，第一格统一为白底黑色粗体“？”。无选择时“？”是会高亮的未来新建随机色状态，固定色分别保存为 `canvas:proNodeDefaults` 内的 `stickyColorMode` / `stickyBgColor`，不覆盖卡片等类型继续使用的普通 `bgColor`；单选已有便签时“？”执行一次随机换色，随后高亮实际抽中的固定色。三处入口共用 `canvas.js` 的 `STICKY_SWATCHES`，不能复制出另一份色表。卡片等节点转为便签且原来没有底色时必须立即写入随机果冻色；便签执行“恢复配色”或“恢复内置朴素外观”时仍重新随机取色。便签缺少 `bgColor` 时的基础兜底是白色，不再是旧黄色；普通配色面板混选多种节点后应用“黑框白底”时，便签必须显式保存白色，不能因普通节点的默认字段清理逻辑退回另一种颜色。单行便签进入与退出文字编辑时必须保持相同外框尺寸：编辑区最小高度不能把默认 `64px` 便签撑高；多行内容仍按文字自然增长，手动正文高度仍优先。便签选中态不得使用向外扩散的多层粗焦点环，避免在高画布缩放下造成外框膨胀错觉；以原边界内的深色细边、内高光和尺寸手柄表达选择。
+- 语义分组复用 `kind:"shape"` + `shapeType:"group-box"`，普通盒子与分组共用同一套图案默认和右栏预设；新建盒子/分组的默认标题固定为 `Untitled`，与界面语言无关。没有选中盒子/分组时，分组预设写入 `canvas:decorShapeDefaults` 的 `group-box` 项并跨画布影响后续新建；选中一个或多个盒子/分组时，同一组预设和“标题文字语义”只修改选中对象并写入一条画布历史，不得反向污染新建预设。拖拽矩形仍决定实际尺寸；浅色标题字用于较深标题底，深色字适合柠檬黄等明亮标题底。空白框选生成盒子与框选节点生成分组的门槛统一为盒子实际最小尺寸 `20×8`，不得再另设更大的旧阈值。成员 ID 保存在 `groupMemberIds`，折叠状态和展开高度分别保存在 `groupCollapsed` / `groupExpandedHeight`。建立分组不能修改成员坐标；拖动分组标题必须让分组与全部成员使用同一屏幕增量，折叠隐藏成员及其相邻连线，展开恢复原高度。分组框视觉层可高于内容，但框体必须 `pointer-events:none`，只让标题、折叠按钮和尺寸手柄命中，不能挡住成员节点；脑图模式选中内容或分组时由对应属性检查器替换脑图面板，清选后再恢复脑图面板。
+
+- 完整画布右栏的“新建样式”标题与选中节点类型标题属于动态界面文案，切换 `canvas:toolbarLanguage` 时必须立即按当前语言刷新，不能缓存初始标题或依赖重新打开画布。
+
+- 顶栏模板库打开时可复用已渲染列表并在后台拉取最新数据；接口返回内容未变化时不得清空重绘，确有变化时也要整批一次性替换，避免旧卡片先显示、随后消失并重播入场动画。模板库用半透明叠色、高光细边和静态阴影形成轻玻璃层次，不使用 `backdrop-filter`；深色语义下使用高不透明度墨绿黑表面。普通关闭先播放一次快速淡出、轻微上移/缩小的有限退场，完成后再设置 `hidden`；拖动模板时为及时露出画布仍立即收起，低动态模式直接切换。当前画布图谱浮层打开时使用一次有限的遮罩淡入与窗口上浮缩放动画，不使用模糊，并在 `prefers-reduced-motion` 下静态出现。
+
+- 图谱关闭统一走 `graph-view.js` 的有限退场：先停渲染并让窗口轻微下沉缩小、遮罩淡出，动画完成后才设置 `hidden` 与解除外部浮层状态；重复关闭不得产生竞态，`prefers-reduced-motion` 下直接收起。右上角工具区不再包裹额外的灰色托盘/外框，只保留带读数的自绘透明度滑杆、线性图标按钮与克制的黑白悬停反馈；所有控件无模糊，并保持浅色和深色语义一致。
+
+- 顶栏“背景”面板与浅色右栏共用轻透玻璃表面，深色语义下改用高不透明度墨绿黑表面且不使用模糊；面板滚动区保留滚轮/触控板滚动但隐藏原生滚动条。打开与关闭使用一次有限的淡入、轻微位移/缩放过渡，退场完成后才设置 `hidden`；`prefers-reduced-motion` 下直接切换。
+
+### 节点类型
+
+| kind | 行为 |
+| --- | --- |
+| `index` | 索引/目录节点。旧数据里缺 `kind` 或 `kind:"text"` 会迁移为索引语义。 |
+| `preview` | 正文悬停展开。 |
+| `card` | 卡片节点，标题 + 常驻正文。 |
+| `sticky` | 便签节点，正文即主体，常驻显示，可随机便签色。 |
+| `code` | 代码节点，整块按代码渲染，不走普通 Markdown/MathJax。 |
+| `textBox` | 装饰文字框，自身不参与连线；通用外观字段含 `fontSize`、`color`、`fontWeight`、`textAlign`，`boxStyle:"emphasis-card"` / `"note-bubble"` 另支持边框色、背景色、`borderWidth` 与 `borderStyle`。可通过 `textBindTarget` + `textBindDx` / `textBindDy` 持久跟随一个内容节点，也可显式转为该节点的标准导图子节点。 |
+| `shape` | 装饰形状：分组框、色块、虚线框、括号标记、分隔线、角标框、手绘圆角矩形/菱形/椭圆、问号图案。 |
+| `image` | 画布图片资源。 |
+| `pdf` | PDF 附件节点，可连线，可放大阅读和批注。 |
+| `md` | Markdown 附件节点，可连线，可阅读和批注。 |
+
+关键判断函数在 `canvas.js` 中：`isIndexNode`、`isBodyNode`、`isReadableNode`、`isDecorationNode`、`isLinkable`。当前规则是：`shape`、`image`、`textBox` 不可连线；PDF/MD 附件可连线并进入图谱，但导出 Markdown 时会跳过附件和装饰。
+图案模式中，点击某个图案按钮会激活拖拽创建工具，并在未选中实际对象时显示该图案的“预设”面板；此处修改的是后续创建默认值，不写入画布历史。未选中对象且没有激活创建工具时，右栏常驻显示“纯色色块 · 预设”，允许直接修改 `color-block` 的全局新建默认，但不会因此激活画布绘制。
+- 纯色色块的预设颜色固定按 6 列 × 3 行展示 18 色：浅色纸张色与降低饱和度、提高明度后的砖红、焦橙、赭黄、苔绿、青绿、靛蓝强调色交错分布在三行，不单独形成一排偏深色带；色表明确包含柔和红与杏橙。调整色表时应保持每组六色、三行明度均衡和明显的色相区分，避免重新堆叠多个难以辨认的灰白近似色。
+- 图案右栏严格区分“新建预设”和“对象属性”：无装饰对象选中时，普通字段、颜色/文字/分组预设和“重置新建预设”只改浏览器本地的新建默认，不改画布也不写历史；单选或纯装饰多选时，面板读取对象的共同值/“混合”状态，普通字段、预设按钮、右键改色、尺寸手柄和“应用新建预设 / 应用预设颜色”只改选中对象并写画布历史，不得把结果同步回新建默认。清选后面板必须立即恢复此前的新建预设值。
+- 装饰对象用 `layer:"back"|"front"` 表示相对正文的“底层 / 顶层”，并用整数 `zOrder` 保存同一显示图层内的叠放顺序；新建、复制、模板落地和导入的装饰对象进入所属显示图层顶部。图案属性面板底部提供“移到底部 / 下移一层 / 上移一层 / 移到顶部”，多选时把所选图案作为一组移动并保持组内顺序。多选图案必须显示真实批量状态，相同属性显示共同值，不同属性显示“混合”，不得退回“纯色色块 · 预设”；拖动期间仍保持原有顶层/底层关系。空白处右键拖出的纯色色块完整继承 `color-block` 预设（包括透明度），不得另写固定透明度。
+
+### 渲染和编辑
+
+- 普通文本显示态走 `MarkdownMini.render`；只有内容命中公式分隔符、TeX 环境或引用时才调度本地 MathJax，并在引擎就绪后补排。局部字号/字色/高光/粗体的真实数据是 `textMarks` / `bodyMarks`，`assets/richtext.js` 只在显示与 Markdown 导出边界把它序列化成 `==...==`、`{hl:...}`、`{tc:...}`、`{fs:...}` 与 `**...**`。编辑 DOM 始终是纯文字 + 格式 span，用户不会看到这些定界符；旧画布加载时自动解析为新结构并通过自动保存落盘。
+- 文本框显示态仍逐行调用 `MarkdownMini.renderInline`，但与内容节点共用同一套 `RelatumRichText` 数据模型，不另存可见语法字符串。代码节点保持纯源码，不启用局部富文本。
+- 底部纯图标文字属性带在主编辑器中常驻，不再随文本上下文出现/消失；全新用户默认收起。颜色、四档字号、粗体、高光、字色、三种对齐、绑定/转导图与清除全部位于同一个可横向滚动的单行容器，不再使用相互竞争的上浮弹层。没有适用上下文时相应按钮置灰，色块仍可预选颜色。无背景的箭头按钮收起整条属性带，收起后只显示透明向上箭头，并保持在属性带原来的最右端，不跳到屏幕中间；`canvas:textToolbarCollapsed` 在 `localStorage` 中跨画布全局记忆，展开/收起使用短位移、透明度和延迟 `visibility` 过渡，并服从 `prefers-reduced-motion`。有文字选区时字号、粗体、高光、字色与清除只修改该选区的 marks；清除按钮会一次移除选区上的所有局部格式，选区外保持不变。无选区时字号/粗体/对齐修改当前文本框或正在编辑的节点，纯文本工具上下文则写入之后新建默认。高光与文字颜色共用黄/橙/红/紫/蓝/青/绿/灰八色柔和色栏：点色块只选择并记住当前颜色，不修改内容；再点高光或字色图标才立即应用，高光与字色图标是命令按钮，不得维持 `active` / 作用目标选中态。选区格式后保留原选区与就地编辑态，以便连续叠加多种格式；不因点击字号、高光、字色或清除而提前提交/退出编辑。文本工具提交一个文本框后保持激活，`Esc` 或选择工具才退出连续创建；就地编辑时点击空白的这一次 `pointerdown` 只提交当前文本框，不得复用同一次事件新建对象，下一次点击才创建新文本框。文本工具下单击已有文本框必须优先进入该对象的编辑态，不新建对象，并按该次 `pointerdown` 的视口坐标把折叠光标放到对应文字位置，不得全选内容；再次单击已在编辑的文本框要放行给浏览器移动光标/选择文字。
+- 文本框拖动自动对齐由右下角齿轮的 `canvas:textSnapEnabled` 控制，默认关闭；关闭时拖动单个文本框既不显示绿色参考线，也不修改自由拖动落点。显式开启后，会对附近内容节点的左/中/右和上/中/下边线做 9 屏幕像素内软吸附并显示临时参考线，软吸附只负责对齐且不参与关系判断。底栏链接入口只有在选区恰好包含一个文本框与一个非装饰内容节点、且没有连线/箭头选择时才可用：点击会把文本框绑定或改绑到明确选中的节点；若当前已经是这一对则解除跟随。双选状态下拖动文本框只调整文本框自身及相对偏移，不得把目标一起拖走；目标普通拖动、导图排版与导图滑行都必须同步带动文本框，目标因上级折叠而隐藏时文本框也一起隐藏，删除目标则原地解绑。复制时，目标也在选区内就重映射到副本，只复制文本框则保留原目标并刷新相对偏移；模板只在目标同时被收入时重映射，否则解绑。
+- “转为导图子节点”与绑定入口使用同一组“一个文本框 + 一个内容节点”明确选择，不再要求两者预先绑定；原文本框保留 id、坐标、纯文字与局部 `textMarks`，清除 `kind:"textBox"`、跟随关系、尺寸和装饰字段，新建所选节点 `parent → child` 的树边并立即走现有导图样式/排版。这是显式类型转换，不让一个对象同时具有“文本框”和“导图节点”两种语义。转换结果默认写入 `hideChrome:true`，只隐藏子节点背景、边框和阴影，文字、透明命中区、选择反馈与树边仍保留；原文本框整体字色转换为不覆盖既有局部字色的全文语义色，八种共享柔和色精确保留，其他有效十六进制色映射到最近的共享色，黑色系沿用普通节点语义正文色；整体字重达到 600 以上时只给尚未局部指定粗体的范围补全文粗体。绝对字号按 `fontSize / (14.5 × 导图节点 scale)` 换算为 `fontScale` 并限制在现有 75%–160% 范围，节点整体 `scale`、宽高和对齐仍由导图预设接管。
+- 新建内容节点若未输入文字便结束编辑，持久化默认标题固定为 `Untitled`，与界面语言无关；已有节点不自动改名，空便签仍按既有规则保持为空。
+- Mermaid fence 走 `MermaidRenderer` 离线按需渲染；首次真实图表才插入 `vendor/mermaid/mermaid.min.js`。
+- 代码节点绕开 Markdown 渲染，标题从代码内容/语言推导。
+- 手写层包含笔、荧光笔、箭头、橡皮、压力/倾斜/书法效果。撤销历史包含节点、边、手写。
+- 历史栈限制约 50。AI 注入、模板实例化等批量操作应保持可整体撤销。
+
+### 附件和批注
+
+- PDF 使用离线 PDF.js。画布附件、索引右栏和大阅读器都只保留视野缓冲带内的页面；滚远、关闭、删除、快照重建或资源更换时必须取消在途 canvas/文字层任务、清零位图、断开 observer 并销毁 PDF 文档。大阅读器的会话 token 用于隔离快速关闭/重开；调整附件尺寸后只重栅格化可见页以恢复清晰。
+- PDF 读者批注包括文本高亮/下划线、画笔、荧光笔、框选、便签、橡皮、撤销/重做、清页。坐标归一化到虚拟宽度 `PDF_ANNOT_VW = 1000`。
+- Markdown 附件的文本高亮按源文件指纹处理；源文本变更时，字符偏移型标注可能失效，手写/框选仍保留。
+- 文本读者的节点批注不写进 `.canvas`，写在 `.assets/node-annotations.json`。
+
+### 模板
+
+- 模板库在 `data/templates.json`，所有画布共享。
+- 保存模板只保留“纯结构”：可读节点、边、允许的装饰形状。图片、PDF、MD 附件不进入模板。
+- 模板不会携带节点的 `review` 间隔复习进度。
+- AI 注入会剥离样式字段以保持安全和统一；模板实例化会保留样式字段。
+
+### AI 注入接口
+
+`CanvasModule` 暴露的关键方法：
+
+- `init`
+- `setMode`
+- `setFilePath`
+- `commitPendingEdits`
+- `getSelectedCardIds`
+- `removeArchivedNodes`
+- `revealNode`
+- `setExternalOverlayOpen`
+- `injectCanvas`
+- `instantiateTemplate`
+- `describeCanvas`
+- `exportImage`
+- `applyMindmap`
+- `applyMindmapStyle`
+- `alignMindmapLevels`
+- `setMindmapNodeSizes`
+- `getMindmapSizeState`
+- `restoreMindmapNodeSizes`
+- `equalizeMindmapLevelWidths`
+- `repairMindmapOverlaps`
+
+`describeCanvas` 只给 AI 读取可读节点和连线摘要，不发送装饰、附件正文、坐标等。`injectCanvas` 只接受 `card/index/preview/sticky/code`，并把新增内容放在当前视野中心附近。
+
+## 7. 起步页和页面模块
+
+### 起步页 `start.js`
+
+- 首页是书本式工作台，不是营销页。
+- 主要页面顺序包括复习、日历、速记、节奏/活跃、学习、专注、最近/分组；另有回收站、帮助、主题/背景设置。
+- 最近文件会展示存在状态、节点数、大小等；失效文件不主动删除，需要用户处理。
+- 最近画布的节点数统计按文件身份、大小和时间戳缓存，缓存上限 512 项；文件变化必须自动失效。
+- 分组、收藏、排序都存 `data/recent.json`。
+- 当前页通过 `aria-hidden` / `inert` 与 `start:viewchange` 统一管理；退场动画结束后，隐藏页用 `visibility:hidden` + `content-visibility:hidden` 跳过后代绘制。学习、活跃、速记、日历、复习和专注模块应在离页/pagehide 时暂停自己的计时器、RAF、observer 或音频，不能让隐藏页继续耗帧。
+- 默认最近页不预读 `/api/study` 或 `/api/notes`；学习和速记数据在首次进入对应页或执行跨页动作时加载，并复用同一个在途 Promise。首次加载完成前不得用空前端状态覆盖服务端数据。
+
+### 学习 `study.js`
+
+- 学习任务有 `todo/doing/done`，支持看板和极简清单两种视图。
+- 任务可链接画布，也可从任务创建画布；学习页内有迷你编辑器 iframe。
+- 拖拽排序、移入回收、恢复、永久删除、归档已完成任务都走后端 API。
+- 隔日未完成任务会作为 carry-over 提醒，可本地打盹当天。
+- 选中环的 900ms 保险校准只在学习页可见时运行；离页/pagehide 停止，BFCache 恢复时按当前页重新启动。
+- 今日任务横向列表必须为卡片悬停上移和 2px 选中环保留纵向裁切缓冲，黑色描边不能在列表顶边被截断。
+
+### 活跃星图 `study-graph.js`
+
+- 使用 `graph-engine.js` 渲染学习活动图。
+- 普通视图按根节点、月份、任务组织；概览视图按年份、月份、任务组织。
+- 图谱是只读展示，不负责跳转画布编辑定位。
+- 普通/概览分段滑块必须在动态中英翻译完成后按最终按钮尺寸重定位，不能沿用中文宽度裁切英文 `Normal`。
+
+### 速记 `notes.js`
+
+- 速记墙是独立数据 `data/notes.json`，不是 `.canvas`。
+- 支持双击空白建便签、拖拽、堆叠/扇形预览、右键/快捷删除、便签间连线、箭头、搜索、键盘浏览、缩放和平移。
+- 归档速记会写入学习归档目录下的 `notes.json`。
+- 离开速记页或进入 BFCache 时会取消惯性、缩放、滚轮/方向键 RAF、悬停展开与堆叠滚轮计时器，并按“先停交互、后落盘”的顺序保存。
+
+### 日历 `calendar.js`
+
+- 日记是每天一个 Markdown 文件，带 frontmatter：`title/date/tags/updatedAt`。
+- 日历聚合日记、学习任务、专注记录、归档记录、倒数日和任务便签。
+- 月历任务便签保存在 `data/calendar-pins.json`，按月份保存自由坐标和颜色。
+- 倒数日保存在 `data/countdown.json`，起步页可开关显示。
+- 倒数日数据 v2 支持最多 100 个事件，也支持真正的零事件空状态：删除最后一条后后端删除 `data/countdown.json`，GET 返回空的 v2 结构；旧版 `{event,date}` 读取时仍作为第一条事件迁移。事件选择会持久化 `selectedId`，前端不使用 `localStorage` 存事件。
+- 日历右上角显示当前倒数摘要或“创建第一个倒数日”入口；单击时钟图标（空状态时点击创建入口）导航到独立 `countdown.html`，返回统一落到 `index.html?view=calendar`，由起步页恢复日历视图。摘要中的事件名和日期/剩余天数区域支持双击就地编辑，Enter 保存、Esc 取消、失焦保存，键盘聚焦后也可用 Enter/F2；编辑时隐藏摘要标签和其余句子，让输入框独占卡片剩余宽度，不能把固定宽输入框塞进原句导致右侧裁切。倒数日页面不依附日历 DOM，不使用全屏 `backdrop-filter`，也不使用原生 Fullscreen API。
+- 独立倒数日页使用不透明深色表面，左侧管理事件、右侧显示当前时钟；新建/编辑共用页面内对话框，删除需短时间内二次确认，最后一条允许删除。当前事件标题和日期支持双击就地编辑（键盘聚焦后也可按 Enter/F2），输入框内 Enter 保存、Esc 取消、失焦保存；保存先轻量更新当前标题、日期与左侧条目，再异步落盘，不重建页面。“放大”进入页面内专注视图：顶栏上移退场、左侧事件栏收至零宽、标题与底部提示淡出，四栏数字卡按同一页面布局连续放大；右上角只留低透明度退出按钮，悬停展开文字，Esc 优先退出专注视图。该模式不调用原生 Fullscreen、不重建时钟 DOM、不持久化，使用 `--easing-page` / `--easing-soft` 和有限 transition，低动态模式下静态切换。计时器按真实整秒对齐，用一次性 timeout 调度。翻页内核复用 `daoshu` 参考项目的固定四层结构：静态上下页和旧上/新下叶片从建页起常驻，每次只更新文字并重启 `.go` 类，不创建或删除合成层；旧上叶片按 `280ms ease-in` 折走，新下叶片延迟 `280ms` 后按 `300ms cubic-bezier(0.37,0,0.63,1)` 落下，600ms 后提交静态底页。为严格保持参考效果，单个变化单位允许读取一次自身 `offsetWidth` 重启动画；不复制参考项目的 200ms 轮询、`drop-shadow` 滤镜、毛玻璃或 Electron 外壳。页面隐藏或离开时必须停止计时器，`prefers-reduced-motion` 下直接换值。
+- 放大/退出按钮使用 `aria-label` 和自身文字，不设置会触发浏览器原生提示的 `title`；退出按钮在悬停与键盘聚焦时都展开文字。倒数页从浏览器前进/后退缓存恢复时，`pageshow` 必须重启并重新对齐计时。
+
+### 复习 `review.js`
+
+- 复习池由后端扫描 `canvases/*.canvas` 生成，不递归进入 `.assets/` 或回收站，也不单独维护数据库；接口只保留排序最前的 240 张完整卡片，但 `count` 仍统计全部候选。
+- 只有 `index/preview/card/sticky/code` 等可读节点，并且 `node.review.enabled === true`，才会进入复习池。
+- 被划掉/归档语义的节点会被跳过。
+- 间隔天数：`[0, 1, 3, 7, 16, 35]`。没有 due 的卡片视为当前可复习。
+- 复习页渲染 Markdown、MathJax、Mermaid；代码节点按纯代码展示。
+- 自定义问题和答案来自节点的 `review.questions` / `review.answer`。
+
+### 专注 `focus.js`
+
+- 支持番茄钟和正计时，运行状态存在 `localStorage`，刷新后可恢复。
+- 可绑定学习任务或每日任务。专注完成后写入 `data/focus.json`，并同步任务统计。
+- 支持音效、柔和噪音、时长偏好、目标/收尾记录、记录编辑/删除、Zen 模式。
+- 每日任务是独立清单 `data/daily.json`，每天重置勾选状态，但累计天数和分钟保留；v3 起每条任务记录 `doneDates` / `minutesByDate`，用于专注页任务打卡日历。
+- 每日任务详情标题保留单行省略号，但行盒必须给中英文及拉丁字母上下伸部留足空间，短标题也不能被纵向裁切。
+- `pagehide` 会持久化运行态、停 ticker 并暂停 AudioContext；BFCache `pageshow` 会按保存时间补算经过秒数、恢复 ticker/显示和需要继续播放的噪音。
+
+### 回收站 `trash.js`
+
+- 右栏列出 `canvases/回收站/` 下的画布；左栏是恢复目标分组。
+- 点击、拖拽、键盘数字键都可恢复到目标分组。
+- 一键清空需要确认，并永久删除回收站内容。
+
+## 8. AI 功能现状
+
+- AI 配置存在 `data/ai.json`：`apiKey`、`model`、`baseUrl`。前端只看到是否有 Key 和末尾掩码，不长期保存完整 Key。
+- 默认 `baseUrl` 是 `https://api.deepseek.com`，默认模型是 `deepseek-chat`。调用接口是 OpenAI 兼容 `/chat/completions`。
+- 单次请求上下文最多保留 40 条消息；输出上限给到 `32768`，超长会回传截断提示。
+- 后端启用 DeepSeek thinking 参数；其他 OpenAI 兼容服务通常会忽略未知字段或自行处理。改这块前要测试对应服务。
+- AI 面板有两类行为：
+  - 普通发送：只在右侧对话区回复，不改画布。
+  - 生成到画布/挂到选中/基于画布补充/整理精炼：调用 `/api/ai-compose`，后端要求模型只输出 JSON，解析后布局，前端先展示预览，用户点“放进画布”才调用 `CanvasModule.injectCanvas`。
+- `AI笔记创作指南.md` 是 compose 的完整提示词资源。源码模式从项目根读取；冻结包里如果缺失，会退回内置精简提示。
+- compose 允许的节点类型是 `card/index/preview/sticky/code`，最多 40 个。端点可以是本次生成节点下标，或上下文里已有节点 id。
+- 前端 AI 上下文模式有“连续对话”和“单次请求”，偏好键是 `canvas:ai-context-mode:v1`。聊天历史是页面内存，刷新后重新开始。
+
+## 9. 导入、导出、归档
+
+- Markdown 导出会生成一组互相双链的 `.md` 文件。装饰、图片、PDF、MD 附件不导出；连到这些节点的边也会被邻接过滤。
+- Markdown 导入只接受文件夹第一层 `.md` 文件；开头连续的 `[[标题]]` 行表示双链。单文件最多 4MiB、总计最多 64MiB、一次最多 2000 个文件；单个连通簇超过 240 个节点时改用确定性网格，避免 O(n²) 力导向长时间占满 CPU。
+- PNG 导出由前端 `CanvasModule.exportImage` 生成，尽量包含节点、边、手写、图片、形状和背景；PDF 节点不完整导出，公式可能降级。
+- 编辑器顶栏“归档”只移走当前画布中已划删除线的正文节点及其相邻连线，画布本身保留，并在 `data/画布归档/` 留轻量记录。
+- “导出画布到任务”会按画布节点生成学习任务；修改时要同时检查学习任务字段和画布读取逻辑。
+
+## 10. 桌面壳和打包
+
+- 桌面方案是 pywebview + WebView2，不是 Electron。
+- `desktop.py` 会先启动本地服务，再打开 `index.html?desktop=1` 或 `editor.html?desktop=1&file=...`。
+- Windows 下做了无边框窗口：隐藏原生标题栏、保留系统最小化/最大化动画、DWM 圆角、关闭时检查 dirty。
+- `desktop-shell.js` 负责窗口按钮、pywebview ready 队列、dirty 标记和桌面 session 标识。
+- WebView2 用户数据默认在 `%LOCALAPPDATA%\Canvas\WebView2`；启动时给 HTTP 磁盘缓存和媒体缓存分别设置 64MiB / 32MiB 参数上限。这不是整个用户目录或 Code/GPU Cache 的硬总上限，不要为清缓存误删 Cookies、localStorage 等用户状态。
+- 窗口状态版本是 `2`，尺寸以逻辑像素原子保存到 `data/window-state.json`。
+- 构建脚本输出 `Relatum-release/Relatum.exe`、同级 `Relatum.exe.config` 和 `_internal/`。配置文件通过 .NET Framework `loadFromRemoteSources` 允许加载被 Windows 标记为来自 Web 的随包 pythonnet 程序集；分发时不能漏掉。不要再写旧的 `画布-release`。
+- 构建会整体替换 `Relatum-release/`；若目录内已有 `canvases/` 或 `data/`，默认拒绝覆盖，除非显式 `-ForceReplaceUserData`。
+- 构建环境参考 `README.md`：Python 3.9-3.12，`pywebview==6.2.1`，`pyinstaller==6.20.0`，Pillow 用于图标。
+
+## 11. 验证清单
+
+文档-only 改动：
+
+- 至少重新读取 `AGENTS.md`，确认编码和结构正常。
+- 可用 `Select-String` 或 `rg` 检查关键章节是否存在。
+
+Python 改动：
+
+```powershell
+python -m py_compile .\app.py .\desktop.py .\packaging\make_icon.py .\packaging\make_font_subset.py
+```
+
+前端 JS 改动：
+
+```powershell
+node --check .\assets\canvas.js
+node --check .\assets\editor.js
+node --check .\assets\i18n.js
+node --check .\assets\start.js
+node --check .\assets\countdown.js
+```
+
+只检查改过的手写 JS；不要对 `assets/vendor/` 里的压缩库做人工格式化或随意 check。
+
+本地服务冒烟：
+
+```powershell
+python .\app.py --no-browser --port 8799
+Invoke-WebRequest http://127.0.0.1:8799/api/runtime
+```
+
+如果启动了服务，完成后要关闭对应进程。前端/交互改动应打开实际页面验证，尤其是 `index.html`、`editor.html` 和涉及的功能页。
+
+桌面或打包改动：
+
+- 先读 `README.md` 的“构建 Windows 桌面版”章节。
+- 只在用户要求或任务确实需要时运行 `build-desktop.ps1`。
+- 验收 `Relatum-release/Relatum.exe`、同级 `Relatum.exe.config`、`_internal/assets/`、`_internal/AI笔记创作指南.md`，并确认没有把 `canvases/`、`data/` 打进包里。
+
+## 12. 常见坑
+
+- README 可能滞后；本文件和源码优先。
+- 旧文档里的 `kind:"text"` 不应作为新节点类型继续扩展。当前语义是迁移/兼容到 `index`。
+- 专注页现在确实有柔和噪音选项；不要照旧文档写“没有白噪音/噪音功能”。
+- PDF/MD 附件是可连线节点，也会出现在图谱里；但 Markdown 导出会跳过它们。
+- 模板不会保存附件、图片和复习进度。
+- `graph-engine.js` 与 `graph-gl.js` 是性能关键路径。WebGL 后端只画几何，中文文字不要塞进 GPU 字体图集。
+- MathJax 是首个公式源触发的空闲异步加载。不要让普通文本节点无条件加载或排队公式排版。
+- 日历保存日记有草稿和串行保存链；不要用简单 debounce 覆盖已有防竞态设计。
+- 学习页迷你画布是 iframe 内嵌编辑器，隐藏顶栏并锁普通模式；不要把完整编辑器偏好写乱。
+- 构建脚本、PowerShell 启动脚本尽量保持 ASCII，避免 Windows PowerShell 5.1 编码问题。
+
+## 13. 改功能时如何同步本文
+
+每次新增或改动功能，至少检查：
+
+- 新增入口文件或模块：更新“源码地图”。
+- 新增持久化文件、字段、localStorage key：更新“运行时和数据位置”。
+- 新增/删除 API：更新“后端路由总览”。
+- 改节点、边、附件、模板、AI 注入：更新“画布编辑器契约”或“AI 功能现状”。
+- 改桌面/构建：更新“桌面壳和打包”。
+- 改验证方式：更新“验证清单”。
+
+保持这份文档像地图，不要把具体任务争论、临时猜测、一次性 TODO 塞进来。

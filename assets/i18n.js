@@ -1,0 +1,1093 @@
+(function () {
+  'use strict';
+
+  const STORAGE_KEY = 'canvas:toolbarLanguage';
+  const EN = {
+    '起步页': 'Home', '最近': 'Recent', '收藏': 'Favorite', '分组': 'Groups',
+    '复习': 'Review', '日历': 'Calendar', '速记': 'Notes', '活跃': 'Activity',
+    '复': 'Review', '学': 'Study', '专': 'Focus',
+    'spineReviewGlyph': 'R', 'spineCalendarGlyph': 'C', 'spineStudyGlyph': 'S',
+    '学习': 'Study', '专注': 'Focus', '画布': 'Canvas', '导图': 'Mind Map', '图案': 'Shapes',
+    '普通': 'Standard', '专业': 'Professional', '编辑': 'Edit', '完整界面': 'Full interface',
+    '加载中…': 'Loading…', '加载中...': 'Loading…', '帮助': 'Help', '设置': 'Settings',
+    '新建分组': 'New group', '打开起步页使用指引': 'Open the getting-started guide',
+    '切换为浅色起始页': 'Switch to light theme', '切换为深色起始页': 'Switch to dark theme',
+    '调整翻页速度': 'Adjust page motion', '分组导航': 'Page navigation',
+    '主页背景风格': 'Home background style', '速记便签墙': 'Notes', '活跃热力图': 'Activity',
+    '学习页': 'Study page', '活跃热力图页': 'Activity page', '速记便签墙页': 'Notes page',
+    '日历与日记页': 'Calendar and journal page', '复习卡片页': 'Review page', '专注钟页': 'Focus page',
+    '打开文件': 'Open file', '打开已有文件': 'Open an existing file', '新建画布': 'New canvas',
+    '导入 MD': 'Import MD', '导入 MD 文件夹': 'Import MD folder', '进入学习页': 'Go to Study',
+    '开始你的第一张画布': 'Begin with your first canvas',
+    '为想法、规划、知识网络准备一块空白': 'A quiet space for ideas, plans, and connected knowledge.',
+    '回收站': 'Trash', '任务回收站': 'Task Trash', '清空回收站': 'Empty Trash',
+    '客户端设置': 'Desktop Settings', 'DESKTOP CLIENT': 'DESKTOP CLIENT',
+    '设置窗口从最大化恢复后使用的大小。标题栏的最小化按钮仍会将窗口收进任务栏。': 'Choose the window size used after leaving maximized view. Minimize still sends the app to the taskbar.',
+    '紧凑': 'Compact', '均衡': 'Balanced', '宽敞': 'Spacious', '宽度': 'Width', '高度': 'Height',
+    '应用': 'Apply', '可选范围会按当前显示器自动调整': 'Available sizes adapt to the current display.',
+    '界面语言': 'Interface language', '中文': 'Chinese', '英文': 'English',
+    '起始页、专注、学习与画布使用同一种语言': 'Use one language across Home, Focus, Study, and Canvas.',
+    '翻页速度': 'Page motion', '快': 'Fast', '慢': 'Slow', '速记惯性': 'Note inertia',
+    '稳': 'Steady', '滑': 'Fluid', '叠摞展开延迟': 'Stack hover delay', '瞬发': 'Instant', '长按': 'Long press',
+    '主页背景': 'Home background', '简洁': 'Minimal', '沉浸': 'Immersive',
+    '足迹星图动画': 'Activity constellation motion', '重置': 'Reset', '生长时长': 'Growth duration',
+    '错峰间隔': 'Stagger', '入场力度': 'Entrance force', '阻尼': 'Damping', '速度上限': 'Speed limit',
+    '结束后自动取景': 'Reframe after motion', '关闭时镜头不再补移动': 'When off, the camera stays where the motion ends.',
+    '日历倒数日': 'Calendar countdown', '在日历页显示目标日期': 'Show target dates on Calendar.',
+    '打开翻页时钟': 'Open flip clock', '翻页时钟': 'Flip clock',
+    '关闭翻页时钟': 'Close flip clock', '倒数事件列表': 'Countdown events',
+    '倒数事件': 'Countdown events', '关闭事件列表': 'Close event list',
+    '编辑倒数事件': 'Edit countdown', '删除倒数事件': 'Delete countdown',
+    '新建倒数日': 'New countdown', '创建第一个倒数日': 'Create first countdown',
+    '返回日历': 'Back to Calendar', '事件名称': 'Event name', '目标日期': 'Target date',
+    '准备迎接什么？': 'What are you counting down to?', '至少保留一个倒数日': 'Keep at least one countdown.',
+    '时': 'hr', '秒': 'sec',
+    '隐藏特殊页': 'Hide utility pages',
+    '收起复习/日历/速记/活跃/学习/专注，只留最近·收藏·分组': 'Hide Review, Calendar, Notes, Activity, Study, and Focus; keep Recent, Favorites, and Groups.',
+
+    '新建任务': 'New task', '任务': 'Tasks', '任务详情': 'Task details', '任务画布': 'Task canvas',
+    '今日': 'Today', '今日任务': 'Today’s tasks', '待办': 'To do', '进行中': 'In progress',
+    '已完成': 'Completed', '归档': 'Archive', '都带到今天': 'Move all to today', '不用了': 'Not now',
+    '添加今日任务': 'Add today’s task', '开始专注': 'Start focus', '专注投入': 'Focus time',
+    '尚无记录': 'No sessions yet', '状态': 'Status', '标题': 'Title', '备注': 'Notes',
+    '标签': 'Tags', '用逗号分隔': 'Separate with commas', '截止日期': 'Due date',
+    '关联画布': 'Linked canvas', '打开关联画布': 'Open linked canvas', '新建并关联画布': 'Create and link a canvas',
+    '关联后锁定不可更改；删除任务时画布一并进回收站': 'Once linked, it stays fixed. Deleting the task also moves its canvas to Trash.',
+    '取消': 'Cancel', '保存': 'Save', '移到回收站': 'Move to Trash',
+    '暂无任务': 'No tasks', '任务统计': 'Task summary', '任务看板': 'Task board',
+    '新建待办任务': 'New to-do task', '删除任务': 'Delete task',
+    '选中任务按 G 加入，或按 F 进入今日专注': 'Select a task and press G, or press F to enter Focus.',
+    '今天的任务，全部完成。': 'Everything for today is complete.',
+    '给自己一个停顿。明天的事，明天再说。': 'Take a breath. Tomorrow can wait until tomorrow.',
+    '还没有每日任务 · 在下面加一件想每天坚持的事': 'No daily tasks yet · add one small thing to repeat each day.',
+    '未命名任务': 'Untitled task', '未命名分组': 'Untitled group', '（不分组）': '(No group)',
+    '子分组': 'Subgroup', '在此加任务': 'Add task here', '空': 'Empty',
+    '已绑定本段': 'Bound to session', '设为本段专注': 'Focus on this',
+    '取消今日打卡': 'Undo today', '今日打卡': 'Check in today', '还没有历史打卡': 'No check-ins yet',
+
+    '复习卡片': 'Review Cards', '待复习': 'Due', '今日复习': 'Reviewed today', '更新': 'Refresh',
+    '复习统计': 'Review summary', '重新读取复习池': 'Refresh review cards',
+    '还没有可复习节点': 'No cards to review yet',
+    '在画布里写几个正文节点，或在编辑模式里打开「加入复习」。': 'Write a few text nodes in a canvas, or enable Add to Review while editing.',
+    '在编辑模式里选中正文节点，勾选「加入复习卡片」即可。': 'Select a body node in Edit mode, then enable Add to Review.',
+    '节点': 'Node', '生': 'New', '未命名节点': 'Untitled node',
+    '你还记得这个节点在讲什么吗？': 'What do you remember about this node?',
+    '查看答案': 'Reveal answer', '记得': 'Remembered', '模糊': 'Vague', '不会': 'Forgot',
+    '换个问题': 'Another prompt', '打开画布': 'Open canvas', '再来一张': 'Next card', '退出漫游': 'Exit roam',
+    '✦ 自由复习中 · 不计进度、不改间隔': '✦ Free review · progress and intervals stay unchanged',
+
+    '专注钟': 'Focus Timer', '今日段数': 'Sessions today', '今日专注': 'Focus today',
+    '今日专注统计': 'Today’s focus summary', '专注设置': 'Focus settings',
+    '专注页使用帮助': 'Focus help', '重新读取专注数据': 'Refresh focus data',
+    '准备开始': 'Ready when you are', '番茄钟': 'Pomodoro', '正计时': 'Open timer',
+    '番茄钟 · 专注 25 / 休息 5 分': 'Pomodoro · 25 focus / 5 rest', '准备这一段': 'Prepare this session',
+    '专注于': 'Focus on', '不绑定 · 只是专注': 'No task · just focus', '本段目标': 'Session intention',
+    '开始前写下这一段准备完成什么；运行中也可点座舱目标行随时补改。': 'Write down what this session should accomplish. You can refine it while the timer is running.',
+    '这一段准备完成什么？（可选）': 'What will you accomplish this session? (optional)',
+    '绑定学习任务': 'Link a study task', '计时模式': 'Timer mode',
+    '双击修改专注时长': 'Double-click to change focus length',
+    '每日任务（Tab 开合）': 'Daily tasks (Tab to toggle)',
+    '开始或暂停': 'Start or pause', '开始': 'Start', '暂停': 'Pause', '完成本段': 'Finish session',
+    '退出深度专注': 'Exit deep focus', '深度专注': 'Deep focus', '今日足迹': 'Today’s trail',
+    '今天还没有专注记录 · 开始第一段吧': 'No focus sessions yet · begin the first one.',
+    '今日没有专注记录': 'No focus sessions today',
+    '补一句实际成果，再继续、收工或明确完成任务。': 'Capture the outcome, then continue, stop, or complete the task.',
+    '实际完成': 'Outcome', '保存并继续': 'Save & continue', '保存并收工': 'Save & finish',
+    '保存并完成任务': 'Save & complete task', '专注记录': 'Focus session', '编辑这一段': 'Edit session',
+    '目标': 'Intention', '成果': 'Outcome', '删除记录': 'Delete session', '保存修改': 'Save changes',
+    '专注（分）': 'Focus (min)', '休息（分）': 'Break (min)', '长休（分）': 'Long break (min)',
+    '几段后长休': 'Sessions before long break', '结束提示音': 'Completion sound',
+    '柔和噪音 · 专注时': 'Soft noise while focusing', '噪音音量': 'Noise volume',
+    '怎么使用': 'How it works', '双击时间': 'Double-click time',
+    '修改番茄钟的专注分钟数；运行中不可修改。': 'Change focus minutes before the timer starts.',
+    '选择任务': 'Choose a task', '这一段会计入所选的学习任务或每日任务。': 'This session will count toward the selected study or daily task.',
+    '每日任务': 'Daily tasks', '深度专注': 'Deep focus',
+    '运行时点 ⛶ 或按 Z 进入全屏极简，Esc 退出。': 'While running, select ⛶ or press Z for a minimal full-screen view. Press Esc to leave.',
+    '学习页负责安排，专注页负责执行，日历负责回看。': 'Plan in Study, do the work in Focus, and look back in Calendar.',
+    '查看今日清单': 'View today’s list', '今天的每日任务都做完了': 'All daily tasks are complete.',
+    '正在做': 'Now doing', '自由专注': 'Open focus', '＋ 为这一段写个目标': '+ Add an intention',
+    '继续': 'Continue', '跳过休息': 'Skip break', '保存并完成这件每日任务': 'Save & complete daily task',
+    '本段将计入': 'This session counts toward',
+
+    '年度足迹': 'Annual Activity', '完成': 'Completed', '静': 'Quiet', '丰': 'Full',
+    '足迹浓度从静到丰': 'Activity intensity from quiet to full', '热力图查看': 'Activity view',
+    '足迹星图': 'Activity Constellation', '最近完成': 'Recent Completions',
+    '活跃统计': 'Activity summary', '专注时间统计': 'Focus summary',
+    '安静的一天': 'A quiet day', '归档过的任务，会安静地留在这里。': 'Archived work stays here as a quiet record.',
+    '重新读取活跃数据': 'Refresh activity data', '活跃年份翻页': 'Activity years',
+    '已完成任务 · 一年活跃': 'Completed work · annual activity',
+    '今天': 'Today', '尚未到来': 'Upcoming', '暂无记录': 'No activity',
+    '悬停回望，点击展开当天成果': 'Hover to look back; select a day to open its outcomes.',
+    '今天仍是一张等待落笔的纸。': 'Today is still a blank page waiting to be written.',
+    '今天仍是一张等待续写的纸。': 'Today is still a page waiting to continue.',
+    '本月完成': 'Completed this month', '连续推进': 'Current streak',
+    '累计归档': 'Archived total', '累计完成': 'Completed total',
+    '星图查看模式': 'Constellation view', '正常': 'Normal', '总览': 'Overview',
+    '未专注': 'No focus', '今天还没有开始专注。': 'No focus session has started today.',
+    '这一天还在前方。': 'This day is still ahead.', '共': 'Total', '段专注': 'focus sessions',
+    '今日专注': 'Focus today', '本月专注': 'Focus this month',
+    '今年专注': 'Focus this year', '累计专注': 'All-time focus',
+    '分钟': 'min', '小时': 'hr', '分': 'min', '天': ' days',
+
+    'AI 助手': 'AI Assistant', '图谱': 'Graph', '背景': 'Background', '模板': 'Templates',
+    '导出 MD': 'Export MD', '导出 PNG': 'Export PNG', '转为任务': 'Turn into Tasks',
+    '确认转为任务': 'Confirm Tasks', '确认归档划线节点': 'Confirm Archive',
+    '已保存': 'Saved', '保存中…': 'Saving…', '未保存': 'Unsaved', '顶栏语言': 'Interface language',
+    '（这里没有未分组的画布）': 'No ungrouped canvases yet.',
+    '（还没有收藏的画布）': 'No favorite canvases yet.',
+    '（空 — 拖文件进来，或右键画布选「移动到」）': 'Empty — drag a file here, or right-click a canvas and choose Move to.',
+    '(未命名)': 'Untitled', '文件已不在': 'File missing',
+    '收藏': 'Favorite', '取消收藏': 'Remove from Favorites',
+    '已收藏': 'Added to Favorites', '已取消收藏': 'Removed from Favorites',
+    '先用 ↑↓ 选中一个画布': 'Use ↑↓ to select a canvas first.',
+    '已移到回收站': 'Moved to Trash', '重命名': 'Rename',
+    '在文件资源管理器打开': 'Show in File Explorer', '从列表移除': 'Remove from list',
+    '移动到': 'Move to', '（还没有分组，先在左栏新建一个）': 'No groups yet. Create one in the sidebar first.',
+    '重命名分组': 'Rename group', '删除分组': 'Delete group', '分组名称': 'Group name',
+    '重命名失败': 'Rename failed', '新建分组失败': 'Could not create group',
+    '只能拖入 .canvas 画布文件': 'Only .canvas files can be dropped here.',
+    '导入失败': 'Import failed',
+    '我的模板': 'My Templates', '模板列表': 'Template list',
+    '还没有模板。用左侧「套索」圈出一组节点，点「保存到模板」就能存到这里。': 'No templates yet. Use the Lasso tool to select a group of nodes, then choose Save as Template.',
+    '拖动模板卡片到画布即可放置；卡片右上角 × 删除模板。': 'Drag a template card onto the canvas to place it. Use × in the upper-right corner to delete it.',
+    '拖动模板卡片到画布即可放置；卡片右上角': 'Drag a template card onto the canvas to place it. Use',
+    '删除模板。': 'in the upper-right corner to delete it.',
+    '拖到画布放置': 'Drag onto the canvas to place', '未命名模板': 'Untitled template',
+    '删除模板': 'Delete template', '删除？': 'Delete?',
+
+    '画布背景': 'Canvas background', '全局背景': 'Global Background',
+    '关闭背景设置': 'Close background settings', '恢复默认纸白': 'Restore Paper White',
+    '柔和纯色': 'Soft Solids', '暖米': 'Warm Rice', '雾青': 'Mist Green',
+    '灰蓝': 'Slate Blue', '砂粉': 'Sand Rose', '月灰': 'Moon Gray',
+    '自定义纯色': 'Custom Color', '柔和渐变': 'Soft Gradients',
+    '晨雾': 'Morning Mist', '象牙光': 'Ivory Light', '松烟': 'Pine Haze',
+    '雨后': 'After Rain', '暮砂': 'Dusk Sand', '月白': 'Moon White',
+    '沉浸预设（浅色）': 'Immersive Presets · Light',
+    '清晨': 'Dawn', '云湖': 'Cloud Lake', '雪岭': 'Snow Ridge',
+    '杏光': 'Almond Light', '竹雾': 'Bamboo Mist', '珠雾': 'Pearl Haze',
+    '雨玻': 'Rain Glass', '云霞': 'Rose Cloud', '天青': 'Sky Azure',
+    '薄荷': 'Mint', '薰衣': 'Lavender', '藕荷': 'Lotus Haze', '宣纸': 'Rice Paper',
+    '沉浸预设（深色）': 'Immersive Presets · Dark',
+    '北极光': 'Aurora', '极冕': 'Aurora Corona', '雪山极光': 'Snow Aurora',
+    '星峦': 'Star Peaks', '皓月': 'Full Moon', '孤月': 'Lone Moon',
+    '新月': 'Crescent', '暮湖': 'Dusk Lake', '虹桥': 'Dusk Bridge',
+    '暮途': 'Dusk Road', '晚照': 'Evening Glow', '幽林': 'Deep Forest', '夜泊': 'Night Harbor',
+    '标题栏': 'Top Bar', '背景展示范围': 'Background Coverage',
+    '全屏沉浸': 'Full Immersion', '柔和工具栏': 'Soft Toolbar',
+    '背景语义': 'Background Tone',
+    '全屏沉浸时影响标题栏文字颜色；本地图片默认浅色。': 'Controls top-bar text color in Full Immersion. Local images default to Light.',
+    '标题栏可读性保护': 'Top-Bar Readability', '轻': 'Light',
+    'backgroundReadabilityMedium': 'Medium',
+    '全屏沉浸时有效，仅在标题栏覆盖极淡保护层。': 'Available in Full Immersion; adds only a subtle protective layer behind the top bar.',
+    '本地图片': 'Local Image', '选择图片': 'Choose Image', '尚未选择图片': 'No image selected',
+    '拖动调整背景图片构图': 'Drag to reframe the background image', '标题栏区域': 'Top-bar area',
+    '拖动调整构图中心': 'Drag to adjust focal point', '图片透明度': 'Image opacity',
+    '图片缩放': 'Image scale', '水平位置': 'Horizontal position', '垂直位置': 'Vertical position',
+    '恢复默认构图': 'Reset framing', '移除图片并恢复默认': 'Remove image & restore default',
+    '设置对所有画布生效；图片只记录本地绝对路径，移动文件后会回退为默认背景。': 'These settings apply to every canvas. Images store only their local absolute path; moving the file restores the default background.',
+
+    '编辑颜色或尺寸会转为手工值；恢复后会继续跟随脑图分支和层级。': 'Editing color or size creates a custom value. Restore it to follow the mind-map branch and level again.',
+    '转换会保留标题；索引按连接关系自动生成目录，卡片正文常驻显示，预览悬停展开，代码只做语法着色。': 'Conversion keeps the title. Index builds an outline from links; Card keeps its body visible; Preview expands on hover; Code adds syntax color only.',
+    '仅保留标题，正文会在确认后清除。': 'Keeps the title only; the body is cleared after confirmation.',
+    '当前内容会完整保存为正文，首行成为可见标题，可撤销。': 'Keeps the full content as the body and uses its first line as the visible title. This can be undone.',
+    '只影响当前代码节点的着色；代码不会执行，也不会解析 Markdown 或数学公式。': 'Changes syntax coloring for this code node only. Code is never executed or parsed as Markdown or math.',
+    '选中文字可添加高光、字色或字号；回到画布后按 F 阅读。': 'Select text to add highlights, text color, or size. Press F on the canvas to read.',
+    '复习页会优先抽这些问题，再混合系统预设问题。': 'Review prioritizes these prompts, then mixes in built-in prompts.',
+    '写给未来的自己对照用；复习卡片右上角「查看答案」会显示它。': 'Write a reference for your future self. Reveal answer on the review card will show it.',
+    '把选中的正文节点一次性加入复习卡片；若都已加入则改为全部移出。': 'Add all selected body nodes to Review at once; if all are already included, remove them instead.',
+    '改动作用于当前选中的内容节点或连线；多选会批量应用，创建操作仍可正常使用。': 'Changes apply to the selected content nodes or edges. Multiple selections update together, while creation tools remain available.',
+    '只影响简洁画布模式中之后新建的节点与连线。': 'Applies only to nodes and edges created later in Quiet Canvas mode.',
+    '路径与箭头': 'Paths & Arrowheads', '恢复简洁默认': 'Restore Quiet Defaults',
+    '类型与轮廓': 'Type & Outline', '边框': 'Border',
+    '当前节点': 'Current node', '脑图节点': 'Mind-map node',
+    '当前连线': 'Current edge', '脑图连线': 'Mind-map edge', '单选': 'Single selection',
+    '思维导图样式': 'Mind Map Style', '跟随预设': 'Follow Preset',
+    '混合选择': 'Mixed selection', '手工配色与尺寸': 'Custom colors & size',
+    '手工配色': 'Custom colors', '手工尺寸': 'Custom size',
+    '恢复预设配色': 'Restore Preset Colors', '恢复自动尺寸': 'Restore Auto Size',
+    '阅读（F）': 'Read (F)',
+    '转换为索引节点': 'Convert to Index Node', '转换为预览节点': 'Convert to Preview Node',
+    '转换为卡片节点': 'Convert to Card Node', '转换为代码节点': 'Convert to Code Node',
+    '转换为普通节点': 'Convert to Standard Node', '整体缩放': 'Overall Scale',
+    '文字与轮廓': 'Text & Outline', '正文': 'Body', '默认': 'Default',
+    '只在阅读窗口显示': 'Shown in reader only',
+    '整块只按代码渲染': 'Rendered entirely as code', '整块即正文，常驻显示': 'Body always shown in the node',
+    '常驻显示在卡片上': 'Always shown on the card', '悬停节点时展开': 'Expands on hover',
+    '自动读取相连节点生成目录': 'Builds an outline from connected nodes',
+    '保留空格、换行和缩进；不会解析 Markdown、链接或数学公式。': 'Preserves spaces, line breaks, and indentation. Markdown, links, and math are not parsed.',
+    '选中文字可添加高光、字色或字号；正文会直接显示在便签上，支持 Markdown / 公式 / 代码块。': 'Select text to add highlights, color, or size. The body stays visible on the sticky note and supports Markdown, math, and code blocks.',
+    '选中文字可添加高光、字色或字号；正文会直接显示在卡片上。': 'Select text to add highlights, color, or size. The body stays visible on the card.',
+    '选中文字可添加高光、字色或字号；回到画布后悬停预览。': 'Select text to add highlights, color, or size. Hover over the node on the canvas to preview it.',
+    '选中文字可添加高光、字色或字号；回到画布后按 F 阅读索引正文。': 'Select text to add highlights, color, or size. Press F on the canvas to read the index body.',
+    '把长文本粘贴到这里。支持 Markdown、数学公式与选区标注。': 'Paste long-form text here. Supports Markdown, math, and selection annotations.',
+    '直接输入代码。Tab 缩进，Shift+Tab 减少缩进。': 'Enter code directly. Tab indents; Shift+Tab outdents.',
+    '加入复习卡片': 'Add to Review', '全部加入复习卡片': 'Add All to Review',
+    '全部移出复习卡片': 'Remove All from Review',
+    '每行一个自定义问题；留空时使用系统预设问题。': 'Enter one custom question per line. Leave blank to use the built-in questions.',
+    '参考答案（可留空）：复习时点「查看答案」才显示。': 'Reference answer (optional). It appears only after choosing Reveal Answer during review.',
+    '恢复所选节点外观': 'Restore Selected Node Appearance',
+    '代码节点': 'Code node', '便签节点': 'Sticky node', '代码语言': 'Code language',
+    '批量编辑': 'Batch edit', '混合节点批量编辑': 'Mixed-node batch edit',
+    '脑图连线批量编辑': 'Mind-map edge batch edit', '混合连线批量编辑': 'Mixed-edge batch edit',
+    '混合': 'Mixed', '建立分组': 'Create Group', '编辑选中对象': 'Edit selected objects',
+    '代码节点语言': 'Code node language', '默认色': 'Default color',
+    '清除所有拐点': 'Clear all bend points', '恢复所选连线样式': 'Restore Selected Edge Style',
+
+    '当前画布图谱': 'Current canvas graph', '关系视图': 'Relationship View',
+    '调节悬浮窗透明度': 'Adjust window opacity', '重新舒展图谱布局': 'Relax graph layout',
+    '恢复图谱视野': 'Reset graph view', '复位': 'Reset', '关闭图谱': 'Close graph',
+    '当前节点之间还没有连线': 'The current nodes are not connected yet.',
+    '当前画布还没有内容节点': 'This canvas has no content nodes yet.',
+    '连线': 'Edges', '索引节点': 'Index node', '预览节点': 'Preview node',
+    '卡片节点': 'Card node', 'PDF 附件': 'PDF attachment',
+    'Markdown 附件': 'Markdown attachment', '普通节点': 'Node', '未命名节点': 'Untitled node',
+    '当前画布': 'Current canvas',
+    '橡皮 · 局部擦': 'Eraser · Area', '橡皮 · 整笔擦': 'Eraser · Stroke',
+    '已恢复预设配色': 'Preset colors restored',
+    '已恢复自动文字尺寸': 'Automatic text sizing restored',
+    '已恢复所选节点外观': 'Selected node appearance restored',
+    '已恢复所选连线样式': 'Selected edge style restored',
+    '已粘贴为卡片': 'Pasted as a card',
+    '已粘贴为卡片（按 F 可阅读全文）': 'Pasted as a card · press F to read the full text',
+    '已退出配色刷': 'Color brush closed',
+    '已吸取节点配色，点击另一个节点应用': 'Node colors picked. Select another node to apply them.',
+    '请选择另一个节点': 'Select another node', '已复制节点配色': 'Node colors copied',
+    '已匹配父分支配色': 'Matched parent-branch colors',
+    '已统一所选节点配色': 'Selected node colors unified',
+    '已转为导图子节点': 'Converted to a Mind Map child node',
+    '已解除文本框跟随': 'Text box no longer follows a node',
+    '文本框已改为跟随所选节点': 'Text box now follows the selected node',
+    '文本框将跟随所选节点': 'Text box will follow the selected node',
+    '这次移动会产生无效结构': 'This move would create an invalid structure',
+    '这组节点含有交叉连接，暂不能自动排序': 'These nodes contain cross-links and cannot be arranged automatically yet.',
+    '放射布局暂不支持拖动排序': 'Radial layout does not support drag sorting yet.',
+    '没有落入可排序的位置': 'No valid sorting position',
+    '套索里没有可保存到模板的内容': 'The lasso contains nothing that can be saved as a template.',
+    '保存模板失败了，请重试': 'Could not save the template. Please try again.',
+    '分组已折叠': 'Group collapsed', '分组已展开': 'Group expanded',
+    '橡皮擦': 'Eraser', '画笔': 'Pen', '文字': 'Text',
+    '逆时针箭头': 'Counterclockwise Arrow', '顺时针箭头': 'Clockwise Arrow',
+    '直线箭头': 'Straight Arrow', '工具': 'Tool',
+    '同一层级至少需要两个节点': 'At least two nodes are required on the same level.',
+    '已统一同级节点宽度': 'Node widths unified on this level',
+    '已整理重叠节点': 'Overlapping nodes arranged', '当前没有重叠节点': 'No overlapping nodes',
+    '画布名称没有改动': 'Canvas name unchanged', '知道了': 'Got it',
+    '这里将只清除任务记录，且不可恢复。关联画布已经单独进入 Relatum 回收站，不受影响。': 'This permanently clears task records only. Linked canvases already in Relatum Trash are not affected.',
+    '当前显示器可用区域不足': 'Not enough usable space on this display',
+    '调整窗口大小失败，请重试。': 'Could not resize the window. Please try again.',
+    '配色': 'Color', '排版': 'Layout', '方向': 'Direction', '跟随分支': 'Follow branch',
+    '向右': 'Right', '向左': 'Left', '向下': 'Down', '放射': 'Radial', '密度': 'Density',
+    '舒展': 'Relaxed', '节点尺寸': 'Node size', '自动适配文字': 'Fit to text',
+    '中心节点': 'Center node', '一级分支': 'First-level branches', '二级及以后': 'Level 2 and deeper', '恢复自动': 'Auto size',
+    '同级等宽': 'Equal width', '整理重叠': 'Fix overlaps', '未选择': 'Nothing selected',
+    '先选中一个节点': 'Select a node first', '配色刷': 'Color brush', '匹配父分支': 'Match parent branch',
+    '思维导图模式': 'Mind Map Mode',
+    '将整理与此节点相连的整张结构': 'The whole structure connected to this node will be arranged.',
+    '经典枝桠': 'Classic Branches', '学术曲线': 'Academic Curves',
+    '柔彩自然': 'Soft Organic', '黑白直线': 'Monochrome Lines',
+    '层级标题': 'Tiered Titles', '蓝图 S 线': 'Blueprint S',
+    '高对比折线': 'High-Contrast Elbow', '杂志弧线': 'Editorial Arcs',
+    '应用并整理': 'Apply & arrange',
+    '经典枝桠：通用圆润分支，适合大多数脑图': 'Classic Branches: rounded, versatile branches for most mind maps.',
+    '学术曲线：低饱和配色与规整贝塞尔曲线': 'Academic Curves: muted colors with orderly Bézier curves.',
+    '柔彩自然：轻柔配色与不对称自然曲线': 'Soft Organic: gentle colors with asymmetric natural curves.',
+    '黑白直线：克制单色与利落直线': 'Monochrome Lines: restrained tones with crisp straight lines.',
+    '层级标题：醒目的分支标题与紧凑叶节点': 'Tiered Titles: prominent branch headings with compact leaves.',
+    '蓝图 S 线：冷色主调与流动 S 曲线': 'Blueprint S: cool tones with flowing S curves.',
+    '高对比折线：明亮配色与清晰阶梯结构': 'High-Contrast Elbow: bright colors with a clear stepped structure.',
+    '杂志弧线：克制配色与醒目的拱形连接': 'Editorial Arcs: restrained colors with bold arched connections.',
+    '配色刷只复制节点颜色；右键或 Esc 退出。': 'The color brush copies node colors only. Right-click or press Esc to exit.',
+    '短标题保持紧凑，长标题自动换行；左右边缘调宽，角点调宽与留白，双击恢复自动。': 'Short titles stay compact; long titles wrap. Drag side handles to resize width, corner handles for width and padding, and double-click to restore automatic sizing.',
+    '随预设': 'Use preset', '层距': 'Level spacing', '分支距': 'Branch spacing',
+    '放射半径': 'Radial spacing', '应用预设并整理': 'Apply preset & arrange',
+    '仅对齐层级': 'Align levels only', '只套用样式': 'Style only',
+    'Tab 建子节点，Enter 建同级节点；新节点会继承当前脑图样式。': 'Tab creates a child; Enter creates a sibling. New nodes inherit the current mind-map style.',
+    '单选会整理与该节点相连的整张结构；多选只整理所选节点。“仅对齐层级”不会改变上下顺序。': 'With one node selected, the whole connected map is arranged. With multiple nodes, only the selection is arranged. Align levels only preserves vertical order.',
+    '清除手工宽度，恢复文字自动适配': 'Clear manual width and fit to text',
+    '让同一层级节点使用相同宽度': 'Give nodes on the same level equal width',
+    '只整理发生重叠的分支': 'Arrange overlapping branches only',
+    '吸取所选节点的填充、边框与透明度': 'Pick fill, border, and opacity from the selected node',
+    '恢复为当前父分支的自动配色': 'Restore automatic color from the current parent branch',
+    '画布工具': 'Canvas tools', '选择 / 移动': 'Select / Move',
+    '点击重命名': 'Click to rename',
+    '套索：圈出一组节点，存成模板': 'Lasso a group of nodes and save it as a template',
+    '画笔 · 自由书写；再次点击设置，长按恢复默认': 'Pen · draw freely; click again for settings, hold to reset',
+    '笔': 'Pen', '笔型': 'Pen type', '钢笔': 'Pen', '马克笔': 'Marker', '荧光笔': 'Highlighter',
+    '粗细': 'Thickness', '不透明度': 'Opacity', '稳定器': 'Stabilizer', '顺滑度': 'Smoothing',
+    '压感': 'Pressure', '压感曲线': 'Pressure curve', '软': 'Soft', '正常': 'Normal', '硬': 'Hard',
+    '笔锋渐细': 'Taper strokes', '书法笔锋': 'Calligraphic nib', '笔尖角度': 'Nib angle',
+    '示例文字': 'Sample text',
+
+    // 编辑器右下角“？”· 快捷键速查
+    '快捷键速查': 'Keyboard Shortcuts',
+    '重新学习画布编辑器': 'Replay the Canvas Tutorial',
+    '10 个动画演示 · 随时重新上手': '10 animated demos · Replay anytime',
+    '最先记住这 5 个': 'Start with these 5',
+    '从空白画布到第一组结构，先记住这些。': 'These take you from a blank canvas to your first connected structure.',
+    '双击空白': 'Double-click empty space', '写想法': 'Write an idea', '拖': 'Drag',
+    '节点间连线': 'Connect nodes', '子节点': 'Child node', '同级节点': 'Sibling node',
+    '空格': 'Space', '平移': 'Pan', '/ 无选中时': '/ with nothing selected',
+    '在画布 / 导图中新建内容节点': 'Create a content node in Canvas / Mind Map',
+    '双击节点': 'Double-click a node', '编辑文字': 'Edit text',
+    '选中内容节点后': 'With a content node selected', '直接打字': 'Start typing',
+    '替换标题并进入编辑': 'Replace the title and start editing',
+    '在下方建兄弟节点': 'Create a sibling below', '在上方插入兄弟节点': 'Insert a sibling above',
+    '沿当前分支方向建子节点 + 连线': 'Create and connect a child along the current branch',
+    '导图节点提升一级': 'Promote a Mind Map node one level', '复制选中节点': 'Duplicate selected nodes',
+    '删除选中的节点 / 连线 / 图案': 'Delete selected nodes / lines / shapes',
+    '右键节点': 'Right-click a node', '快速换色 / 复制 / 删除': 'Quickly recolor / duplicate / delete',
+    '正文节点 · 阅读 · 批注': 'Content Nodes · Reading · Annotation',
+    '画布·完整': 'Canvas · Full', '切换接下来新建索引 / 预览 / 卡片 / 代码': 'Choose Index / Preview / Card / Code for new nodes',
+    '画布·简洁': 'Canvas · Minimal', '切换接下来新建卡片 / 便签': 'Choose Card / Sticky for new nodes',
+    '索引/预览/卡片/便签 +': 'Index / Preview / Card / Sticky +',
+    '放大阅读并编辑正文': 'Open the reader and edit the body', '代码节点 +': 'Code node +',
+    '放大读写代码（只着色，不批注）': 'Open the code reader/editor (syntax color only; no annotation)',
+    'PDF / Markdown 附件 +': 'PDF / Markdown attachment +', '打开放大阅读与附件批注': 'Open the attachment reader and annotation tools',
+    '正文 / Markdown 阅读层': 'Body / Markdown reader', '钢笔 / 盒子 / 橡皮': 'Pen / Box / Eraser',
+    'PDF 阅读层': 'PDF reader', '高亮 / 下划线 / 钢笔 / 荧光笔 / 盒子 / 便签 / 橡皮': 'Highlight / Underline / Pen / Highlighter / Box / Note / Eraser',
+    '代码节点内': 'Inside a code node', '增加 / 减少缩进': 'Increase / decrease indentation',
+    '正文编辑内': 'While editing body text', '插入 Markdown 代码块': 'Insert a Markdown code block',
+    '思维导图': 'Mind Map', '单选节点 +': 'One selected node +', '整理整条相连结构': 'Arrange the entire connected structure',
+    '多选节点 +': 'Multiple selected nodes +', '只整理所选节点': 'Arrange selected nodes only',
+    '拉齐层级，保留同层顺序': 'Align levels while preserving order within each level',
+    '左侧继续向左，右侧继续向右': 'Continue outward: left branches left, right branches right',
+    '拖动同级节点': 'Drag a sibling node', '调整顺序并自动整理所在分支': 'Reorder it and automatically arrange its branch',
+    '拖到另一个节点上': 'Drop onto another node', '整棵分支改为它的子节点': 'Reparent the entire branch under that node',
+    '复制节点配色，不改变尺寸与连线': 'Copy node colors without changing size or lines',
+    '恢复所选节点的自动分支配色': 'Restore automatic branch colors for selected nodes',
+    '预设右上角': 'Preset upper-right corner', '立即套用该预设并整理结构': 'Apply the preset and arrange immediately',
+    '三档节点尺寸滑条': 'Three-level node size sliders', '分别调整中心、一级分支与二级及以后节点尺寸': 'Resize the center, first-level branches, and level-2-or-deeper nodes separately',
+    '拖动节点左右边缘': 'Drag a node\'s side edge', '手工设置宽度；双击边缘恢复自动': 'Set a custom width; double-click the edge to restore automatic sizing',
+    '拖动节点角点': 'Drag a node corner', '自由调整宽度与最小高度，文字不会被裁切': 'Adjust width and minimum height without clipping text',
+    '只重新排布发生碰撞的分支': 'Rearrange only colliding branches', '一级分支越过中心': 'Drag a first-level branch across the center',
+    '整条分支切换到另一侧': 'Move the entire branch to the other side', '拖动中心节点': 'Drag the center node',
+    '移动整张思维导图': 'Move the entire Mind Map',
+    '按住': 'Hold', '，从一个节点拖到另一个': 'and drag from one node to another', '创建节点间连线': 'Create a connection between nodes',
+    '双击连线': 'Double-click a line', '给连线写文字': 'Label the line', '+点击': '+ click',
+    'shortcutsSelectionHeading': 'Selection', 'shortcutsDragAction': 'drag',
+    '加选 / 减选': 'Add to / remove from selection', '空白处': 'On empty canvas,', '框选': 'Marquee select',
+    '全选所有节点': 'Select all nodes', '图片 · 分组 · 图案': 'Images · Groups · Shapes',
+    '拖入图片文件': 'Drop an image file', '导入到鼠标落点（任意模式可拖动 / 删除）': 'Import at the pointer (move / delete in any mode)',
+    '框选一组节点 →': 'Marquee-select a group of nodes →', '原地建立语义分组，不打乱节点位置': 'Create a semantic group without moving its nodes',
+    '框选空白区域 →': 'Marquee-select an empty area →', '按选框大小生成带标题的分区盒子': 'Create a titled box matching the selection',
+    '画布空白处': 'On empty canvas', '右键拖动': 'Right-drag', '在任意模式按拖拽范围创建纯色色块': 'Create a solid color block from the dragged area in any mode',
+    '右键单击': 'Right-click', '退出绘制并切回「选择」工具': 'Exit drawing and return to the Select tool',
+    '界面 / 工具': 'Interface / Tools', '鼠标移到': 'Move the pointer to', '画布左缘': 'the left edge of the canvas',
+    '浮现左侧手写工具栏（笔 / 橡皮 / 文字 / 箭头 / 手绘图形）': 'Reveal the drawing toolbar (pen / eraser / text / arrows / sketch shapes)',
+    '选择；': 'Select;', '画笔，再按一次切到橡皮（反复按': 'Pen; press again for Eraser (keep pressing',
+    '在画笔 ↔ 橡皮间切换）': 'to toggle Pen ↔ Eraser)', '再点': 'Click the', '图标': 'icon again',
+    '弹出画笔配置（笔型 / 粗细 / 压感 / 书法笔锋…逐项见下表）': 'Open pen settings (type / thickness / pressure / calligraphic nib… see below)',
+    '橡皮': 'Eraser', '在「整笔擦 / 局部擦」间切换；局部擦只擦圆圈内一段，其余保留': 'Toggle Stroke / Partial erasing; Partial removes only the segment inside the circle',
+    '画笔 / 箭头': 'Pen / Arrow', '恢复该工具默认设置；按钮轻弹表示已生效': 'Restore the tool defaults; a quick bounce confirms the reset',
+    '左侧手绘图形': 'Left-side sketch shape', '点按': 'Click', '放小图标；拖动则按框定尺寸': 'Place a small shape; drag to set its size',
+    '重复点击当前': 'Click the current', '画布 / 导图 / 图案': 'Canvas / Mind Map / Shapes',
+    '切换该模式自己的「简洁 / 完整」状态': 'Toggle that mode between Minimal / Full',
+    '导图 / 图案或画布·简洁中，无选中时': 'With nothing selected in Mind Map / Shapes or Canvas · Minimal',
+    '临时收起 / 展开当前右侧面板': 'Temporarily collapse / expand the current right panel',
+    '完整状态下选中对象': 'Select an object in Full mode', '自动打开对应属性检查器（可在设置中分别关闭）': 'Open its inspector automatically (each can be disabled in Settings)',
+    '右下': 'Bottom right', '语言、速度与延迟、三个检查器、深色优化、压感和自动保存等': 'Language, speeds and delays, three inspectors, dark-mode optimization, pressure, autosave, and more',
+    '打开本速查；顶部绿色按钮可重学完整新手引导': 'Open this reference; use the green button above to replay the full tutorial',
+    '画笔配置（再点': 'Pen Settings (click the', '图标弹出）': 'icon again)',
+    '钢笔（实色）/ 马克笔（更粗）/ 荧光笔（半透明，盖在字上仍可读）': 'Pen (solid) / Marker (thicker) / Highlighter (translucent; text remains readable)',
+    '线条的宽度与透明度': 'Stroke width and opacity', '越高越抗抖，但笔迹更慢跟手；写字建议低到中': 'Higher values reduce shake but add lag; use low to medium for handwriting',
+    '越高越把折点修成圆滑曲线；写小字别开太高': 'Higher values smooth corners into curves; keep it lower for small writing',
+    '手写笔按下笔力度自动变粗细（鼠标无效）；总开关在右下': 'Pen pressure changes stroke width (not available with a mouse); the master switch is at bottom right',
+    '软＝轻轻一碰就变粗 · 正常 · 硬＝要用力才变粗': 'Soft = thickens with a light touch · Normal · Hard = needs more pressure',
+    '笔画两端自动收尖；没压感的笔也有手写味': 'Automatically taper both ends, even without pressure input',
+    '横细竖粗的书法 / 钢笔体；配下面的「笔尖角度」一起用': 'Calligraphic strokes with thin horizontals and thick verticals; use with Nib angle',
+    '书法笔尖的朝向（45° 最常用）；支持倾斜的手写笔躺下去会更粗': 'Calligraphic nib direction (45° is common); supported styluses draw thicker when tilted',
+    '画布导航': 'Canvas Navigation', '滚轮': 'Mouse wheel', '以鼠标为中心缩放': 'Zoom around the pointer', '+拖动': '+ drag',
+    '平移画布': 'Pan the canvas', '短按': 'Tap', '定位最近新建的节点': 'Go to the most recently created node',
+    '持续平移画布（单选内容节点时字母优先进入编辑）': 'Continuously pan (with one content node selected, letter keys start editing instead)',
+    '重置到 100%': 'Reset to 100%', '缩放到容纳全部': 'Zoom to fit all', '搜索节点（Enter 跳下一个）': 'Search nodes (Enter finds next)',
+    '文件 / 历史': 'File / History', '立即保存（默认开自动保存，改完约 1.5 秒自动写盘）': 'Save now (autosave is on by default and writes about 1.5 seconds after changes)',
+    '顶栏': 'Top bar', '导出': 'Export', '导出 Markdown 或 PNG 图片': 'Export Markdown or a PNG image',
+    '清理附件': 'Clean Assets', '删除 .assets 里未被引用的图片 / 附件': 'Delete unreferenced images / attachments from .assets',
+    '编辑节点时': 'While Editing a Node', '提交': 'Commit', '换行': 'New line', '取消修改': 'Cancel changes',
+    '文字格式（Markdown / 公式）': 'Text Formatting (Markdown / Math)', '## 标题': '## Heading', '二级标题（### 三级）': 'Level 2 heading (### is level 3)',
+    '**加粗**': '**bold**', '加粗': 'Bold', '*斜体*': '*italic*', '斜体': 'Italic', '- 列表项': '- List item',
+    '无序列表（1. 有序）': 'Bulleted list (1. for numbered)', '`代码`': '`code`', '行内代码': 'Inline code',
+    '行内公式（$$…$$ 块级）': 'Inline math ($$…$$ for display math)', '==高光==': '==highlight==', '选中文字后可在工具栏换色': 'Select text, then choose a color in the toolbar',
+    '{tc:red|文字}': '{tc:red|Text}', '文字颜色（工具栏彩色 A）': 'Text color (colored A in the toolbar)',
+    '{fs:lg|文字}': '{fs:lg|Text}', '文字字号（小 / 默认 / 大 / 特大）': 'Text size (small / default / large / extra large)',
+    '右下角': 'Bottom right', '公式 / 符号面板，向正在编辑处插入 LaTeX 片段': 'Math / symbol panel; insert a LaTeX snippet at the editing point',
+    '选中文字框': 'Select a text box', '放大 / 缩小 / 还原文字框字号': 'Increase / decrease / reset the text-box font size',
+    '同一正文内点击公式引用，跳转并闪烁目标': 'Click an equation reference in the same body to jump to and flash its target',
+    '看不到更新 / 页面不对劲？': 'Updates missing or page behaving strangely?',
+    '强制刷新清缓存——改了东西没生效时先按这个': 'Hard-refresh and clear cache—try this first when changes do not appear',
+    '强刷还不行 → 开无痕窗口访问同一地址，绕开一切缓存': 'If that fails, open the same address in a private window to bypass all caches',
+    '“文件已不在”': '“File no longer exists”', '起步页带此标签的是已删除/移动的文件，点它可从列表移除': 'This Home label marks a deleted or moved file; click it to remove the entry',
+    'shortcutsPress': 'Press', 'shortcutsOr': 'or', 'shortcutsCloseSuffix': 'to close',
+    '最先记住的五个操作': 'Five essential actions',
+    '逆时针箭头': 'Counterclockwise Arrow', '顺时针箭头': 'Clockwise Arrow',
+    '弯曲幅度': 'Curve amount', '直线箭头': 'Straight Arrow', '转折': 'Bend',
+    '直线转折': 'Straight bend', '曲线转折': 'Curved bend',
+    '橡皮擦除': 'Eraser', '添加文字': 'Add text',
+    '添加逆时针箭头；再次点击设置，长按恢复默认': 'Add counterclockwise arrow; click again for settings',
+    '添加顺时针箭头；再次点击设置，长按恢复默认': 'Add clockwise arrow; click again for settings',
+    '直线箭头（选中后可加转折点）；再次点击设置，长按恢复默认': 'Straight arrow; select it to add bends',
+    '手绘圆角矩形': 'Sketch rounded rectangle', '手绘菱形': 'Sketch diamond', '手绘椭圆': 'Sketch ellipse',
+    '撤销': 'Undo', '重做': 'Redo', '未命名': 'Untitled',
+    '小地图：点击跳转 / 拖动取景框平移': 'Minimap · click to jump / drag to pan',
+    '双击空白处，写下第一个想法': 'Double-click anywhere to begin with an idea',
+    '新建默认样式': 'New default styles', '熄灭面板': 'Dim panel', '类型': 'Type',
+    '索引': 'Index', '预览': 'Preview', '卡片': 'Card', '便签': 'Sticky', '代码': 'Code',
+    '形状': 'Shape', '矩形': 'Rectangle', '正方': 'Square', '圆形': 'Circle',
+    '图案': 'Shape', '图案与图片': 'Shapes and images', '图案模式': 'Shapes Mode',
+    '圆角矩形': 'Rounded Rectangle', '椭圆': 'Ellipse', '正三角形': 'Triangle',
+    '菱形': 'Diamond', '滑条': 'Slider', '盒子': 'Box', '纯色色块': 'Color Block',
+    '箭头图案': 'Arrow',
+    '虚线框': 'Dashed Box', '分隔线': 'Divider',
+    '胶囊标签': 'Pill Label', '角标框': 'Corner Frame', '括号标记': 'Bracket',
+    '问号': 'Question', '重点便签': 'Emphasis Note', '旁注框': 'Side Note',
+    '文字框': 'Text Box', '图片': 'Image', '颜色': 'Color', '预设': 'Preset',
+    '插入图案': 'Insert Shapes', '插入本地图片': 'Insert Local Image',
+    '插入 PDF / Markdown 附件': 'Insert PDF / Markdown',
+    '盒子 / 分组预设': 'Box / Group Presets', '全局默认': 'Global Default',
+    '样式预设': 'Style Presets',
+    '盒子与分组预设': 'Box and group presets',
+    '也可以直接把本地图片 / PDF / Markdown 文件拖进画布；图片存到 <画布名>.assets/images/，附件存到 .assets/attachments/（同一文档按内容去重只存一份）。附件可任意模式拖动（拖标题栏）、正文区滚动，图案模式可调大小。': 'You can also drop local images, PDFs, or Markdown files onto the canvas. Images are stored in <canvas>.assets/images/ and attachments in .assets/attachments/ with duplicate content stored only once. Attachments can be moved by dragging their title bar, scrolled in the body, and resized in Shapes mode.',
+    '点击预设会应用到当前盒子或分组，并成为所有画布之后拖拽新建时的默认样式；拖拽尺寸不会被改动。': 'Selecting a preset applies it to the current box or group and makes it the default for newly dragged groups across all canvases. Existing dimensions are preserved.',
+    '选中一个图案或图片后，可调整外观、尺寸与图层。': 'Select a shape or image to adjust its appearance, size, and layer.',
+    '宽度': 'Width', '高度': 'Height', '字号': 'Font size', '旋转角度': 'Rotation',
+    '双线': 'Double', '边框粗细': 'Border weight', '填充颜色': 'Fill color',
+    '文字颜色': 'Text color', '预设颜色': 'Preset colors', '填充': 'Fill',
+    '淡': 'Tint', '实': 'Solid', '重置默认颜色': 'Reset colors',
+    '标题文字语义': 'Title contrast', '浅色': 'Light', '深色': 'Dark',
+    '浅色字适合较深的标题底色；深色字适合柠檬黄等明亮标题底色。': 'Light text suits dark title fills; dark text suits bright fills such as lemon yellow.',
+    '滑条进度': 'Slider progress', '透明度': 'Opacity', '显示图层': 'Layer',
+    '底层': 'Behind', '顶层': 'Front',
+    '底层被文字节点覆盖；顶层覆盖文字。只有图案模式可选中装饰对象。': 'Behind sits under text nodes; Front sits above them. Decorative objects can only be selected in Shapes mode.',
+    '叠放顺序': 'Stacking order', '移到底部': 'Send to bottom', '下移一层': 'Move backward',
+    '上移一层': 'Move forward', '移到顶部': 'Bring to top',
+    '只调整所选图案在当前显示图层内的先后顺序。': 'Only changes the selected decorations\' order within their current layer.',
+    '选中一个或多个图案后，可调整叠放顺序。': 'Select one or more decorations to change their stacking order.',
+    '重置为默认设置': 'Reset to defaults', '重置新建预设': 'Reset creation preset',
+    '应用新建预设': 'Apply creation preset', '应用预设颜色': 'Apply preset colors',
+    '删除此装饰对象': 'Delete decoration',
+    '新建预设': 'Creation preset', '应用到选中': 'Apply to selection',
+    '没有选中盒子或分组时，点击只修改之后新建的默认样式。': 'With no box or group selected, clicking only changes the style for future creations.',
+    '点击只应用到当前选中的盒子或分组，不修改新建预设。': 'Clicking only applies to the selected boxes or groups and does not change the creation preset.',
+    '图案、文字装饰与图片不会成为正文节点，也不会进入 Markdown 导出内容。': 'Shapes, decorative text, and images remain outside document nodes and Markdown exports.',
+    '读取图片失败': 'Could not read the image', '读取文件失败': 'Could not read the file',
+    '插入图片失败': 'Could not insert the image', '插入附件失败': 'Could not insert the attachment',
+    '双击 PDF，或按 <kbd>F</kbd>，进入阅读与批注': 'Double-click the PDF or press <kbd>F</kbd> to read and annotate.',
+    '暖金': 'Warm Gold', '雾蓝': 'Mist Blue', '草木绿': 'Sage Green',
+    '藕粉': 'Dusty Rose', '墨白': 'Ink White', '湖水青': 'Lake Teal',
+    '杏橙': 'Apricot', '柠檬黄': 'Lemon', '天空蓝': 'Sky Blue',
+    '薄荷绿': 'Mint', '珊瑚红': 'Coral', '淡紫': 'Lavender',
+    '咖啡棕': 'Coffee', '透明灰': 'Clear Gray',
+    '写下重点': 'Write a key point', '写下旁注': 'Write a side note',
+    '暖金纸': 'Warm Gold Paper', '象牙纸': 'Ivory Paper', '陶粉纸': 'Peach Paper',
+    '藕荷纸': 'Dusty Rose Paper', '灰紫纸': 'Muted Violet Paper', '雾蓝纸': 'Mist Blue Paper',
+    '鼠尾草': 'Sage', '原色纸': 'Natural Paper', '墨线留白': 'Ink Outline',
+    '雾蓝细框': 'Mist Blue Outline', '灰绿虚线': 'Sage Dash', '藕粉点线': 'Rose Dots',
+    '赭金粗框': 'Ochre Bold', '灰紫双线': 'Violet Double', '苔灰短线': 'Moss Dash',
+    '石墨点线': 'Graphite Dots',
+    '边框颜色': 'Border color', '背景颜色': 'Background color', '背景透明度': 'Background opacity',
+    '隐藏节点背景': 'Hide node background', '圆角': 'Corner radius', '字重': 'Weight',
+    '文字比例': 'Text scale', '文字对齐': 'Text alignment', '左': 'Left', '中': 'Center', '右': 'Right',
+    '线型': 'Path', '曲线': 'Curve', '直线': 'Straight', '折线': 'Elbow', '圆角折线': 'Rounded elbow',
+    'S 曲线': 'S curve', '平滑曲线': 'Smooth curve', '枝桠曲线': 'Branch curve',
+    '弧线': 'Arc', '自然曲线': 'Organic curve', '线条样式': 'Line style',
+    '实线': 'Solid', '虚线': 'Dashed', '点线': 'Dotted', '柔线': 'Soft', '荧光': 'Glow',
+    '线条颜色': 'Line color', '箭头': 'Arrowheads', '无': 'None', '单向': 'One way', '双向': 'Two way',
+    '线条粗细': 'Line weight', '箭头大小': 'Arrow size', '全部重置为朴素默认': 'Reset all to clean defaults',
+    '只影响之后新建的节点与连线；选中对象时会自动显示属性检查器。': 'Applies to new nodes and lines. Selecting an object opens its inspector.',
+    '新建代码节点默认语言': 'Default language for new code nodes',
+    '默认 8': 'Default 8', '默认 15%': 'Default 15%', '默认 1×': 'Default 1×',
+    '默认 0.8s': 'Default 0.8s', '默认 0.5s': 'Default 0.5s', '默认 0.4s': 'Default 0.4s',
+    '默认 3.5s': 'Default 3.5s', '默认 70ms': 'Default 70ms', '默认 100%': 'Default 100%',
+    '默认 10px': 'Default 10px', '默认 400': 'Default 400', '默认 1.5': 'Default 1.5', '默认 12': 'Default 12',
+    '偏好缩放比例（25-400%；点击修改，Enter 保存）': 'Preferred zoom (25–400%; select to edit, Enter to save)',
+    '空格 + 左键拖动画布松手后的滑行动量（最左=关闭惯性）': 'Momentum after Space + drag (far left turns it off)',
+    '鼠标滚轮缩放速度': 'Mouse-wheel zoom speed',
+    '悬停节点多久后浮出任务清单（最左=瞬发）': 'Delay before a node checklist appears on hover',
+    '悬停已收起的脑图节点多久后临时展开分支（最左=瞬发）': 'Delay before a collapsed branch previews on hover',
+    '鼠标悬停索引节点多久后，在其左侧弹出目录预览（最左=瞬发）': 'Delay before an index preview appears on hover',
+    '在节点左侧显示悬停任务清单入口': 'Show checklist affordance beside nodes',
+    '在有子节点的节点右侧显示收起 / 展开按钮': 'Show collapse controls on nodes with children',
+    '控制「画布」完整状态下选中节点或连线时是否打开属性检查器；简洁状态始终禁用': 'Open the inspector for selected nodes or lines in full Canvas view',
+    '控制思维导图模式、图案模式完整状态下选中对象时是否打开属性检查器；各模式的排版或新建预设面板仍会保留': 'Open object inspectors in full Mind Map and Shapes modes; layout and new-item preset panels remain available',
+    '关闭后，空格仍可按住拖动画布，但松开空格不再自动定位最近节点': 'Space still pans the canvas, but no longer returns to the latest node.',
+    '日记': 'Journal', '书写': 'Write', '阅读': 'Read', '展开书写': 'Open editor', '收起': 'Collapse',
+    '上一篇': 'Previous', '下一篇': 'Next', '等待书写': 'Ready to write', '正在保存': 'Saving',
+    '保存失败 · 点击重试': 'Save failed · click to retry', '正在记录…': 'Writing…',
+    '今天，发生了什么？': 'What happened today?', '标签，用逗号分隔': 'Tags, separated by commas',
+    '删除这篇': 'Delete entry', '学习安排': 'Study plan', '前往学习': 'Go to Study',
+    '当天成果': 'Daily outcomes', '查看活跃': 'View Activity', '自由专注': 'Open focus',
+    '这一天没有安排学习任务。': 'No study tasks were planned for this day.',
+    '这一天还没有专注记录。': 'No focus sessions were recorded this day.',
+    '这一天没有归档成果。': 'No outcomes were archived this day.',
+    '把临时想法、学习过程和完成的事，放回它们发生的那一天。': 'Return ideas, learning, and finished work to the day they happened.',
+    '搜索日记标题、标签或正文摘要': 'Search journal titles, tags, or excerpts',
+    'weekdayMon': 'Mon', 'weekdayTue': 'Tue', 'weekdayWed': 'Wed', 'weekdayThu': 'Thu',
+    'weekdayFri': 'Fri', 'weekdaySat': 'Sat', 'weekdaySun': 'Sun',
+    '距离': 'Until', '还有': 'in', '已经过去': 'was',
+    '双击编辑目标事件': 'Double-click to edit the target event',
+    '双击编辑目标日期': 'Double-click to edit the target date',
+    '支持 Markdown。这里适合留下当天的思考、过程和结论。': 'Markdown supported. Capture the day’s thoughts, process, and conclusions here.',
+    '方向键平移速度': 'Arrow-key pan speed',
+    '总开关：同时控制左侧画布手写笔，以及 PDF / Markdown / 正文阅读批注里的压感钢笔；关掉则全部不随力度变粗细。左侧画布笔还需在左侧「画笔」配置里单独勾选「压感」才生效。': 'Master pressure control for the canvas pen and PDF, Markdown, and document annotation pens. When off, pressure no longer changes stroke width. The canvas pen also needs Pressure enabled in its own settings.',
+    '拖动单个文本框靠近内容节点时显示绿色对齐线并自动吸附；默认关闭。': 'Show green alignment guides and snap automatically when a single text box is dragged near a content node. Off by default.',
+    '鼠标悬停索引节点时，在其左侧弹出只读目录预览（默认开启；出现快慢见上方「目录出现延迟」）': 'Show a read-only outline beside index nodes on hover. The delay is controlled by Index preview delay above.',
+    '框选多个节点后浮出「生成索引」小按钮，一键收成目录卡（默认关闭）': 'Offer a Generate Index action after selecting multiple nodes to collect them into an outline card.',
+    '背景语义为深色时，把画布连线临时按荧光样式显示；只改变视觉，不修改线条原始样式或 .canvas 数据。': 'On dark backgrounds, preview canvas lines with a glow treatment without changing their saved style or canvas data.',
+    '背景语义为深色时，让思维导图、专业、编辑、图案、图谱、背景、脑图和模板使用深色界面；关闭后恢复原来的浅色界面': 'Use dark semantic styling for Mind Map, Shapes, Graph, Background, and Templates on dark canvases. Turn this off to keep the light interface.',
+    '改动后自动保存到 .canvas 文件（默认开启）；关掉则回到手动 Ctrl+S': 'Automatically save changes to the canvas file. Turn this off to use Ctrl+S manually.',
+    '已沉淀进活跃足迹': 'Added to your activity trail',
+    '上个月': 'Previous month', '下个月': 'Next month', '移除便签': 'Remove note',
+    '归档过的完成任务，会在这里连成一片星图。': 'Archived work gathers here as a living constellation.',
+    '我': 'Me', '未命名': 'Untitled', '已完成任务足迹星图': 'Constellation of completed work',
+    '继续自由复习 →': 'Continue free review →', '今天的复习做完了': 'Today’s review is complete',
+    '今天没有到期的卡片': 'No cards are due today', '收起答案': 'Hide answer',
+    '未完成学习任务': 'Incomplete study tasks', '拖到月历': 'Drag to Calendar',
+    '按住任务拖到左侧月历，松手后生成便签。': 'Drag a task onto the calendar to create a note.',
+    '拖动调节宽度': 'Drag to resize',
+    '关闭': 'Close', '确认': 'Confirm', '删除': 'Delete', '完成': 'Done',
+
+    '+ 盒子': '+ Box', '+ 分组': '+ Group',
+    '建立分组后可命名、折叠并整体移动': 'Name, collapse, and move the group as a whole',
+    '可以把空白选区变成一个盒子': 'Turn an empty selection into a box',
+
+    // ── 专注页 · 每日任务侧栏 ──
+    '添加一件今天想坚持的事…': 'Add one thing to repeat today…',
+    '新增每日任务': 'Add daily task',
+    '添加每日任务': 'Add daily task',
+    '收起每日任务（Tab / Esc）': 'Close daily tasks (Tab / Esc)',
+    '新增类型': 'Add type',
+    '新建分组名称…': 'New group name…',
+    '＋ 子分组': '+ Subgroup',
+    '＋ 在此加任务': '+ Add task here',
+    '今日进度': 'Progress today',
+    '最近打卡': 'Recent check-ins',
+    '未分组': 'Ungrouped',
+    '今日目标': 'Daily goal',
+    '分钟 · 可选': 'Minutes · optional',
+    '每日任务名称': 'Daily task name',
+    '关闭每日任务详情': 'Close daily task details',
+    '今天还没开始': 'Not started today',
+    '已达标': 'Goal met',
+    '今天还没有专注分钟': 'No focus minutes today',
+    '完成第一次打卡后，这里会开始沉淀它的日历轨迹。': 'After the first check-in, its calendar trail will begin to form here.',
+    '件全部完成': 'all complete',
+    '明天见': 'See you tomorrow',
+    '已打卡': 'Checked in',
+    '连续': 'Streak',
+    '累计': 'Total',
+    '最佳': 'Best',
+    '名称不能为空': 'Name cannot be empty.',
+    '分组名不能为空': 'Group name cannot be empty.',
+    '已删除分组': 'Group deleted',
+    '专注数据已更新': 'Focus data refreshed',
+    '专注记录已更新': 'Session updated',
+    '专注记录已删除': 'Session deleted',
+    '专注记录未保存': 'Session not saved',
+    '已删除': 'Deleted',
+    '记录': 'Record',
+
+    // ── 专注页 · 计时器状态 ──
+    '等待收尾': 'Wrap up',
+    '已暂停': 'Paused',
+    '专注中': 'Focusing',
+    '休息（暂停）': 'Break (paused)',
+    '休息一下': 'Take a break',
+    '正计时 · 自由专注，按「完成」记一段': 'Open timer · focus freely, then press Finish to log.',
+    '正计时从 00:00 开始，不需要设定结束时间': 'Open timer starts at 00:00 — no end time needed.',
+    '计时运行中不能修改时长': 'Cannot change duration while the timer is running.',
+    '正计时从 00:00 开始': 'Open timer starts at 00:00',
+    '这一段没有填写目标。': 'No intention was set for this session.',
+    '为这一段写个目标': 'Add an intention for this session',
+
+    // ── 专注页 · 收尾 / 记录编辑 ──
+    '本段完成': 'Session complete',
+    '可选：留下结果、进度或下一步。': 'Optional: record outcomes, progress, or next steps.',
+    '请先完成或重置当前专注段': 'Please finish or reset the current session first.',
+
+    // ── 专注页 · 设置 / 帮助 / 提示 ──
+    '重新读取任务/每日/记录（平时翻进来用上次结果；在别处改了，点这里才更新）': 'Refresh tasks, daily items, and records. (Uses cached data; click after making changes elsewhere.)',
+    '进入深度专注（Z）': 'Enter deep focus (Z)',
+    '按 Tab 划出右侧清单：勾选完成、累计天数与专注分钟，全部完成有庆祝。': 'Press Tab to open the side panel: check off tasks, track streaks and focus minutes. Celebrate when all done.',
+    '结束收尾': 'Wrap up',
+    '点击圆点可查看、修改或删除一段记录。': 'Click a dot to view, edit, or delete a session.',
+    '删除这段专注记录？当天与长期统计会同步扣除。': 'Delete this session? Daily and long-term stats will be updated accordingly.',
+    '上次离开时，这段专注已经走完。要进入收尾并记下这一段吗？': 'This session had finished when you left. Wrap up and log it?',
+    '上次休息已经结束，可以开始下一段': 'The last break has ended. Ready for the next session.',
+    '重置当前计时？未满一段的时间不会记入记录。': 'Reset the current timer? Unfinished time will not be logged.',
+    '移动失败': 'Move failed',
+
+    // ── 专注页 · 键盘提示 ──
+    'Space 暂停　Esc 退出深度专注': 'Space Pause  Esc Exit deep focus',
+    '开始 / 暂停': 'Start / Pause',
+    '关闭 / 退出': 'Close / Exit',
+
+    // ── 星期标签 ──
+    '一': 'Mon', '二': 'Tue', '三': 'Wed', '四': 'Thu', '五': 'Fri', '六': 'Sat', '日': 'Sun',
+
+    // ── 每日任务 aria 前缀（用于拼接后匹配）──
+    '取消完成 · ': 'Undo · ',
+    '标记完成 · ': 'Mark done · ',
+    '查看打卡日历 · ': 'Check-in calendar · ',
+    '任务选项 · ': 'Task options · ',
+    '分组选项 · ': 'Group options · ',
+    '展开分组 · ': 'Expand group · ',
+    '折叠分组 · ': 'Collapse group · ',
+    '段数': 'Sessions',
+    '段': 'sessions',
+    '，打开记录': ', open record',
+    '没有专注记录': 'no focus sessions',
+    '点击圆点可回看': 'click a dot to review',
+    '专注': 'Focus',
+    '目标：': 'Intention: ',
+    '番茄轮次': 'Pomodoro round',
+    '［每日］': '[Daily]',
+    '［今日］': '[Today]',
+    '［进行中］': '[In progress]',
+    '学习任务': 'Study tasks'
+  };
+
+  const AUTO_EXCLUDE = [
+    '[contenteditable]', 'input', 'textarea', '.notes-surface', '.review-body',
+    '.calendar-diary-preview', '.study-task-title',
+    '.focus-daily-name', '.template-card-name', '[data-role="graph-title"]',
+    '.background-image-name', '.canvas', '.node', '[data-user-content]', '[data-i18n-managed]'
+  ].join(',');
+  const ATTRS = ['title', 'aria-label', 'placeholder'];
+  const textSources = new WeakMap();
+  let language = readLanguage();
+  let applying = false;
+  const listeners = new Set();
+
+  function readLanguage() {
+    try { return localStorage.getItem(STORAGE_KEY) === 'en' ? 'en' : 'zh-CN'; }
+    catch (error) { return 'zh-CN'; }
+  }
+
+  function interpolate(value, vars) {
+    if (!vars) return value;
+    return value.replace(/\{(\w+)\}/g, (_, key) => vars[key] == null ? '' : String(vars[key]));
+  }
+
+  function translateDynamic(source) {
+    let match = source.match(/^专注了\s*(\d+)\s*分钟$/);
+    if (match) return `Focused for ${match[1]} minutes`;
+    match = source.match(/^专注\s*(\d+)\s*分钟$/);
+    if (match) return `${match[1]} min focused`;
+    match = source.match(/^休息\s*(\d+)\s*分钟$/);
+    if (match) return `${match[1]} min break`;
+    match = source.match(/^今日\s*(\d+)\s*项$/);
+    if (match) return `${match[1]} today`;
+    match = source.match(/^已完成\s*(\d+)\s*项$/);
+    if (match) return `${match[1]} completed`;
+    match = source.match(/^第\s*(\d+)\s*段$/);
+    if (match) return `Session ${match[1]}`;
+    match = source.match(/^(\d{4})\s*年\s*(\d{1,2})\s*月$/);
+    if (match) {
+      const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+      return `${months[Number(match[2]) - 1]} ${match[1]}`;
+    }
+    match = source.match(/^(\d{4})\s*年$/);
+    if (match) return match[1];
+    match = source.match(/^(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*·\s*周([日一二三四五六])$/);
+    if (match) {
+      const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      const days = { 日: 'Sun', 一: 'Mon', 二: 'Tue', 三: 'Wed', 四: 'Thu', 五: 'Fri', 六: 'Sat' };
+      return `${days[match[3]]} · ${months[Number(match[1]) - 1]} ${Number(match[2])}`;
+    }
+    match = source.match(/^(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*·\s*周([日一二三四五六])$/);
+    if (match) {
+      const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      const days = { 日: 'Sun', 一: 'Mon', 二: 'Tue', 三: 'Wed', 四: 'Thu', 五: 'Fri', 六: 'Sat' };
+      return `${days[match[4]]} · ${months[Number(match[2]) - 1]} ${Number(match[3])}, ${match[1]}`;
+    }
+    match = source.match(/^(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*·\s*周([日一二三四五六])\s*·\s*(暂无记录|尚未到来|未专注|完成\s*\d+\s*项|专注\s*.+)$/);
+    if (match) {
+      const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      const days = { 日: 'Sun', 一: 'Mon', 二: 'Tue', 三: 'Wed', 四: 'Thu', 五: 'Fri', 六: 'Sat' };
+      return `${days[match[3]]} · ${months[Number(match[1]) - 1]} ${Number(match[2])} · ${EN[match[4]] || translateDynamic(match[4])}`;
+    }
+    match = source.match(/^(\d{1,2})\s*月$/);
+    if (match) {
+      const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      return months[Number(match[1]) - 1];
+    }
+    match = source.match(/^完成\s*(\d+)\s*项$/);
+    if (match) return `${match[1]} completed`;
+    match = source.match(/^留下\s*(\d+)\s*道足迹$/);
+    if (match) return `${match[1]} ${match[1] === '1' ? 'mark' : 'marks'} made`;
+    match = source.match(/^(\d+)\s*段\s*·\s*(.+)$/);
+    if (match) return `${match[1]} sessions · ${EN[match[2]] || translateDynamic(match[2])}`;
+    match = source.match(/^共\s*(\d+)\s*段专注$/);
+    if (match) return `${match[1]} focus ${match[1] === '1' ? 'session' : 'sessions'}`;
+    match = source.match(/^(\d+)\s*分(?:钟)?$/);
+    if (match) return `${match[1]} min`;
+    match = source.match(/^(\d+(?:\.\d+)?)\s*小时(?:\s*(\d+)\s*分)?$/);
+    if (match) return `${match[1]} hr${match[2] ? ` ${match[2]} min` : ''}`;
+    match = source.match(/^累计\s*(\d+)\s*件$/);
+    if (match) return `${match[1]} total`;
+    match = source.match(/^查看\s*(\d{4})\s*年$/);
+    if (match) return `View ${match[1]}`;
+    match = source.match(/^(\d{4})\s*年逐日已完成任务热力图$/);
+    if (match) return `Daily completed-work activity for ${match[1]}`;
+    match = source.match(/^(\d+)\s*天$/);
+    if (match) return `${match[1]} days`;
+    match = source.match(/^自动保存到\s*(.+)$/);
+    if (match) return `Autosaved to ${match[1]}`;
+    match = source.match(/^应用(.+)并整理$/);
+    if (match) return `Apply ${EN[match[1]] || translateDynamic(match[1])} & arrange`;
+    match = source.match(/^应用(.+)并设为全局默认$/);
+    if (match) return `Apply ${EN[match[1]] || translateDynamic(match[1])} and set as global default`;
+    match = source.match(/^(\d+)\s*个元素(?:\s*·\s*(\d+)\s*条连线)?$/);
+    if (match) return `${match[1]} ${match[1] === '1' ? 'element' : 'elements'}`
+      + (match[2] ? ` · ${match[2]} ${match[2] === '1' ? 'edge' : 'edges'}` : '');
+    match = source.match(/^(.+)\s*·\s*(\d+)\s*元素$/);
+    if (match) return `${match[1]} · ${match[2]} ${match[2] === '1' ? 'element' : 'elements'}`;
+    match = source.match(/^(.+)\s*\/\s*(索引节点|预览节点|卡片节点|PDF 附件|Markdown 附件|普通节点)$/);
+    if (match) return `${match[1]} / ${EN[match[2]] || match[2]}`;
+    match = source.match(/^(最近|收藏)\s+(\d+)$/);
+    if (match) return `${EN[match[1]] || match[1]}  ${match[2]}`;
+    match = source.match(/^没有第\s*(\d+)\s*个分组$/);
+    if (match) return `Group ${match[1]} does not exist.`;
+    match = source.match(/^已经在「(.+)」$/);
+    if (match) return `Already in “${match[1]}”`;
+    match = source.match(/^已移到「(.+)」$/);
+    if (match) return `Moved to “${match[1]}”`;
+    match = source.match(/^已移回「(.+)」$/);
+    if (match) return `Moved back to “${match[1]}”`;
+    match = source.match(/^读取「(.+)」失败$/);
+    if (match) return `Could not read “${match[1]}”.`;
+    match = source.match(/^「(.+)」不是有效的画布文件$/);
+    if (match) return `“${match[1]}” is not a valid canvas file.`;
+    match = source.match(/^(重命名失败|导入失败)：(.+)$/);
+    if (match) return `${EN[match[1]] || match[1]}: ${match[2]}`;
+    match = source.match(/^已选\s*(\d+)\s*个节点，改动会应用到全部。$/);
+    if (match) return `${match[1]} nodes selected. Changes apply to all.`;
+    match = source.match(/^已选\s*(\d+)\s*条连线，改动会应用到全部。$/);
+    if (match) return `${match[1]} edges selected. Changes apply to all.`;
+    match = source.match(/^(\d+)\s*个$/);
+    if (match) return `${match[1]} selected`;
+    match = source.match(/^(\d+)\s*条$/);
+    if (match) return `${match[1]} selected`;
+    match = source.match(/^当前显示器可选范围：(.+)$/);
+    if (match) return `Available range on this display: ${match[1]}`;
+    match = source.match(/^将只整理已选中的\s*(\d+)\s*个节点$/);
+    if (match) return `Only the ${match[1]} selected nodes will be arranged.`;
+    match = source.match(/^(.+)\s*·\s*(?:预设|Preset)$/);
+    if (match) return `${EN[match[1]] || translateDynamic(match[1])} · Preset`;
+    match = source.match(/^分组\s*·\s*(\d+)\s*个节点$/);
+    if (match) return `Group · ${match[1]} ${match[1] === '1' ? 'node' : 'nodes'}`;
+    match = source.match(/^(.+)已恢复默认设置$/);
+    if (match) return `${EN[match[1]] || translateDynamic(match[1])} defaults restored`;
+    match = source.match(/^未找到《(.+)》$/);
+    if (match) return `Could not find “${match[1]}”`;
+    match = source.match(/^已应用“(.+)”并设为全局默认$/);
+    if (match) return `Applied “${EN[match[1]] || translateDynamic(match[1])}” and set it as the global default`;
+    match = source.match(/^已将“(.+)”应用到选中盒子\s*\/\s*分组$/);
+    if (match) return `Applied “${EN[match[1]] || translateDynamic(match[1])}” to the selected boxes or groups`;
+    match = source.match(/^“(.+)”已设为盒子\s*\/\s*分组新建预设$/);
+    if (match) return `“${EN[match[1]] || translateDynamic(match[1])}” is now the creation preset for boxes and groups`;
+    match = source.match(/^将(.+)应用到选中$/);
+    if (match) return `Apply ${EN[match[1]] || translateDynamic(match[1])} to selection`;
+    match = source.match(/^将(.+)设为新建预设$/);
+    if (match) return `Use ${EN[match[1]] || translateDynamic(match[1])} as creation preset`;
+    match = source.match(/^应用(.+)并设为全局默认$/);
+    if (match) return `Apply ${EN[match[1]] || translateDynamic(match[1])} and set as global default`;
+    match = source.match(/^“(.+)”已设为盒子\s*\/\s*分组全局默认$/);
+    if (match) return `“${EN[match[1]] || translateDynamic(match[1])}” is now the global default for boxes and groups`;
+    match = source.match(/^已建立分组\s*·\s*(\d+)\s*个节点$/);
+    if (match) return `Group created · ${match[1]} ${match[1] === '1' ? 'node' : 'nodes'}`;
+    match = source.match(/^已移到「(.+)」下$/);
+    if (match) return `Moved under “${match[1] || 'Untitled'}”`;
+    match = source.match(/^已存为模板「(.+)」\s*·\s*(\d+)\s*个元素$/);
+    if (match) return `Saved as template “${match[1]}” · ${match[2]} ${match[2] === '1' ? 'element' : 'elements'}`;
+    match = source.match(/^新建\s*·\s*(.+)$/);
+    if (match) return `New · ${EN[match[1]] || translateDynamic(match[1])}`;
+    match = source.match(/^([一二三四五六七八九十]+月)，你完成了\s*(\d+)\s*件事。最常在周([日一二三四五六])留下痕迹。$/);
+    if (match) {
+      const months = { 一月:'January', 二月:'February', 三月:'March', 四月:'April', 五月:'May', 六月:'June', 七月:'July', 八月:'August', 九月:'September', 十月:'October', 十一月:'November', 十二月:'December' };
+      const days = { 日:'Sunday', 一:'Monday', 二:'Tuesday', 三:'Wednesday', 四:'Thursday', 五:'Friday', 六:'Saturday' };
+      return `You completed ${match[2]} items in ${months[match[1]] || match[1]}, most often on ${days[match[3]]}.`;
+    }
+    match = source.match(/^(\d+)\s*分钟前$/);
+    if (match) return `${match[1]} min ago`;
+    match = source.match(/^(\d+)\s*小时前$/);
+    if (match) return `${match[1]} hr ago`;
+    match = source.match(/^(\d+)\s*天前$/);
+    if (match) return `${match[1]} days ago`;
+    match = source.match(/^(\d+)\s*个节点\s*·\s*(.+)$/);
+    if (match) return `${match[1]} ${match[1] === '1' ? 'node' : 'nodes'} · ${match[2]}`;
+    if (source === '刚刚') return 'Just now';
+    if (source === '昨天') return 'Yesterday';
+    if (source === '文件已不在') return 'File missing';
+
+    // ── 专注页 · 每日任务统计 ──
+    match = source.match(/^连续\s*(\d+)\s*天$/);
+    if (match) return `${match[1]}-day streak`;
+    match = source.match(/^共\s*(\d+)\s*天$/);
+    if (match) return `${match[1]} days total`;
+    match = source.match(/^累计\s*(\d+)\s*分$/);
+    if (match) return `${match[1]} min total`;
+    match = source.match(/^今天\s*(\d+)\s*分$/);
+    if (match) return `${match[1]} min today`;
+    match = source.match(/^(\d+)\s*件全部完成\s*·\s*专注\s*(\d+)\s*分钟\s*·\s*明天见$/);
+    if (match) return `${match[1]} all complete · ${match[2]} min focused · See you tomorrow`;
+    match = source.match(/^(\d+)\s*件全部完成\s*·\s*明天见$/);
+    if (match) return `${match[1]} all complete · See you tomorrow`;
+    match = source.match(/^已记录\s*(\d+)\s*个打卡日，最近一次是\s*(.+)。$/);
+    if (match) return `${match[1]} check-in days recorded. Last was ${match[2]}.`;
+    match = source.match(/^今天\s*(\d+)\s*\/\s*(\d+)\s*完成$/);
+    if (match) return `${match[1]} / ${match[2]} done today`;
+    match = source.match(/^今天\s*(\d+)\s*\/\s*(\d+)\s*完成\s*·\s*今日已专注\s*(\d+)\s*分$/);
+    if (match) return `${match[1]} / ${match[2]} done today · ${match[3]} min focused`;
+    match = source.match(/^今日已专注\s*(\d+)\s*分$/);
+    if (match) return `${match[1]} min focused today`;
+    match = source.match(/^已打卡\s*(\d+)\s*天$/);
+    if (match) return `${match[1]} days checked in`;
+    match = source.match(/^最佳连续\s*(\d+)\s*天$/);
+    if (match) return `Best streak: ${match[1]} days`;
+    match = source.match(/^今天\s*(\d+)\s*\/\s*(\d+)\s*分\s*·\s*达标\s*✦$/);
+    if (match) return `Today ${match[1]} / ${match[2]} min · goal met ✦`;
+    match = source.match(/^今天\s*(\d+)\s*\/\s*(\d+)\s*分$/);
+    if (match) return `Today ${match[1]} / ${match[2]} min`;
+    match = source.match(/^今天已专注\s*(\d+)\s*分钟$/);
+    if (match) return `${match[1]} min focused today`;
+    match = source.match(/^(\d+)\s*\/\s*(\d+)\s*分钟\s*·\s*已达标$/);
+    if (match) return `${match[1]} / ${match[2]} min · goal met`;
+    match = source.match(/^(\d+)\s*\/\s*(\d+)\s*分钟$/);
+    if (match) return `${match[1]} / ${match[2]} min`;
+
+    // ── 专注页 · 计时器动态文本 ──
+    match = source.match(/^专注\s*·\s*第\s*(\d+)\s*段$/);
+    if (match) return `Focus · Session ${match[1]}`;
+    match = source.match(/^番茄钟\s*·\s*专注\s*(\d+)\s*\/\s*休息\s*(\d+)\s*分$/);
+    if (match) return `Pomodoro · ${match[1]} focus / ${match[2]} rest`;
+    match = source.match(/^番茄轮次\s+第\s*(\d+)\s*\/\s*(\d+)\s*段$/);
+    if (match) return `Pomodoro round ${match[1]} / ${match[2]}`;
+    match = source.match(/^(\d+)\s*段\s*·\s*(.+)$/);
+    if (match) return `${match[1]} sessions · ${EN[match[2]] || translateDynamic(match[2])}`;
+
+    // ── 专注页 · Toast 消息 ──
+    match = source.match(/^已保存专注记录，并完成今天的「(.+)」$/);
+    if (match) return `Session logged and today's "${match[1]}" completed`;
+    match = source.match(/^专注\s*(\d+)\s*分\s*·\s*(.+)\s*✦\s*已记下$/);
+    if (match) return `${match[1]} min focused · ${match[2]} ✦ logged`;
+    match = source.match(/^专注\s*(\d+)\s*分\s*✦\s*已记下$/);
+    if (match) return `${match[1]} min focused ✦ logged`;
+    match = source.match(/^专注记录已保存，每日任务未更新\s*·\s*(.+)$/);
+    if (match) return `Session logged; daily task update failed · ${match[1]}`;
+    match = source.match(/^专注记录已保存，任务状态未更新\s*·\s*(.+)$/);
+    if (match) return `Session logged; task status update failed · ${match[1]}`;
+    match = source.match(/^已保存专注记录，并完成任务\s*·\s*(.+)$/);
+    if (match) return `Session logged and task completed · ${match[1]}`;
+
+    // ── 专注页 · 每日任务动态 placeholder ──
+    match = source.match(/^在「(.+)」下添加任务…$/);
+    if (match) return `Add task under "${match[1]}"…`;
+    match = source.match(/^在「(.+)」下新建子分组…$/);
+    if (match) return `New subgroup under "${match[1]}"…`;
+
+    // ── 专注页 · 删除确认动态文本 ──
+    match = source.match(/^删除「(.+)」？它的累计天数与分钟会一起清掉。$/);
+    if (match) return `Delete "${match[1]}"? Its accumulated days and minutes will be cleared.`;
+    match = source.match(/^删除分组「(.+)」？里面的任务和子分组会移到上一层，不会被删除。$/);
+    if (match) return `Delete group "${match[1]}"? Tasks and subgroups will move up one level.`;
+
+    // ── 专注页 · 足迹（今日专用，匹配在通用模式之前）──
+    match = source.match(/^今日\s+(\d+)\s+段\s*·\s*(\d+)\s*分钟\s*·\s*点击圆点可回看$/);
+    if (match) return `Today ${match[1]} sessions · ${match[2]} min · click a dot to review`;
+    match = source.match(/^今日\s+(\d+)\s+段\s*·\s*(\d+)\s*小时\s*(\d+)\s*分\s*·\s*点击圆点可回看$/);
+    if (match) return `Today ${match[1]} sessions · ${match[2]} hr ${match[3]} min · click a dot to review`;
+    match = source.match(/^今日\s+(\d+)\s+段\s*·\s*(\d+)\s*小时\s*·\s*点击圆点可回看$/);
+    if (match) return `Today ${match[1]} sessions · ${match[2]} hr · click a dot to review`;
+    match = source.match(/^今日没有专注记录$/);
+    if (match) return 'Today no focus sessions';
+    // ── 足迹（通用，非今日）──
+    match = source.match(/^(.+)\s+(\d+)\s+段\s*·\s*(.+)\s*·\s*点击圆点可回看$/);
+    if (match) return `${match[1]} ${match[2]} sessions · ${match[3]} · click a dot to review`;
+    match = source.match(/^(.+)没有专注记录$/);
+    if (match) return `${match[1]}no focus sessions`;
+
+    // ── 专注页 · 座舱动态 ──
+    match = source.match(/^本段将计入「(.+)」$/);
+    if (match) return `This session counts toward "${match[1]}"`;
+    match = source.match(/^目标\s*·\s*(.+)$/);
+    if (match) return `Intention · ${match[1]}`;
+    match = source.match(/^累计\s*(\d+)\s*天$/);
+    if (match) return `${match[1]} days total`;
+
+    // ── 每日任务 aria 动态文本 ──
+    match = source.match(/^取消完成\s*·\s*(.+)$/);
+    if (match) return 'Undo · ' + match[1];
+    match = source.match(/^标记完成\s*·\s*(.+)$/);
+    if (match) return 'Mark done · ' + match[1];
+    match = source.match(/^查看打卡日历\s*·\s*(.+)$/);
+    if (match) return 'Check-in calendar · ' + match[1];
+    match = source.match(/^任务选项\s*·\s*(.+)$/);
+    if (match) return 'Task options · ' + match[1];
+    match = source.match(/^分组选项\s*·\s*(.+)$/);
+    if (match) return 'Group options · ' + match[1];
+    match = source.match(/^展开分组\s*·\s*(.+)$/);
+    if (match) return 'Expand group · ' + match[1];
+    match = source.match(/^折叠分组\s*·\s*(.+)$/);
+    if (match) return 'Collapse group · ' + match[1];
+
+    return source;
+  }
+
+  function t(source, vars) {
+    if (source == null) return '';
+    const raw = String(source);
+    if (language !== 'en') return interpolate(raw, vars);
+    return interpolate(EN[raw] || translateDynamic(raw), vars);
+  }
+
+  function isExcluded(element) {
+    return !!(element.closest && element.closest(AUTO_EXCLUDE));
+  }
+
+  function applyElement(element) {
+    if (!(element instanceof Element)) return;
+    if (isExcluded(element) && !element.matches('input, textarea')) return;
+    const key = element.getAttribute('data-i18n');
+    if (key) {
+      const source = element.getAttribute('data-i18n-zh') || key;
+      const target = language === 'en' ? (EN[key] || key) : source;
+      if (element.textContent !== target) element.textContent = target;
+    } else if (element.childElementCount === 0) {
+      const visible = element.textContent.trim();
+      let source = element.dataset.i18nSourceText || '';
+      if (language === 'en') {
+        if (source && visible !== (EN[source] || translateDynamic(source))) source = '';
+        if (!source && (EN[visible] || translateDynamic(visible) !== visible)) {
+          source = visible;
+          element.dataset.i18nSourceText = source;
+        }
+        if (source) {
+          const target = EN[source] || translateDynamic(source);
+          if (visible !== target) element.textContent = target;
+        }
+      } else if (source) {
+        if (visible !== source) element.textContent = source;
+      }
+    }
+
+    ATTRS.forEach((attr) => {
+      if (!element.hasAttribute(attr)) return;
+      const dataName = `i18nSource${attr.replace(/(^|-)(\w)/g, (_, __, char) => char.toUpperCase())}`;
+      const visible = element.getAttribute(attr) || '';
+      let source = element.dataset[dataName] || '';
+      if (language === 'en') {
+        if (!source && (EN[visible] || translateDynamic(visible) !== visible)) {
+          source = visible;
+          element.dataset[dataName] = source;
+        }
+        if (source) {
+          const target = EN[source] || translateDynamic(source);
+          if (visible !== target) element.setAttribute(attr, target);
+        }
+      } else if (source) {
+        if (visible !== source) element.setAttribute(attr, source);
+      }
+    });
+
+    if (element.childElementCount > 0) {
+      element.childNodes.forEach((node) => {
+        if (node.nodeType !== Node.TEXT_NODE) return;
+        const visible = node.nodeValue.trim();
+        let source = textSources.get(node) || '';
+        if (language === 'en') {
+          if (source && visible !== (EN[source] || translateDynamic(source))) source = '';
+          if (!source && (EN[visible] || translateDynamic(visible) !== visible)) {
+            source = visible;
+            textSources.set(node, source);
+          }
+          if (source) {
+            const target = EN[source] || translateDynamic(source);
+            if (visible !== target) node.nodeValue = node.nodeValue.replace(visible, target);
+          }
+        } else if (source && visible !== source) {
+          node.nodeValue = node.nodeValue.replace(visible, source);
+        }
+      });
+    }
+  }
+
+  function apply(root) {
+    if (!root || applying) return;
+    // 动态插入一张画布节点/Markdown 正文时，整棵子树都是用户内容；逐后代 closest()
+    // 扫描不仅无意义，还会在批量建卡时放大成明显卡顿。输入框例外，仍需翻译 placeholder。
+    if (root instanceof Element && isExcluded(root) && !root.matches('input, textarea')) return;
+    applying = true;
+    try {
+      if (root instanceof Element) applyElement(root);
+      const scope = root.querySelectorAll ? root : document;
+      scope.querySelectorAll('*').forEach(applyElement);
+      document.documentElement.lang = language;
+      document.documentElement.dataset.uiLanguage = language;
+      if (document.body) document.body.dataset.uiLanguage = language;
+      document.querySelectorAll('[data-role="ui-language"], [data-role="toolbar-language"]').forEach((select) => { select.value = language; });
+    } finally {
+      applying = false;
+    }
+  }
+
+  function setLanguage(next, persist = true) {
+    const normalized = next === 'en' ? 'en' : 'zh-CN';
+    language = normalized;
+    if (persist) {
+      try { localStorage.setItem(STORAGE_KEY, normalized); } catch (error) {}
+    }
+    apply(document);
+    listeners.forEach((listener) => listener(normalized));
+    document.dispatchEvent(new CustomEvent('relatum:languagechange', { detail: { language: normalized } }));
+  }
+
+  function bindLanguageControls(root) {
+    (root || document).querySelectorAll('[data-role="ui-language"], [data-role="toolbar-language"]').forEach((select) => {
+      if (select.dataset.i18nBound === '1') return;
+      select.dataset.i18nBound = '1';
+      select.value = language;
+      select.addEventListener('change', () => setLanguage(select.value, true));
+    });
+  }
+
+  const observer = new MutationObserver((records) => {
+    if (applying) return;
+    records.forEach((record) => {
+      record.addedNodes.forEach((node) => {
+        if (node.nodeType === 3) {
+          if (node.parentElement) applyElement(node.parentElement);
+          return;
+        }
+        if (node.nodeType !== 1) return;
+        if (isExcluded(node) && !node.matches('input, textarea')) return;
+        bindLanguageControls(node);
+        apply(node);
+      });
+      if (record.type === 'characterData' && record.target.parentElement) applyElement(record.target.parentElement);
+      if (record.type === 'attributes' && record.target instanceof Element) applyElement(record.target);
+    });
+  });
+
+  window.RelatumI18n = {
+    get language() { return language; },
+    t,
+    apply,
+    setLanguage,
+    onChange(listener) { listeners.add(listener); return () => listeners.delete(listener); }
+  };
+
+  function start() {
+    bindLanguageControls(document);
+    apply(document);
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ATTRS
+    });
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
+  else start();
+})();

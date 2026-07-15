@@ -1,0 +1,48 @@
+# 数据与隐私边界
+
+Relatum 是本地优先应用。源码仓库与用户数据严格分离。
+
+## 本地生成的数据
+
+应用运行后会在项目或桌面发布包旁创建：
+
+- `canvases/`：画布正文、回收站以及每张画布的 `.assets/` 图片和附件。
+- `data/recent.json`：最近画布和分组，其中可能包含绝对文件路径。
+- `data/viewport.json`、`data/window-state.json`：视口和窗口状态。
+- `data/study.json`、`data/notes.json`、`data/daily.json`、`data/focus.json`：学习与个人记录。
+- `data/diary/`、`data/学习归档/`、`data/画布归档/`：日记和历史归档。
+- `data/ai.json`：用户配置的 AI 地址、模型与 API Key。
+- `data/backgrounds/`：用户导入的背景图片。
+
+这些内容都不属于源码，已在 `.gitignore` 中整体排除。
+
+Windows 桌面版还会在 `%LOCALAPPDATA%\Canvas\WebView2` 保存 WebView2 配置和前端 `localStorage`。
+它位于仓库之外，不会被 Git 收集；进行“全新用户”测试时，需要使用隔离的本地配置目录或先备份后清理该目录。
+
+## 网络边界
+
+本地服务默认只监听回环地址。除用户主动配置和调用 AI 接口外，核心画布、笔记、学习与日历功能不需要云端账号。
+第三方脚本和字体随项目本地提供，正常使用时无需从 CDN 加载。
+
+## 发布前检查
+
+在 `git add` 或上传压缩包之前运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\check-public.ps1
+```
+
+默认模式检查 Git 会提交的文件，适合日常开发。制作 ZIP 或正式发布前必须检查目录中的全部物理文件：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\check-public.ps1 -Physical
+```
+
+脚本会检查用户数据目录、常见凭据格式、个人绝对路径、缓存和过大的文件。自动检查不能替代人工复核；提交前仍应查看：
+
+```powershell
+git status --short
+git diff --cached --name-only
+```
+
+如果凭据曾经进入 Git 历史，仅删除当前文件不够：应立即在服务商后台吊销或轮换凭据，并在公开前清理仓库历史。

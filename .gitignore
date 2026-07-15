@@ -1,0 +1,46 @@
+# User-created content and local application state
+/canvases/
+/data/
+*.canvas
+*.assets/
+
+# Secrets and local environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# Build and release output
+build/
+dist/
+*.spec
+/*-release/
+/Relatum-release/
+_internal/
+*.exe
+
+# Editor and agent-local settings
+.claude/
+.vscode/
+.idea/
+*.code-workspace
+
+# Logs, temporary files, and operating-system metadata
+*.log
+*.tmp
+*.bak
+*~
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store

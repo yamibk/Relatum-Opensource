@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>回收站 — 画布</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body class="start-page trash-page">
+  <script>
+    try {
+      document.body.dataset.startTheme = localStorage.getItem('canvas:startTheme') === 'dark' ? 'dark' : 'light';
+    } catch (e) {
+      document.body.dataset.startTheme = 'light';
+    }
+  </script>
+  <header class="top-bar">
+    <button type="button" class="btn-text" data-action="back" title="返回起步页">
+      <span aria-hidden="true">‹</span>&nbsp;起步页
+    </button>
+    <div class="brand">回收站</div>
+    <span class="top-bar-spacer" aria-hidden="true"></span>
+  </header>
+
+  <main class="start-main" data-state="recent">
+    <section class="recent-view">
+      <header class="recent-header">
+        <h1 class="recent-title">回收站</h1>
+        <div class="trash-hint">
+          ↑↓ 选择 ·&nbsp; ← 恢复到「最近」 ·&nbsp; 数字键 恢复到分组 ·&nbsp; 或拖到左侧分组
+        </div>
+      </header>
+      <div class="library">
+        <aside class="group-rail" data-role="group-rail"></aside>
+        <div class="group-panel">
+          <div class="trash-panel-head">
+            <h2 class="panel-title">回收站里的画布</h2>
+            <button type="button" class="trash-empty-btn" data-action="empty-trash" disabled>一键清空</button>
+          </div>
+          <ul class="recent-list" data-role="file-list"></ul>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- 右键菜单（动态构建）-->
+  <div class="context-menu" data-role="context-menu" hidden></div>
+
+  <div class="confirm-overlay" data-role="trash-confirm" hidden>
+    <section class="confirm-box" role="dialog" aria-modal="true" aria-labelledby="trash-confirm-title">
+      <h2 class="confirm-title" id="trash-confirm-title">永久清空回收站？</h2>
+      <p class="confirm-path trash-empty-warning">回收站里的所有内容将被永久删除，且不可恢复。</p>
+      <div class="confirm-actions">
+        <button type="button" class="btn-text" data-action="empty-cancel">取消</button>
+        <button type="button" class="btn btn-primary confirm-ok danger" data-action="empty-confirm">确认清空</button>
+      </div>
+    </section>
+  </div>
+
+  <!-- 顶部轻提示 -->
+  <div class="toast" data-role="toast"></div>
+
+  <script src="desktop-shell.js" defer></script>
+  <script src="trash.js" defer></script>
+  <script src="tooltip.js" defer></script>
+</body>
+</html>
