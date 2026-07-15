@@ -87,8 +87,36 @@ if errorlevel 1 (
 )
 
 echo.
-echo [3/4] 开始构建。新电脑第一次运行可能需要联网并等待几分钟...
-powershell -NoProfile -ExecutionPolicy Bypass -File ".\build-desktop.ps1"
+set "RELATUM_BUILD_SCRIPT=%REPO%\build-desktop.ps1"
+set "RELATUM_BUILD_PY=%TEMP%\canvas-desktop-build-venv\Scripts\python.exe"
+set "EXPECTED_WEBVIEW="
+set "EXPECTED_PYINSTALLER="
+set "EXPECTED_PILLOW_MIN="
+set "EXPECTED_PILLOW_MAX="
+set "USE_SKIP_INSTALL="
+
+if exist "%RELATUM_BUILD_PY%" (
+    for /f "tokens=1-4 delims=|" %%A in ('powershell -NoProfile -Command "$t=[IO.File]::ReadAllText($env:RELATUM_BUILD_SCRIPT); $a=[regex]::Match($t,'''pywebview==([^'']+)''').Groups[1].Value; $b=[regex]::Match($t,'''pyinstaller==([^'']+)''').Groups[1].Value; $p=[regex]::Match($t,'''Pillow\x3e=([^,'']+),\x3c([^'']+)'''); if($a -and $b -and $p.Success){$a+'|'+$b+'|'+$p.Groups[1].Value+'|'+$p.Groups[2].Value}"') do (
+        set "EXPECTED_WEBVIEW=%%A"
+        set "EXPECTED_PYINSTALLER=%%B"
+        set "EXPECTED_PILLOW_MIN=%%C"
+        set "EXPECTED_PILLOW_MAX=%%D"
+    )
+)
+
+if defined EXPECTED_WEBVIEW if defined EXPECTED_PYINSTALLER if defined EXPECTED_PILLOW_MIN if defined EXPECTED_PILLOW_MAX (
+    "%RELATUM_BUILD_PY%" -c "import re,sys; from importlib.metadata import version; import webview,PyInstaller,PIL; v=lambda s:tuple(int(x) for x in (re.findall(r'\d+',s)+['0','0','0'])[:3]); ok=(3,9)<=sys.version_info[:2]<=(3,12) and version('pywebview')==sys.argv[1] and version('pyinstaller')==sys.argv[2] and v(version('Pillow'))>=v(sys.argv[3]) and v(version('Pillow'))<v(sys.argv[4]); raise SystemExit(0 if ok else 1)" "%EXPECTED_WEBVIEW%" "%EXPECTED_PYINSTALLER%" "%EXPECTED_PILLOW_MIN%" "%EXPECTED_PILLOW_MAX%" >nul 2>&1
+    if not errorlevel 1 set "USE_SKIP_INSTALL=1"
+)
+
+echo.
+if defined USE_SKIP_INSTALL (
+    echo [3/4] 已检测到匹配的构建依赖，本次离线复用，不再联网安装...
+    powershell -NoProfile -ExecutionPolicy Bypass -File ".\build-desktop.ps1" -SkipInstall
+) else (
+    echo [3/4] 首次构建、依赖缺失或版本已变化，将联网安装依赖...
+    powershell -NoProfile -ExecutionPolicy Bypass -File ".\build-desktop.ps1"
+)
 if errorlevel 1 (
     echo [错误] 构建失败。不要运行或上传失败状态下的 Relatum-release。
     popd >nul
