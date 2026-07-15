@@ -6,7 +6,8 @@
 
 <p align="center">
   An open-source, local-first knowledge canvas and study workspace for Windows<br>
-  Built for visual notes, personal knowledge management, course work, research, and mind maps
+  Built for visual notes, personal knowledge management, course work, research, and mind maps<br>
+  Interface languages: Simplified Chinese · English
 </p>
 
 <p align="center">
@@ -23,7 +24,11 @@
   <img alt="Local first" src="https://img.shields.io/badge/data-local--first-2f855a?style=flat-square">
 </p>
 
-![Relatum mind map with automatic layout](docs/images/relatum-mind-map.png)
+<p align="center">
+  <a href="https://github.com/yamibk/Relatum-Opensource/releases/latest">
+    <img src="https://github.com/user-attachments/assets/fed0dc96-c635-4e79-99c4-fef8f8eb8195" alt="Relatum freeform canvas with connected notes and mind maps">
+  </a>
+</p>
 
 ## What is Relatum?
 

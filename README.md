@@ -7,15 +7,7 @@
 <p align="center">
   开源、本地优先的 Windows 知识画布与学习笔记软件<br>
   适合视觉笔记、个人知识管理（PKM）、课程整理、研究构思与思维导图<br>
-  目前支持的语言：简体中文和英文。<br>
-  Currently supported languages: Simplified Chinese, English.
-</p>
-
-
-<p align="center">
-  <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-111111?style=flat-square"></a>
-  <img alt="Windows 10 and 11" src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-2563eb?style=flat-square">
-  <img alt="Local first" src="https://img.shields.io/badge/data-local--first-2f855a?style=flat-square">
+  界面语言：简体中文 · English
 </p>
 
 <p align="center">
@@ -26,10 +18,17 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/yamibk/Relatum-Opensource/releases/latest"><<<img width="2559" height="1599" alt="image" src="https://github.com/user-attachments/assets/fed0dc96-c635-4e79-99c4-fef8f8eb8195" />
+  <a href="https://github.com/yamibk/Relatum-Opensource/releases/latest"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/yamibk/Relatum-Opensource?style=flat-square"></a>
+  <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-111111?style=flat-square"></a>
+  <img alt="Windows 10 and 11" src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-2563eb?style=flat-square">
+  <img alt="Local first" src="https://img.shields.io/badge/data-local--first-2f855a?style=flat-square">
+</p>
 
-
-![Relatum 思维导图与一键排版界面](docs/images/relatum-mind-map.png)
+<p align="center">
+  <a href="https://github.com/yamibk/Relatum-Opensource/releases/latest">
+    <img src="https://github.com/user-attachments/assets/fed0dc96-c635-4e79-99c4-fef8f8eb8195" alt="Relatum 自由画布、节点连接与思维导图界面">
+  </a>
+</p>
 
 ## Relatum 是什么？
 
