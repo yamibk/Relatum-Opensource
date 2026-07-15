@@ -6,8 +6,8 @@
 
 <p align="center">
   开源、本地优先的 Windows 知识画布与学习笔记软件<br>
-  适合视觉笔记、个人知识管理（PKM）、课程整理、研究构思与思维导图
-  目前支持的语言：简体中文和英文。
+  适合视觉笔记、个人知识管理（PKM）、课程整理、研究构思与思维导图<br>
+  目前支持的语言：简体中文和英文。<br>
   Currently supported languages: Simplified Chinese, English.
 </p>
 
