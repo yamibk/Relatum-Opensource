@@ -11,6 +11,13 @@
   Currently supported languages: Simplified Chinese, English.
 </p>
 
+
+<p align="center">
+  <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-111111?style=flat-square"></a>
+  <img alt="Windows 10 and 11" src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-2563eb?style=flat-square">
+  <img alt="Local first" src="https://img.shields.io/badge/data-local--first-2f855a?style=flat-square">
+</p>
+
 <p align="center">
   <a href="README_EN.md">English</a> ·
   <a href="https://github.com/yamibk/Relatum-Opensource/releases/latest/download/Relatum-release.zip"><strong>下载 Windows 版</strong></a> ·
@@ -19,12 +26,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/yamibk/Relatum-Opensource/releases/latest"><<img width="2559" height="1599" alt="6f52a10d9bbbcc33a94739e82618b136" src="https://github.com/user-attachments/assets/738086fb-46c5-40f7-a5a0-72cd0f3168ba" />
-></a>
-  <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-111111?style=flat-square"></a>
-  <img alt="Windows 10 and 11" src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-2563eb?style=flat-square">
-  <img alt="Local first" src="https://img.shields.io/badge/data-local--first-2f855a?style=flat-square">
-</p>
+  <a href="https://github.com/yamibk/Relatum-Opensource/releases/latest"><<<img width="2559" height="1599" alt="image" src="https://github.com/user-attachments/assets/fed0dc96-c635-4e79-99c4-fef8f8eb8195" />
+
 
 ![Relatum 思维导图与一键排版界面](docs/images/relatum-mind-map.png)
 
