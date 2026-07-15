@@ -96,6 +96,12 @@ No account is required. Canvases, preferences, and optional AI credentials stay 
   </tr>
 </table>
 
+<p align="center">
+  <img src="docs/images/relatum-calendar-diary.png" alt="Relatum calendar, diary, countdowns, study plans, and focus records">
+  <br>
+  <em>Calendar, daily journal, countdowns, and study records</em>
+</p>
+
 ![Relatum custom gradients and image backgrounds](docs/images/relatum-backgrounds.png)
 
 ## Quick start

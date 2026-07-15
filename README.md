@@ -96,6 +96,12 @@ Relatum 是一款开源、本地优先的自由知识画布和学习工作台。
   </tr>
 </table>
 
+<p align="center">
+  <img src="docs/images/relatum-calendar-diary.png" alt="Relatum 日历、日记、倒数日、学习计划与专注记录界面">
+  <br>
+  <em>日历日记、倒数日与每日学习记录</em>
+</p>
+
 ![Relatum 自定义渐变与图片背景](docs/images/relatum-backgrounds.png)
 
 ## 快速开始
