@@ -13,16 +13,15 @@ Relatum 是一个本地优先的画布、学习与笔记工作台。核心界面
 - 最近画布、分组、回收站、学习任务、日历、速记、复习和专注计时。
 - 可选的 AI 对话与“生成到画布”；API Key 仅保存在本机。
 - Markdown 文件夹导入与画布内容导出。
+
 <img width="2559" height="1599" alt="Relatum 画布界面" src="https://github.com/user-attachments/assets/47993904-ec89-415d-8ad8-c068c91935de" />
 <img width="2559" height="1599" alt="Relatum 活跃统计界面" src="https://github.com/user-attachments/assets/87723537-06ac-40d8-8086-a987d15657eb" />
 <img width="2559" height="1599" alt="Relatum 日历界面" src="https://github.com/user-attachments/assets/2397162c-2db8-45ac-932b-5f6381ff49a7" />
 
-
-
-
-
 ## 快速开始
-推荐下载右侧的release，每个release都是一个完整的客户端。直接下载本项目的zip也行，不过默认只能启动网页端。
+
+推荐下载右侧的 Release，每个 Release 都是一个完整的客户端。直接下载本项目的 ZIP 也可以，不过默认只能启动网页端。
+
 ### 源码模式
 
 要求：Windows 10/11、Python 3.9 或更高版本。
