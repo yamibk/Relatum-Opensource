@@ -9600,27 +9600,7 @@ body.start-page[data-start-theme="dark"] .focus-round-pip.is-done { background: 
 .review-card-meta [data-role="review-maturity"][data-maturity="疑"] { background: #fbf4e2; color: #8a6d24; }
 .review-card-meta [data-role="review-maturity"][data-maturity="熟"] { background: #eaf5ec; color: #3f7350; }
 
-/* 过渡动画：换卡上浮淡入 / 换问题轻淡入 / 今日计数跳动 */
-@keyframes reviewCardEnter {
-  from { opacity: 0; transform: translateY(9px) scale(0.992); }
-  to   { opacity: 1; transform: none; }
-}
-.review-card-content.enter {
-  animation: none;
-}
-.review-card-content.enter > * {
-  animation: reviewCardEnter 360ms var(--easing-page) both;
-}
-.review-card-content.enter > .review-card-meta { animation-delay: 0ms; }
-.review-card-content.enter > h2 { animation-delay: 24ms; }
-.review-card-content.enter > .review-body,
-.review-card-content.enter > .review-question { animation-delay: 45ms; }
-.review-card-content.enter > .review-answer-reveal,
-.review-card-content.enter > .review-answer { animation-delay: 62ms; }
-.review-card-content.enter > .review-actions { animation-delay: 82ms; }
-.review-card-content.enter > [hidden] {
-  animation: none;
-}
+/* 局部反馈：答案轻淡入 / 今日计数跳动。换卡本身直接完整展示，避免闪眼。 */
 @keyframes reviewQEnter {
   from { opacity: 0; transform: translateY(5px); }
   to   { opacity: 1; transform: none; }
@@ -9638,8 +9618,6 @@ body.start-page[data-start-theme="dark"] .focus-round-pip.is-done { background: 
   animation: reviewStatBump 0.44s var(--easing-soft, cubic-bezier(0.22, 1, 0.36, 1));
 }
 @media (prefers-reduced-motion: reduce) {
-  .review-card-content.enter,
-  .review-card-content.enter > *,
   .review-question.q-enter,
   .review-stats strong.bump { animation: none; }
 }
