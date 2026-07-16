@@ -154,16 +154,12 @@
       nodeContent: '节点内容', contentHint: '选中一个节点后可编辑正文',
       bodyLabel: '正文', bodyNoteDefault: '只在阅读窗口显示',
       bodyHintCard: '卡片正文常驻显示；预览悬停展开；便签正文即主体；代码整块着色。',
-      reviewEnabled: '加入复习卡片',
       quickColors: '快速配色', nodeColorPresets: '节点配色预设', lineColorPresets: '连线颜色预设',
       stickyRandomColor: '随机换色',
       resetColors: '恢复配色', resetGeometry: '恢复形状与缩放', resetTypography: '恢复文字与轮廓',
       applyCurrentNewStyle: '应用当前新建样式', applyCurrentNewLineStyle: '应用当前新建连线样式',
       resetBuiltInAppearance: '恢复内置朴素外观', resetBuiltInLineStyle: '恢复内置朴素连线',
       resetNewStyleDefaults: '全部新建样式恢复朴素默认', resetLineColor: '恢复连线颜色',
-      reviewQuestionsPlaceholder: '每行一个自定义问题；留空时使用系统预设问题。',
-      reviewHint: '复习页会优先抽这些问题，再混合系统预设问题。',
-      reviewAnswerPlaceholder: '参考答案（可留空）：复习时点「查看答案」才显示。',
       resetAppearance: '恢复所选节点外观',
       proNoteDefaults: '只影响之后新建的节点与连线；选中单个节点时可直接编辑其属性。',
       proNoteEditingBefore: '正在编辑「', proNoteEditingAfter: '」· 清空选择后回到默认样式。',
@@ -185,7 +181,6 @@
       epManualColor: '手工配色', epManualSize: '手工尺寸',
       epResetPresetColor: '恢复预设配色', epResetAutoSize: '恢复自动尺寸',
       epMindmapHint: '编辑颜色或尺寸会转为手工值；恢复后会继续跟随脑图分支和层级。',
-      epReviewBatchHint: '横线表示仅部分节点已加入；点击会统一加入，再次取消则全部移出。',
       epResetAppearance: '恢复所选节点外观',
       epAppliedColors: '已应用配色', epAppliedLineColor: '已应用连线颜色',
       epRestoredColors: '已恢复所选配色', epRestoredGeometry: '已恢复所选形状与缩放',
@@ -279,16 +274,12 @@
       nodeContent: 'Node Content', contentHint: 'Select a node to edit its body',
       bodyLabel: 'Body', bodyNoteDefault: 'Shown in reader only',
       bodyHintCard: 'Card body shown inline; Preview on hover; Sticky shows full body; Code block with syntax highlighting.',
-      reviewEnabled: 'Add to Review Cards',
       quickColors: 'Quick Colors', nodeColorPresets: 'Node color presets', lineColorPresets: 'Edge color presets',
       stickyRandomColor: 'Random Color',
       resetColors: 'Reset Colors', resetGeometry: 'Reset Shape & Scale', resetTypography: 'Reset Type & Outline',
       applyCurrentNewStyle: 'Apply Current New-Node Style', applyCurrentNewLineStyle: 'Apply Current New-Edge Style',
       resetBuiltInAppearance: 'Reset to Built-in Plain Style', resetBuiltInLineStyle: 'Reset to Built-in Plain Edge',
       resetNewStyleDefaults: 'Reset All New Styles to Plain Defaults', resetLineColor: 'Reset Edge Color',
-      reviewQuestionsPlaceholder: 'One custom question per line; leave blank for system defaults.',
-      reviewHint: 'Review will mix these questions with system defaults.',
-      reviewAnswerPlaceholder: 'Reference answer (optional): shown when tapping "Show Answer" during review.',
       resetAppearance: 'Reset Selected Node Appearance',
       proNoteDefaults: 'Changes apply to newly created nodes & lines; select a single node to edit it directly.',
       proNoteEditingBefore: 'Editing "', proNoteEditingAfter: '" · Clear selection to return to defaults.',
@@ -310,7 +301,6 @@
       epManualColor: 'Manual Color', epManualSize: 'Manual Size',
       epResetPresetColor: 'Reset to Preset Color', epResetAutoSize: 'Reset to Auto Size',
       epMindmapHint: 'Editing color or size switches to manual; reset to follow the branch preset again.',
-      epReviewBatchHint: 'A dash means only some nodes are included. Click to include all; clear it to remove all.',
       epResetAppearance: 'Reset Selected Node Appearance',
       epAppliedColors: 'Colors applied', epAppliedLineColor: 'Edge color applied',
       epRestoredColors: 'Selected colors restored', epRestoredGeometry: 'Selected shapes and scale restored',
@@ -1939,11 +1929,7 @@
     const proBodyNote = panel.querySelector('[data-role="pro-body-note"]');
     const proCodeLangWrap = panel.querySelector('[data-role="pro-code-lang-wrap"]');
     const proCodeLang = panel.querySelector('[data-role="pro-code-language"]');
-    const proReviewEnabled = panel.querySelector('[data-role="pro-review-enabled"]');
-    const proReviewQuestions = panel.querySelector('[data-role="pro-review-questions"]');
-    const proReviewAnswer = panel.querySelector('[data-role="pro-review-answer"]');
     const proBodyHint = panel.querySelector('[data-role="pro-body-hint"]');
-    const proReviewHint = panel.querySelector('[data-role="pro-review-hint"]');
     const proNote = panel.querySelector('[data-role="pro-note"]');
     const headTitle = panel.querySelector('.side-panel-head-title');
     let proBodyRichDirty = false;
@@ -2270,24 +2256,6 @@
       if (proCodeLang && codeNode) {
         proCodeLang.value = (node.language === 'c' || node.language === 'python' || node.language === 'matlab')
           ? node.language : 'python';
-      }
-      // 复习
-      if (proReviewEnabled) proReviewEnabled.parentElement.hidden = !readable;
-      if (proReviewEnabled && readable) {
-        var review = (node.review && typeof node.review === 'object') ? node.review : {};
-        proReviewEnabled.checked = review.enabled === true;
-      }
-      if (proReviewQuestions) { proReviewQuestions.hidden = !readable; proReviewQuestions.placeholder = toolbarCopy('reviewQuestionsPlaceholder'); }
-      if (proReviewQuestions && readable && document.activeElement !== proReviewQuestions) {
-        var rv = (node.review && typeof node.review === 'object') ? node.review : {};
-        var qs = Array.isArray(rv.questions) ? rv.questions : [];
-        proReviewQuestions.value = qs.join('\n');
-      }
-      if (proReviewAnswer) { proReviewAnswer.hidden = !readable; proReviewAnswer.placeholder = toolbarCopy('reviewAnswerPlaceholder'); }
-      if (proReviewHint) proReviewHint.hidden = !readable;
-      if (proReviewAnswer && readable && document.activeElement !== proReviewAnswer) {
-        var ra = (node.review && typeof node.review === 'object') ? node.review : {};
-        proReviewAnswer.value = typeof ra.answer === 'string' ? ra.answer : '';
       }
     }
 
@@ -2654,43 +2622,6 @@
       cm().notify();
       updatePanelForNode(node);
     });
-    // 复习
-    if (proReviewEnabled) proReviewEnabled.addEventListener('change', function () {
-      if (!activeNodeId || !cm()) return;
-      var node = cm().findNode(activeNodeId);
-      if (!node) return;
-      var review = (node.review && typeof node.review === 'object') ? node.review : {};
-      node.review = Object.assign({}, review, { enabled: !!proReviewEnabled.checked });
-      cm().pushHistory();
-      cm().notify();
-    });
-    if (proReviewQuestions) {
-      proReviewQuestions.addEventListener('input', function () {
-        if (!activeNodeId || !cm()) return;
-        var node = cm().findNode(activeNodeId);
-        if (!node) return;
-        var lines = proReviewQuestions.value.split(/\r?\n/).map(function (l) { return l.trim(); }).filter(Boolean).slice(0, 12);
-        var review = (node.review && typeof node.review === 'object') ? node.review : {};
-        node.review = Object.assign({}, review, { questions: lines });
-        cm().notify();
-      });
-      proReviewQuestions.addEventListener('change', function () {
-        if (activeNodeId && cm()) cm().pushHistory();
-      });
-    }
-    if (proReviewAnswer) {
-      proReviewAnswer.addEventListener('input', function () {
-        if (!activeNodeId || !cm()) return;
-        var node = cm().findNode(activeNodeId);
-        if (!node) return;
-        var review = (node.review && typeof node.review === 'object') ? node.review : {};
-        node.review = Object.assign({}, review, { answer: proReviewAnswer.value });
-        cm().notify();
-      });
-      proReviewAnswer.addEventListener('change', function () {
-        if (activeNodeId && cm()) cm().pushHistory();
-      });
-    }
     // ── 监听选择变化 ──
     document.addEventListener('editor:singleselect', function (event) {
       var node = event.detail && event.detail.node;

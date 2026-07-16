@@ -2,6 +2,8 @@
   'use strict';
 
   const STORAGE_KEY = 'canvas:editorOnboarding:v2';
+  const INITIAL_LANGUAGE_STORAGE_KEY = 'canvas:initialLanguageChosen:v1';
+  const LANGUAGE_STORAGE_KEY = 'canvas:toolbarLanguage';
   const reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   const replayButton = document.querySelector('[data-role="onboarding-reset"]');
   const editorPage = document.querySelector('.editor-page');
@@ -11,6 +13,8 @@
   let restoreFocus = null;
   let practice = null;
   let readyState = null;
+  let languagePicker = null;
+  let choosingInitialLanguage = false;
 
   const COPY = {
     'zh-CN': {
@@ -127,6 +131,92 @@
   }
 
   function copy() { return COPY[language()]; }
+
+  function suggestedLanguage() {
+    const languages = Array.isArray(navigator.languages) && navigator.languages.length
+      ? navigator.languages : [navigator.language || ''];
+    return languages.some(function (value) {
+      return String(value || '').toLowerCase().startsWith('zh');
+    }) ? 'zh-CN' : 'en';
+  }
+
+  function persistInitialLanguage(next) {
+    try { localStorage.setItem(INITIAL_LANGUAGE_STORAGE_KEY, next); } catch (e) {}
+  }
+
+  function applyInitialLanguage(next) {
+    if (window.RelatumI18n && typeof window.RelatumI18n.setLanguage === 'function') {
+      window.RelatumI18n.setLanguage(next, true);
+      return;
+    }
+    try { localStorage.setItem(LANGUAGE_STORAGE_KEY, next); } catch (e) {}
+    document.documentElement.lang = next;
+    document.documentElement.dataset.uiLanguage = next;
+    if (document.body) document.body.dataset.uiLanguage = next;
+  }
+
+  function trapLanguagePickerFocus(event) {
+    if (!languagePicker || event.key !== 'Tab') return;
+    const choices = Array.from(languagePicker.querySelectorAll('[data-language-choice]'));
+    if (!choices.length) return;
+    const first = choices[0];
+    const last = choices[choices.length - 1];
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+  }
+
+  function chooseInitialLanguage(next) {
+    if (choosingInitialLanguage || !languagePicker) return;
+    choosingInitialLanguage = true;
+    const normalized = next === 'en' ? 'en' : 'zh-CN';
+    applyInitialLanguage(normalized);
+    persistInitialLanguage(normalized);
+    languagePicker.querySelectorAll('[data-language-choice]').forEach(function (button) {
+      button.disabled = true;
+      button.classList.toggle('selected', button.dataset.languageChoice === normalized);
+    });
+    languagePicker.classList.remove('open');
+    window.setTimeout(function () {
+      if (languagePicker) {
+        languagePicker.remove();
+        languagePicker = null;
+      }
+      choosingInitialLanguage = false;
+      openGuide({ page: 0 });
+    }, reduceMotion ? 0 : 230);
+  }
+
+  function openLanguagePicker() {
+    if (languagePicker) return;
+    const suggested = suggestedLanguage();
+    const el = document.createElement('div');
+    el.className = 'editor-onboarding editor-language-welcome';
+    el.setAttribute('aria-hidden', 'true');
+    el.innerHTML = '<div class="editor-onboarding-backdrop" aria-hidden="true"></div>'
+      + '<section class="editor-onboarding-panel editor-language-panel" role="dialog" aria-modal="true" aria-labelledby="editor-language-title" aria-describedby="editor-language-description">'
+      + '<header class="editor-language-head"><div class="editor-language-mark" aria-hidden="true"><svg viewBox="0 0 72 52"><path d="M18 15 C30 15 30 35 43 35 M18 15 C34 15 39 15 54 15"/></svg><i></i><i></i><i></i></div>'
+      + '<p>RELATUM · WELCOME</p><h2 id="editor-language-title"><span lang="zh-CN">选择你的语言</span><span lang="en">Choose your language</span></h2></header>'
+      + '<div class="editor-language-choices">'
+      + '<button type="button" data-language-choice="zh-CN" class="' + (suggested === 'zh-CN' ? 'suggested' : '') + '" aria-label="中文，Chinese"><span class="editor-language-code">ZH</span><span class="editor-language-name"><strong lang="zh-CN">中文</strong><small lang="en">Chinese</small></span><span class="editor-language-arrow" aria-hidden="true">→</span><em class="editor-language-suggested">系统建议 · Suggested</em></button>'
+      + '<button type="button" data-language-choice="en" class="' + (suggested === 'en' ? 'suggested' : '') + '" aria-label="English，英文"><span class="editor-language-code">EN</span><span class="editor-language-name"><strong lang="en">English</strong><small lang="zh-CN">英文</small></span><span class="editor-language-arrow" aria-hidden="true">→</span><em class="editor-language-suggested">Suggested · 系统建议</em></button>'
+      + '</div><footer id="editor-language-description" class="editor-language-foot"><span lang="zh-CN">以后可以在右下角的设置中更改</span><i aria-hidden="true"></i><span lang="en">You can change this later in Settings.</span></footer></section>';
+    document.body.appendChild(el);
+    languagePicker = el;
+    el.addEventListener('click', function (event) {
+      const choice = event.target.closest('[data-language-choice]');
+      if (choice) chooseInitialLanguage(choice.dataset.languageChoice);
+    });
+    el.addEventListener('keydown', trapLanguagePickerFocus);
+    document.body.classList.add('editor-onboarding-open');
+    setCanvasSuspended(true);
+    requestAnimationFrame(function () {
+      if (!languagePicker) return;
+      languagePicker.setAttribute('aria-hidden', 'false');
+      languagePicker.classList.add('open');
+      const suggestedChoice = languagePicker.querySelector('.suggested');
+      if (suggestedChoice) suggestedChoice.focus({ preventScroll: true });
+    });
+  }
 
   function renderReplayEntry() {
     if (!replayButton) return;
@@ -577,9 +667,19 @@
     readyState = event.detail || {};
     if (!readyState.fresh || readyState.embed) return;
     let state = '';
-    try { state = localStorage.getItem(STORAGE_KEY) || ''; } catch (e) {}
+    let initialLanguage = '';
+    let savedLanguage = '';
+    try {
+      state = localStorage.getItem(STORAGE_KEY) || '';
+      initialLanguage = localStorage.getItem(INITIAL_LANGUAGE_STORAGE_KEY) || '';
+      savedLanguage = localStorage.getItem(LANGUAGE_STORAGE_KEY) || '';
+    } catch (e) {}
     if (state) return;
-    window.setTimeout(function () { openGuide({ page: 0 }); }, reduceMotion ? 180 : 620);
+    if (!initialLanguage && savedLanguage) persistInitialLanguage(savedLanguage === 'en' ? 'en' : 'zh-CN');
+    window.setTimeout(function () {
+      if (!initialLanguage && !savedLanguage) openLanguagePicker();
+      else openGuide({ page: 0 });
+    }, reduceMotion ? 180 : 620);
   });
 
   document.addEventListener('relatum:languagechange', function () {

@@ -13,7 +13,6 @@ import argparse
 import base64
 import binascii
 import hashlib
-import heapq
 import http.server
 import json
 import math
@@ -21,6 +20,7 @@ import os
 import re
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -50,12 +50,14 @@ STUDY_FILE = DATA / "study.json"
 STUDY_ARCHIVE_DIR = DATA / "学习归档"
 CANVAS_ARCHIVE_DIR = DATA / "画布归档"   # 编辑器顶栏「归档」：移走划线节点 + 这里留轻量记录
 NOTES_FILE = DATA / "notes.json"   # 起步页「速记」便签墙（独立数据，不进 .canvas）
+START_STICKY_NOTES_FILE = DATA / "start-sticky-notes.json"   # 起步页跨页便签（不含「速记」页）
 FOCUS_FILE = DATA / "focus.json"   # 起步页「专注钟」专注记录（自成一体，不进 .canvas、不接活跃页）
 DAILY_FILE = DATA / "daily.json"   # 专注页「每日任务」习惯清单（每天重置勾选，累计天数/分钟；自成一体，不进 .canvas）
 DIARY_DIR = DATA / "diary"   # 起步页「日历」日记：每天一份 Markdown，与学习/速记数据解耦
 CALENDAR_PINS_FILE = DATA / "calendar-pins.json"   # 日历月历上的任务便签（按月份保存自由坐标）
 COUNTDOWN_FILE = DATA / "countdown.json"   # 日历页轻量倒数日：目标事件 + 目标日期
 TEMPLATES_FILE = DATA / "templates.json"   # 「模板」库：常用节点组的可复用快照（全局，所有画布共用，不进 .canvas）
+REVIEW_DB_FILE = DATA / "review.db"   # 独立复习卡片、调度状态与复习事件；不扫描、不改写 .canvas
 
 DEFAULT_PORT = 8765
 PORT_ATTEMPTS = 20
@@ -1320,6 +1322,9 @@ NOTE_TEXT_MAX = 2000
 NOTES_MAX = 400   # 上限保护，避免数据无限膨胀
 NOTE_EDGES_MAX = 800   # 连线上限保护
 NOTE_ARROWS_MAX = 800   # 右键拖出的箭头上限保护
+START_STICKY_SCOPES = {"recent", "study", "cadence", "calendar", "review", "focus"}
+START_STICKY_NOTES_MAX = 240
+START_STICKY_NOTES_PER_SCOPE_MAX = 60
 
 
 def _sanitize_note(item: object) -> dict | None:
@@ -1473,6 +1478,82 @@ def save_notes(data: dict) -> dict:
         data.get("arrows", []) if isinstance(data, dict) else [],
     )
     _atomic_write_json(NOTES_FILE, payload)
+    return payload
+
+
+def _sanitize_start_sticky_note(item: object) -> dict | None:
+    """规范起步页跨页便签；它只有页面归属、位置和纯文本，不承接速记墙能力。"""
+    if not isinstance(item, dict):
+        return None
+    note_id = item.get("id")
+    scope = item.get("scope")
+    if not isinstance(note_id, str) or not note_id or len(note_id) > 96:
+        return None
+    if scope not in START_STICKY_SCOPES:
+        return None
+    try:
+        x = float(item.get("x", 0))
+        y = float(item.get("y", 0))
+        rotate = float(item.get("rotate", 0))
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(rotate)):
+        return None
+    text = item.get("text")
+    if not isinstance(text, str):
+        text = ""
+    color = item.get("color")
+    if color not in NOTE_COLORS:
+        color = "yellow"
+    note = {
+        "id": note_id,
+        "scope": scope,
+        "x": round(max(0.0, min(50000.0, x)), 2),
+        "y": round(max(0.0, min(50000.0, y)), 2),
+        "color": color,
+        "text": text[:NOTE_TEXT_MAX],
+        "rotate": round(max(-4.0, min(4.0, rotate)), 2),
+    }
+    created_at = item.get("createdAt")
+    if isinstance(created_at, str) and created_at:
+        note["createdAt"] = created_at[:64]
+    return note
+
+
+def _build_start_sticky_notes_payload(items: object) -> dict:
+    notes: list[dict] = []
+    ids: set[str] = set()
+    scope_counts = {scope: 0 for scope in START_STICKY_SCOPES}
+    for item in items if isinstance(items, list) else []:
+        note = _sanitize_start_sticky_note(item)
+        if note is None or note["id"] in ids:
+            continue
+        scope = note["scope"]
+        if scope_counts[scope] >= START_STICKY_NOTES_PER_SCOPE_MAX:
+            continue
+        ids.add(note["id"])
+        scope_counts[scope] += 1
+        notes.append(note)
+        if len(notes) >= START_STICKY_NOTES_MAX:
+            break
+    return {"version": 1, "notes": notes}
+
+
+def load_start_sticky_notes() -> dict:
+    try:
+        raw = json.loads(START_STICKY_NOTES_FILE.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {"version": 1, "notes": []}
+    if not isinstance(raw, dict):
+        return {"version": 1, "notes": []}
+    return _build_start_sticky_notes_payload(raw.get("notes", []))
+
+
+def save_start_sticky_notes(data: dict) -> dict:
+    payload = _build_start_sticky_notes_payload(
+        data.get("notes", []) if isinstance(data, dict) else []
+    )
+    _atomic_write_json(START_STICKY_NOTES_FILE, payload)
     return payload
 
 
@@ -2874,11 +2955,24 @@ def _notes_archive_folder(note_count: int) -> Path:
         index += 1
 
 
-REVIEW_NODE_KINDS = {"index", "preview", "card", "sticky", "code"}
+# 独立复习卡片使用 SQLite 保存。卡片内容、调度和复习事件都不再依附画布节点。
 # 间隔重复（Leitner 盒子）：level=盒子序号；「记得」升一盒、间隔按下表拉长，「不会」清零今天再练，
-# 「模糊」原地但至少隔天。熟练度标签由 level 推导（生→疑→熟），不再有「通」。
+# 「模糊」原地但至少隔天。熟练度标签由 level 推导（生→疑→熟），不落库重复保存。
 REVIEW_LEVEL_DAYS = [0, 1, 3, 7, 16, 35]
 REVIEW_MAX_LEVEL = len(REVIEW_LEVEL_DAYS) - 1
+REVIEW_SCHEMA_VERSION = 3
+REVIEW_CARD_STATUSES = {"active", "suspended", "archived"}
+REVIEW_RATINGS = {"remembered", "vague", "forgot"}
+REVIEW_SCOPE_MODES = {"all", "unfiled", "deck"}
+REVIEW_SESSION_LIMITS = {10, 20, 50}
+REVIEW_ORDER_MODES = {"due", "random", "weak"}
+REVIEW_PROMPT_MAX = 12000
+REVIEW_ANSWER_MAX = 50000
+REVIEW_NOTES_MAX = 100000
+REVIEW_DECK_NAME_MAX = 80
+REVIEW_TAG_NAME_MAX = 32
+REVIEW_TAGS_PER_CARD_MAX = 12
+REVIEW_BATCH_MAX = 500
 
 
 def _review_maturity_for_level(level: int) -> str:
@@ -2889,96 +2983,783 @@ def _review_maturity_for_level(level: int) -> str:
     return "熟"
 
 
-def _review_node_title(node: dict) -> str:
-    title = str(node.get("text") or "").strip()
-    if title:
-        return title
-    body = str(node.get("body") or "").strip()
-    if body:
-        return body.splitlines()[0].strip()[:80] or "未命名节点"
-    return "未命名节点"
-
-
-def review_pool_payload(limit: int = 240) -> dict:
-    """复习卡片候选池：从本地画布里收集可复习的正文节点。
-
-    只有在编辑模式显式勾选「加入复习卡片」(review.enabled=true) 的正文节点才进入候选池；
-    默认不加入。其余节点（无 review 字段或 enabled!=true）一律跳过。
-    """
-    total_count = 0
-
-    def iter_cards():
-        nonlocal total_count
-        if not CANVASES.exists():
-            return
-        # 画布契约只在 canvases/ 第一层保存正文。不要用 rglob 穿过每张
-        # 画布的 .assets 附件树；回收站作为子目录也自然不会进入复习池。
-        for canvas_file in CANVASES.glob("*.canvas"):
-            try:
-                data = json.loads(canvas_file.read_text(encoding="utf-8-sig"))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            if not isinstance(data, dict):
-                continue
-            nodes = data.get("nodes") or []
-            if not isinstance(nodes, list):
-                continue
-            updated_at = str(data.get("updatedAt") or data.get("createdAt") or "")
-            for node in nodes:
-                if not isinstance(node, dict):
-                    continue
-                if node.get("strike"):
-                    continue
-                node_id = str(node.get("id") or "").strip()
-                if not node_id:
-                    continue
-                kind = node.get("kind")
-                if kind == "text":
-                    kind = "index"
-                if kind not in REVIEW_NODE_KINDS:
-                    continue
-                review = node.get("review") if isinstance(node.get("review"), dict) else {}
-                if review.get("enabled") is not True:
-                    continue
-                try:
-                    level = int(review.get("level") or 0)
-                except (TypeError, ValueError):
-                    level = 0
-                questions = review.get("questions") if isinstance(review.get("questions"), list) else []
-                total_count += 1
-                yield {
-                    "canvasPath": _norm(canvas_file),
-                    "canvasName": canvas_file.stem,
-                    "nodeId": node_id,
-                    "title": _review_node_title(node),
-                    "body": str(node.get("body") or ""),
-                    "kind": kind,
-                    "updatedAt": updated_at,
-                    "lastReviewedAt": str(review.get("lastReviewedAt") or ""),
-                    "reviewCount": int(review.get("count") or 0) if str(review.get("count") or "0").isdigit() else 0,
-                    "maturity": str(review.get("maturity") or "生"),
-                    "level": level,
-                    "due": str(review.get("due") or ""),
-                    "answer": str(review.get("answer") or ""),
-                    "questions": [str(q).strip() for q in questions if str(q).strip()][:8],
-                }
-
-    # 接口只返回前 limit 张，但 count 仍统计全部。用有界堆避免复习节点长期
-    # 积累后先把所有正文/答案复制进列表、排序，再丢弃绝大多数。
-    cards = heapq.nsmallest(
-        limit,
-        iter_cards(),
-        key=lambda item: (
-            item.get("due") or "",
-            item.get("updatedAt") or "",
-        ),
+def _review_connect() -> sqlite3.Connection:
+    DATA.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(REVIEW_DB_FILE), timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if version > REVIEW_SCHEMA_VERSION:
+        conn.close()
+        raise sqlite3.DatabaseError("复习数据库来自更高版本的 Relatum")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS review_decks (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            name_key TEXT NOT NULL UNIQUE,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS review_tags (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            name_key TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS review_cards (
+            id TEXT PRIMARY KEY,
+            card_type TEXT NOT NULL DEFAULT 'basic',
+            prompt TEXT NOT NULL,
+            answer TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active'
+                CHECK (status IN ('active', 'suspended', 'archived')),
+            level INTEGER NOT NULL DEFAULT 0,
+            due_on TEXT NOT NULL DEFAULT '',
+            last_reviewed_at TEXT NOT NULL DEFAULT '',
+            review_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            deck_id TEXT,
+            FOREIGN KEY(deck_id) REFERENCES review_decks(id) ON DELETE SET NULL
+        );
+        CREATE TABLE IF NOT EXISTS review_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            card_id TEXT,
+            prompt_snapshot TEXT NOT NULL DEFAULT '',
+            rating TEXT NOT NULL,
+            reviewed_at TEXT NOT NULL,
+            previous_level INTEGER NOT NULL,
+            next_level INTEGER NOT NULL,
+            next_due_on TEXT NOT NULL,
+            FOREIGN KEY(card_id) REFERENCES review_cards(id) ON DELETE SET NULL
+        );
+        CREATE TABLE IF NOT EXISTS review_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            scope_mode TEXT NOT NULL DEFAULT 'all'
+                CHECK (scope_mode IN ('all', 'unfiled', 'deck')),
+            scope_deck_id TEXT,
+            session_limit INTEGER NOT NULL DEFAULT 20
+                CHECK (session_limit IN (10, 20, 50)),
+            order_mode TEXT NOT NULL DEFAULT 'due'
+                CHECK (order_mode IN ('due', 'random', 'weak')),
+            require_reveal INTEGER NOT NULL DEFAULT 0
+                CHECK (require_reveal IN (0, 1)),
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(scope_deck_id) REFERENCES review_decks(id) ON DELETE SET NULL
+        );
+        """
     )
-    return {
-        "version": 1,
-        "generatedAt": _study_now(),
-        "count": total_count,
-        "cards": cards,
+    card_columns = {
+        str(row["name"]) for row in conn.execute("PRAGMA table_info(review_cards)").fetchall()
     }
+    if "deck_id" not in card_columns:
+        conn.execute(
+            "ALTER TABLE review_cards ADD COLUMN deck_id TEXT "
+            "REFERENCES review_decks(id) ON DELETE SET NULL"
+        )
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS review_card_tags (
+            card_id TEXT NOT NULL,
+            tag_id TEXT NOT NULL,
+            PRIMARY KEY(card_id, tag_id),
+            FOREIGN KEY(card_id) REFERENCES review_cards(id) ON DELETE CASCADE,
+            FOREIGN KEY(tag_id) REFERENCES review_tags(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_review_cards_status_due
+            ON review_cards(status, due_on, created_at);
+        CREATE INDEX IF NOT EXISTS idx_review_cards_deck
+            ON review_cards(deck_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_review_cards_deck_status_due
+            ON review_cards(deck_id, status, due_on, created_at);
+        CREATE INDEX IF NOT EXISTS idx_review_events_reviewed_at
+            ON review_events(reviewed_at);
+        CREATE INDEX IF NOT EXISTS idx_review_events_card_id
+            ON review_events(card_id, reviewed_at);
+        CREATE INDEX IF NOT EXISTS idx_review_card_tags_tag
+            ON review_card_tags(tag_id, card_id);
+        """
+    )
+    conn.execute(
+        """INSERT OR IGNORE INTO review_settings
+           (id, scope_mode, scope_deck_id, session_limit, order_mode, require_reveal, updated_at)
+           VALUES (1, 'all', NULL, 20, 'due', 0, ?)""",
+        (_study_now(),),
+    )
+    if version < REVIEW_SCHEMA_VERSION:
+        conn.execute(f"PRAGMA user_version = {REVIEW_SCHEMA_VERSION}")
+    conn.commit()
+    return conn
+
+
+def _review_text(value: object, *, label: str, limit: int, required: bool = False) -> str:
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if required and not text:
+        raise ValueError(f"{label}不能为空")
+    if len(text) > limit:
+        raise ValueError(f"{label}过长（最多 {limit} 个字符）")
+    return text
+
+
+def _review_tag_names(value: object) -> list[str]:
+    raw = value if isinstance(value, list) else re.split(r"[,，\n]", str(value or ""))
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        name = re.sub(r"\s+", " ", str(item or "").strip().lstrip("#")).strip()
+        if not name:
+            continue
+        if len(name) > REVIEW_TAG_NAME_MAX:
+            raise ValueError(f"标签过长（最多 {REVIEW_TAG_NAME_MAX} 个字符）")
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+        if len(names) >= REVIEW_TAGS_PER_CARD_MAX:
+            break
+    return names
+
+
+def _review_card_ids(value: object) -> list[str]:
+    if not isinstance(value, list):
+        raise ValueError("缺少卡片 ids 数组")
+    ids: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        card_id = str(item or "").strip()
+        if card_id and card_id not in seen:
+            seen.add(card_id)
+            ids.append(card_id)
+        if len(ids) >= REVIEW_BATCH_MAX:
+            break
+    if not ids:
+        raise ValueError("至少选择一张卡片")
+    return ids
+
+
+def _review_deck_id(conn: sqlite3.Connection, value: object) -> str | None:
+    deck_id = str(value or "").strip()
+    if not deck_id:
+        return None
+    if conn.execute("SELECT 1 FROM review_decks WHERE id = ?", (deck_id,)).fetchone() is None:
+        raise ValueError("卡组不存在")
+    return deck_id
+
+
+def _review_card_row(conn: sqlite3.Connection, card_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        """SELECT c.*, d.name AS deck_name
+           FROM review_cards c
+           LEFT JOIN review_decks d ON d.id = c.deck_id
+           WHERE c.id = ?""",
+        (card_id,),
+    ).fetchone()
+
+
+def _review_tags_by_card(conn: sqlite3.Connection, card_ids: list[str]) -> dict[str, list[str]]:
+    if not card_ids:
+        return {}
+    result: dict[str, list[str]] = {card_id: [] for card_id in card_ids}
+    # SQLite 的绑定变量上限因运行时构建而异。卡片库可能一次返回上千张卡，
+    # 分块查询可以避免大 IN (...) 在较低上限的系统上直接失败。
+    for offset in range(0, len(card_ids), 400):
+        chunk = card_ids[offset:offset + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"""SELECT ct.card_id, t.name
+                FROM review_card_tags ct
+                JOIN review_tags t ON t.id = ct.tag_id
+                WHERE ct.card_id IN ({placeholders})
+                ORDER BY t.name_key ASC""",
+            chunk,
+        ).fetchall()
+        for row in rows:
+            result.setdefault(str(row["card_id"]), []).append(str(row["name"]))
+    return result
+
+
+def _review_replace_tags(conn: sqlite3.Connection, card_id: str, names: list[str]) -> None:
+    conn.execute("DELETE FROM review_card_tags WHERE card_id = ?", (card_id,))
+    now = _study_now()
+    for name in names:
+        key = name.casefold()
+        tag = conn.execute("SELECT id FROM review_tags WHERE name_key = ?", (key,)).fetchone()
+        if tag is None:
+            tag_id = "rt_" + uuid.uuid4().hex
+            conn.execute(
+                "INSERT INTO review_tags (id, name, name_key, created_at) VALUES (?, ?, ?, ?)",
+                (tag_id, name, key, now),
+            )
+        else:
+            tag_id = str(tag["id"])
+        conn.execute(
+            "INSERT OR IGNORE INTO review_card_tags (card_id, tag_id) VALUES (?, ?)",
+            (card_id, tag_id),
+        )
+    conn.execute(
+        "DELETE FROM review_tags WHERE NOT EXISTS "
+        "(SELECT 1 FROM review_card_tags ct WHERE ct.tag_id = review_tags.id)"
+    )
+
+
+def _review_card_payload(row: sqlite3.Row, tags: list[str] | None = None) -> dict:
+    level = max(0, min(int(row["level"] or 0), REVIEW_MAX_LEVEL))
+    return {
+        "id": str(row["id"]),
+        "type": str(row["card_type"] or "basic"),
+        "prompt": str(row["prompt"] or ""),
+        "answer": str(row["answer"] or ""),
+        "notes": str(row["notes"] or ""),
+        "status": str(row["status"] or "active"),
+        "level": level,
+        "maturity": _review_maturity_for_level(level),
+        "due": str(row["due_on"] or ""),
+        "lastReviewedAt": str(row["last_reviewed_at"] or ""),
+        "reviewCount": int(row["review_count"] or 0),
+        "createdAt": str(row["created_at"] or ""),
+        "updatedAt": str(row["updated_at"] or ""),
+        "deckId": str(row["deck_id"] or ""),
+        "deckName": str(row["deck_name"] or ""),
+        "tags": list(tags or []),
+    }
+
+
+def _review_decks_and_tags_payload(conn: sqlite3.Connection) -> dict:
+    deck_rows = conn.execute(
+        """SELECT d.id, d.name, d.sort_order, d.created_at, d.updated_at,
+                  COUNT(c.id) AS card_count
+           FROM review_decks d
+           LEFT JOIN review_cards c ON c.deck_id = d.id
+           GROUP BY d.id
+           ORDER BY d.sort_order ASC, d.created_at ASC"""
+    ).fetchall()
+    tag_rows = conn.execute(
+        """SELECT t.name, COUNT(ct.card_id) AS card_count
+           FROM review_tags t
+           JOIN review_card_tags ct ON ct.tag_id = t.id
+           GROUP BY t.id
+           ORDER BY t.name_key ASC"""
+    ).fetchall()
+    uncategorized = int(conn.execute(
+        "SELECT COUNT(*) FROM review_cards WHERE deck_id IS NULL OR deck_id = ''"
+    ).fetchone()[0])
+    return {
+        "decks": [{
+            "id": str(row["id"]),
+            "name": str(row["name"]),
+            "count": int(row["card_count"] or 0),
+            "sortOrder": int(row["sort_order"] or 0),
+            "createdAt": str(row["created_at"] or ""),
+            "updatedAt": str(row["updated_at"] or ""),
+        } for row in deck_rows],
+        "tags": [{"name": str(row["name"]), "count": int(row["card_count"] or 0)}
+                 for row in tag_rows],
+        "uncategorizedCount": uncategorized,
+    }
+
+
+def _review_settings_payload(conn: sqlite3.Connection) -> dict:
+    row = conn.execute("SELECT * FROM review_settings WHERE id = 1").fetchone()
+    scope_mode = str(row["scope_mode"] or "all") if row else "all"
+    scope_deck_id = str(row["scope_deck_id"] or "") if row else ""
+    if scope_mode not in REVIEW_SCOPE_MODES:
+        scope_mode = "all"
+    if scope_mode == "deck":
+        exists = scope_deck_id and conn.execute(
+            "SELECT 1 FROM review_decks WHERE id = ?", (scope_deck_id,)
+        ).fetchone()
+        if not exists:
+            scope_mode = "all"
+            scope_deck_id = ""
+    else:
+        scope_deck_id = ""
+    session_limit = int(row["session_limit"] or 20) if row else 20
+    if session_limit not in REVIEW_SESSION_LIMITS:
+        session_limit = 20
+    order_mode = str(row["order_mode"] or "due") if row else "due"
+    if order_mode not in REVIEW_ORDER_MODES:
+        order_mode = "due"
+    return {
+        "scopeMode": scope_mode,
+        "scopeDeckId": scope_deck_id,
+        "sessionLimit": session_limit,
+        "orderMode": order_mode,
+        "requireReveal": bool(row["require_reveal"]) if row else False,
+    }
+
+
+def update_review_settings(raw: dict) -> dict:
+    scope_mode = str(raw.get("scopeMode") or "all").strip()
+    if scope_mode not in REVIEW_SCOPE_MODES:
+        raise ValueError("复习范围无效")
+    try:
+        session_limit = int(raw.get("sessionLimit") or 20)
+    except (TypeError, ValueError) as err:
+        raise ValueError("每轮卡片数量无效") from err
+    if session_limit not in REVIEW_SESSION_LIMITS:
+        raise ValueError("每轮卡片数量无效")
+    order_mode = str(raw.get("orderMode") or "due").strip()
+    if order_mode not in REVIEW_ORDER_MODES:
+        raise ValueError("出题顺序无效")
+    require_reveal = bool(raw.get("requireReveal", False))
+    conn = _review_connect()
+    try:
+        scope_deck_id = ""
+        if scope_mode == "deck":
+            scope_deck_id = _review_deck_id(conn, raw.get("scopeDeckId")) or ""
+            if not scope_deck_id:
+                raise ValueError("请选择卡组")
+        with conn:
+            conn.execute(
+                """UPDATE review_settings
+                   SET scope_mode = ?, scope_deck_id = ?, session_limit = ?,
+                       order_mode = ?, require_reveal = ?, updated_at = ?
+                   WHERE id = 1""",
+                (scope_mode, scope_deck_id or None, session_limit, order_mode,
+                 1 if require_reveal else 0, _study_now()),
+            )
+        return _review_settings_payload(conn)
+    finally:
+        conn.close()
+
+
+def _review_scope_sql(settings: dict, *, alias: str = "c") -> tuple[str, list[object]]:
+    if settings["scopeMode"] == "unfiled":
+        return f" AND {alias}.deck_id IS NULL", []
+    if settings["scopeMode"] == "deck":
+        return f" AND {alias}.deck_id = ?", [settings["scopeDeckId"]]
+    return "", []
+
+
+def _review_scope_options(conn: sqlite3.Connection, today: str) -> list[dict]:
+    rows = conn.execute(
+        """SELECT d.id, d.name, d.sort_order,
+                  SUM(CASE WHEN c.status = 'active' THEN 1 ELSE 0 END) AS active_count,
+                  SUM(CASE WHEN c.status = 'active' AND (c.due_on = '' OR c.due_on <= ?)
+                           THEN 1 ELSE 0 END) AS due_count
+           FROM review_decks d
+           LEFT JOIN review_cards c ON c.deck_id = d.id
+           GROUP BY d.id
+           ORDER BY d.sort_order ASC, d.created_at ASC""",
+        (today,),
+    ).fetchall()
+    total = conn.execute(
+        """SELECT COUNT(*) AS active_count,
+                  SUM(CASE WHEN due_on = '' OR due_on <= ? THEN 1 ELSE 0 END) AS due_count
+           FROM review_cards WHERE status = 'active'""",
+        (today,),
+    ).fetchone()
+    unfiled = conn.execute(
+        """SELECT COUNT(*) AS active_count,
+                  SUM(CASE WHEN due_on = '' OR due_on <= ? THEN 1 ELSE 0 END) AS due_count
+           FROM review_cards WHERE status = 'active' AND deck_id IS NULL""",
+        (today,),
+    ).fetchone()
+    options = [{
+        "mode": "all", "deckId": "", "name": "全部卡组",
+        "activeCount": int(total["active_count"] or 0),
+        "dueCount": int(total["due_count"] or 0),
+    }, {
+        "mode": "unfiled", "deckId": "", "name": "未分类",
+        "activeCount": int(unfiled["active_count"] or 0),
+        "dueCount": int(unfiled["due_count"] or 0),
+    }]
+    options.extend({
+        "mode": "deck", "deckId": str(row["id"]), "name": str(row["name"]),
+        "activeCount": int(row["active_count"] or 0),
+        "dueCount": int(row["due_count"] or 0),
+    } for row in rows)
+    return options
+
+
+def review_pool_payload() -> dict:
+    """Return active standalone cards without opening any .canvas file."""
+    today = date.today().isoformat()
+    conn = _review_connect()
+    try:
+        settings = _review_settings_payload(conn)
+        scope_sql, scope_params = _review_scope_sql(settings)
+        if settings["orderMode"] == "random":
+            order_sql = "CASE WHEN c.due_on = '' OR c.due_on <= ? THEN 0 ELSE 1 END, RANDOM()"
+        elif settings["orderMode"] == "weak":
+            order_sql = ("CASE WHEN c.due_on = '' OR c.due_on <= ? THEN 0 ELSE 1 END, "
+                         "c.level ASC, c.due_on ASC, c.created_at ASC")
+        else:
+            order_sql = ("CASE WHEN c.due_on = '' OR c.due_on <= ? THEN 0 ELSE 1 END, "
+                         "c.due_on ASC, c.created_at ASC")
+        rows = conn.execute(
+            f"""
+            SELECT c.*, d.name AS deck_name
+            FROM review_cards c
+            LEFT JOIN review_decks d ON d.id = c.deck_id
+            WHERE c.status = 'active'{scope_sql}
+            ORDER BY {order_sql}
+            LIMIT ?
+            """,
+            [*scope_params, today, settings["sessionLimit"]],
+        ).fetchall()
+        active_count = int(conn.execute(
+            f"SELECT COUNT(*) FROM review_cards c WHERE c.status = 'active'{scope_sql}",
+            scope_params,
+        ).fetchone()[0])
+        due_count = int(conn.execute(
+            f"""SELECT COUNT(*) FROM review_cards c
+                 WHERE c.status = 'active' AND (c.due_on = '' OR c.due_on <= ?){scope_sql}""",
+            [today, *scope_params],
+        ).fetchone()[0])
+        reviewed_today = int(conn.execute(
+            "SELECT COUNT(*) FROM review_events WHERE substr(reviewed_at, 1, 10) = ?",
+            (today,),
+        ).fetchone()[0])
+        tags_by_card = _review_tags_by_card(conn, [str(row["id"]) for row in rows])
+        return {
+            "version": 3,
+            "generatedAt": _study_now(),
+            "count": active_count,
+            "dueCount": due_count,
+            "reviewedToday": reviewed_today,
+            "settings": settings,
+            "scopes": _review_scope_options(conn, today),
+            "cards": [_review_card_payload(row, tags_by_card.get(str(row["id"]), []))
+                      for row in rows],
+        }
+    finally:
+        conn.close()
+
+
+def review_cards_payload() -> dict:
+    conn = _review_connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT c.*, d.name AS deck_name
+            FROM review_cards c
+            LEFT JOIN review_decks d ON d.id = c.deck_id
+            ORDER BY CASE c.status WHEN 'active' THEN 0 WHEN 'suspended' THEN 1 ELSE 2 END,
+                     c.updated_at DESC, c.created_at DESC
+            """
+        ).fetchall()
+        tags_by_card = _review_tags_by_card(conn, [str(row["id"]) for row in rows])
+        meta = _review_decks_and_tags_payload(conn)
+        return {
+            "version": 3,
+            "count": len(rows),
+            "cards": [_review_card_payload(row, tags_by_card.get(str(row["id"]), []))
+                      for row in rows],
+            **meta,
+        }
+    finally:
+        conn.close()
+
+
+def create_review_card(raw: dict) -> dict:
+    prompt = _review_text(raw.get("prompt"), label="问题", limit=REVIEW_PROMPT_MAX, required=True)
+    answer = _review_text(raw.get("answer"), label="答案", limit=REVIEW_ANSWER_MAX)
+    notes = _review_text(raw.get("notes"), label="补充说明", limit=REVIEW_NOTES_MAX)
+    status = str(raw.get("status") or "active").strip()
+    if status not in REVIEW_CARD_STATUSES:
+        raise ValueError("卡片状态无效")
+    tags = _review_tag_names(raw.get("tags"))
+    now = _study_now()
+    card_id = "rc_" + uuid.uuid4().hex
+    conn = _review_connect()
+    try:
+        deck_id = _review_deck_id(conn, raw.get("deckId"))
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO review_cards
+                    (id, card_type, prompt, answer, notes, status, due_on,
+                     created_at, updated_at, deck_id)
+                VALUES (?, 'basic', ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (card_id, prompt, answer, notes, status, date.today().isoformat(), now, now, deck_id),
+            )
+            _review_replace_tags(conn, card_id, tags)
+        row = _review_card_row(conn, card_id)
+        return _review_card_payload(row, tags)
+    finally:
+        conn.close()
+
+
+def update_review_card(raw: dict) -> dict:
+    card_id = str(raw.get("id") or "").strip()
+    if not card_id:
+        raise ValueError("缺少卡片 id")
+    prompt = _review_text(raw.get("prompt"), label="问题", limit=REVIEW_PROMPT_MAX, required=True)
+    answer = _review_text(raw.get("answer"), label="答案", limit=REVIEW_ANSWER_MAX)
+    notes = _review_text(raw.get("notes"), label="补充说明", limit=REVIEW_NOTES_MAX)
+    status = str(raw.get("status") or "active").strip()
+    if status not in REVIEW_CARD_STATUSES:
+        raise ValueError("卡片状态无效")
+    conn = _review_connect()
+    try:
+        existing = conn.execute("SELECT * FROM review_cards WHERE id = ?", (card_id,)).fetchone()
+        if existing is None:
+            raise LookupError("卡片不存在")
+        deck_id = _review_deck_id(
+            conn,
+            raw.get("deckId") if "deckId" in raw else existing["deck_id"],
+        )
+        if "tags" in raw:
+            tags = _review_tag_names(raw.get("tags"))
+        else:
+            tags = _review_tags_by_card(conn, [card_id]).get(card_id, [])
+        with conn:
+            changed = conn.execute(
+                """
+                UPDATE review_cards
+                SET prompt = ?, answer = ?, notes = ?, status = ?, deck_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (prompt, answer, notes, status, deck_id, _study_now(), card_id),
+            ).rowcount
+            _review_replace_tags(conn, card_id, tags)
+        if not changed:
+            raise LookupError("卡片不存在")
+        row = _review_card_row(conn, card_id)
+        return _review_card_payload(row, tags)
+    finally:
+        conn.close()
+
+
+def delete_review_card(card_id: object) -> None:
+    value = str(card_id or "").strip()
+    if not value:
+        raise ValueError("缺少卡片 id")
+    conn = _review_connect()
+    try:
+        with conn:
+            changed = conn.execute("DELETE FROM review_cards WHERE id = ?", (value,)).rowcount
+            conn.execute(
+                "DELETE FROM review_tags WHERE NOT EXISTS "
+                "(SELECT 1 FROM review_card_tags ct WHERE ct.tag_id = review_tags.id)"
+            )
+        if not changed:
+            raise LookupError("卡片不存在")
+    finally:
+        conn.close()
+
+
+def _review_deck_name(value: object) -> str:
+    return _review_text(
+        value,
+        label="卡组名称",
+        limit=REVIEW_DECK_NAME_MAX,
+        required=True,
+    )
+
+
+def _review_deck_payload(row: sqlite3.Row) -> dict:
+    return {
+        "id": str(row["id"]),
+        "name": str(row["name"]),
+        "sortOrder": int(row["sort_order"] or 0),
+        "createdAt": str(row["created_at"] or ""),
+        "updatedAt": str(row["updated_at"] or ""),
+    }
+
+
+def create_review_deck(raw: dict) -> dict:
+    name = _review_deck_name(raw.get("name"))
+    now = _study_now()
+    deck_id = "rd_" + uuid.uuid4().hex
+    conn = _review_connect()
+    try:
+        order = int(conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM review_decks"
+        ).fetchone()[0])
+        try:
+            with conn:
+                conn.execute(
+                    """INSERT INTO review_decks
+                       (id, name, name_key, sort_order, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (deck_id, name, name.casefold(), order, now, now),
+                )
+        except sqlite3.IntegrityError as err:
+            raise ValueError("已存在同名卡组") from err
+        row = conn.execute("SELECT * FROM review_decks WHERE id = ?", (deck_id,)).fetchone()
+        return _review_deck_payload(row)
+    finally:
+        conn.close()
+
+
+def update_review_deck(raw: dict) -> dict:
+    deck_id = str(raw.get("id") or "").strip()
+    if not deck_id:
+        raise ValueError("缺少卡组 id")
+    name = _review_deck_name(raw.get("name"))
+    conn = _review_connect()
+    try:
+        try:
+            with conn:
+                changed = conn.execute(
+                    "UPDATE review_decks SET name = ?, name_key = ?, updated_at = ? WHERE id = ?",
+                    (name, name.casefold(), _study_now(), deck_id),
+                ).rowcount
+        except sqlite3.IntegrityError as err:
+            raise ValueError("已存在同名卡组") from err
+        if not changed:
+            raise LookupError("卡组不存在")
+        row = conn.execute("SELECT * FROM review_decks WHERE id = ?", (deck_id,)).fetchone()
+        return _review_deck_payload(row)
+    finally:
+        conn.close()
+
+
+def delete_review_deck(deck_id: object) -> None:
+    value = str(deck_id or "").strip()
+    if not value:
+        raise ValueError("缺少卡组 id")
+    conn = _review_connect()
+    try:
+        with conn:
+            conn.execute(
+                """UPDATE review_settings
+                   SET scope_mode = 'all', scope_deck_id = NULL, updated_at = ?
+                   WHERE scope_mode = 'deck' AND scope_deck_id = ?""",
+                (_study_now(), value),
+            )
+            changed = conn.execute("DELETE FROM review_decks WHERE id = ?", (value,)).rowcount
+        if not changed:
+            raise LookupError("卡组不存在")
+    finally:
+        conn.close()
+
+
+def batch_update_review_cards(raw: dict) -> int:
+    card_ids = _review_card_ids(raw.get("ids"))
+    status_present = "status" in raw and str(raw.get("status") or "").strip() != ""
+    status = str(raw.get("status") or "").strip()
+    if status_present and status not in REVIEW_CARD_STATUSES:
+        raise ValueError("卡片状态无效")
+    deck_present = "deckId" in raw
+    add_tags = _review_tag_names(raw.get("addTags")) if "addTags" in raw else []
+    remove_tags = _review_tag_names(raw.get("removeTags")) if "removeTags" in raw else []
+    if not status_present and not deck_present and not add_tags and not remove_tags:
+        raise ValueError("没有可应用的批量修改")
+    conn = _review_connect()
+    try:
+        placeholders = ",".join("?" for _ in card_ids)
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                f"SELECT id FROM review_cards WHERE id IN ({placeholders})",
+                card_ids,
+            ).fetchall()
+            if len(existing) != len(card_ids):
+                raise LookupError("部分卡片不存在，请刷新卡片库")
+            deck_id = _review_deck_id(conn, raw.get("deckId")) if deck_present else None
+            sets = ["updated_at = ?"]
+            values: list[object] = [_study_now()]
+            if status_present:
+                sets.append("status = ?")
+                values.append(status)
+            if deck_present:
+                sets.append("deck_id = ?")
+                values.append(deck_id)
+            conn.execute(
+                f"UPDATE review_cards SET {', '.join(sets)} WHERE id IN ({placeholders})",
+                [*values, *card_ids],
+            )
+            if add_tags or remove_tags:
+                current = _review_tags_by_card(conn, card_ids)
+                remove_keys = {name.casefold() for name in remove_tags}
+                for card_id in card_ids:
+                    names = [name for name in current.get(card_id, [])
+                             if name.casefold() not in remove_keys]
+                    known = {name.casefold() for name in names}
+                    for name in add_tags:
+                        if name.casefold() not in known:
+                            names.append(name)
+                            known.add(name.casefold())
+                    _review_replace_tags(conn, card_id, names[:REVIEW_TAGS_PER_CARD_MAX])
+        return len(card_ids)
+    finally:
+        conn.close()
+
+
+def batch_delete_review_cards(raw: dict) -> int:
+    card_ids = _review_card_ids(raw.get("ids"))
+    conn = _review_connect()
+    try:
+        placeholders = ",".join("?" for _ in card_ids)
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing_count = int(conn.execute(
+                f"SELECT COUNT(*) FROM review_cards WHERE id IN ({placeholders})",
+                card_ids,
+            ).fetchone()[0])
+            if existing_count != len(card_ids):
+                raise LookupError("部分卡片不存在，请刷新卡片库")
+            changed = conn.execute(
+                f"DELETE FROM review_cards WHERE id IN ({placeholders})",
+                card_ids,
+            ).rowcount
+            conn.execute(
+                "DELETE FROM review_tags WHERE NOT EXISTS "
+                "(SELECT 1 FROM review_card_tags ct WHERE ct.tag_id = review_tags.id)"
+            )
+        return changed
+    finally:
+        conn.close()
+
+
+def mark_review_card(card_id: object, rating: object) -> dict:
+    value = str(card_id or "").strip()
+    normalized_rating = str(rating or "").strip()
+    if not value:
+        raise ValueError("缺少卡片 id")
+    if normalized_rating not in REVIEW_RATINGS:
+        raise ValueError("复习评分无效")
+    conn = _review_connect()
+    try:
+        with conn:
+            row = conn.execute("SELECT * FROM review_cards WHERE id = ?", (value,)).fetchone()
+            if row is None:
+                raise LookupError("卡片不存在")
+            if row["status"] != "active":
+                raise ValueError("这张卡片当前未启用")
+            previous_level = max(0, min(int(row["level"] or 0), REVIEW_MAX_LEVEL))
+            next_level = previous_level
+            if normalized_rating == "remembered":
+                next_level = min(previous_level + 1, REVIEW_MAX_LEVEL)
+                days = REVIEW_LEVEL_DAYS[next_level]
+            elif normalized_rating == "vague":
+                days = max(1, REVIEW_LEVEL_DAYS[previous_level])
+            else:
+                next_level = 0
+                days = 0
+            reviewed_at = _study_now()
+            next_due = (date.today() + timedelta(days=days)).isoformat()
+            conn.execute(
+                """
+                UPDATE review_cards
+                SET level = ?, due_on = ?, last_reviewed_at = ?, review_count = review_count + 1
+                WHERE id = ?
+                """,
+                (next_level, next_due, reviewed_at, value),
+            )
+            conn.execute(
+                """
+                INSERT INTO review_events
+                    (card_id, prompt_snapshot, rating, reviewed_at, previous_level, next_level, next_due_on)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (value, str(row["prompt"] or ""), normalized_rating, reviewed_at,
+                 previous_level, next_level, next_due),
+            )
+        updated = _review_card_row(conn, value)
+        tags = _review_tags_by_card(conn, [value]).get(value, [])
+        return _review_card_payload(updated, tags)
+    finally:
+        conn.close()
 
 
 def _archive_folder_count() -> int:
@@ -4415,9 +5196,19 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             q = urllib.parse.parse_qs(parsed.query)
             return self._send_json(200, study_activity_payload(q.get("year", [None])[0]))
         if parsed.path == "/api/review-pool":
-            return self._send_json(200, review_pool_payload())
+            try:
+                return self._send_json(200, review_pool_payload())
+            except sqlite3.DatabaseError as err:
+                return self._send_json(500, {"error": f"读取复习数据库失败：{err}"})
+        if parsed.path == "/api/review-cards":
+            try:
+                return self._send_json(200, review_cards_payload())
+            except sqlite3.DatabaseError as err:
+                return self._send_json(500, {"error": f"读取复习数据库失败：{err}"})
         if parsed.path == "/api/notes":
             return self._send_json(200, load_notes())
+        if parsed.path == "/api/start-sticky-notes":
+            return self._send_json(200, load_start_sticky_notes())
         if parsed.path == "/api/focus":
             return self._send_json(200, load_focus())
         if parsed.path == "/api/daily":
@@ -4514,10 +5305,30 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._api_study_task_create_canvas(body)
         if path == "/api/study-reorder":
             return self._api_study_reorder(body)
+        if path == "/api/review-card-create":
+            return self._api_review_card_create(body)
+        if path == "/api/review-card-update":
+            return self._api_review_card_update(body)
+        if path == "/api/review-card-delete":
+            return self._api_review_card_delete(body)
+        if path == "/api/review-cards-batch":
+            return self._api_review_cards_batch(body)
+        if path == "/api/review-cards-batch-delete":
+            return self._api_review_cards_batch_delete(body)
+        if path == "/api/review-deck-create":
+            return self._api_review_deck_create(body)
+        if path == "/api/review-deck-update":
+            return self._api_review_deck_update(body)
+        if path == "/api/review-deck-delete":
+            return self._api_review_deck_delete(body)
+        if path == "/api/review-settings":
+            return self._api_review_settings(body)
         if path == "/api/review-mark":
             return self._api_review_mark(body)
         if path == "/api/notes-save":
             return self._api_notes_save(body)
+        if path == "/api/start-sticky-notes-save":
+            return self._api_start_sticky_notes_save(body)
         if path == "/api/templates-save":
             return self._api_templates_save(body)
         if path == "/api/notes-archive":
@@ -5256,71 +6067,109 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         save_study(data)
         self._send_json(200, {"ok": True})
 
+    def _api_review_card_create(self, body: dict):
+        try:
+            card = create_review_card(body)
+        except ValueError as err:
+            return self._send_json(400, {"error": str(err)})
+        except sqlite3.DatabaseError as err:
+            return self._send_json(500, {"error": f"保存复习卡片失败：{err}"})
+        self._send_json(200, {"ok": True, "card": card})
+
+    def _api_review_card_update(self, body: dict):
+        try:
+            card = update_review_card(body)
+        except LookupError as err:
+            return self._send_json(404, {"error": str(err)})
+        except ValueError as err:
+            return self._send_json(400, {"error": str(err)})
+        except sqlite3.DatabaseError as err:
+            return self._send_json(500, {"error": f"更新复习卡片失败：{err}"})
+        self._send_json(200, {"ok": True, "card": card})
+
+    def _api_review_card_delete(self, body: dict):
+        try:
+            delete_review_card(body.get("id"))
+        except LookupError as err:
+            return self._send_json(404, {"error": str(err)})
+        except ValueError as err:
+            return self._send_json(400, {"error": str(err)})
+        except sqlite3.DatabaseError as err:
+            return self._send_json(500, {"error": f"删除复习卡片失败：{err}"})
+        self._send_json(200, {"ok": True})
+
+    def _api_review_cards_batch(self, body: dict):
+        try:
+            count = batch_update_review_cards(body)
+        except LookupError as err:
+            return self._send_json(404, {"error": str(err)})
+        except ValueError as err:
+            return self._send_json(400, {"error": str(err)})
+        except sqlite3.DatabaseError as err:
+            return self._send_json(500, {"error": f"批量更新卡片失败：{err}"})
+        self._send_json(200, {"ok": True, "count": count})
+
+    def _api_review_cards_batch_delete(self, body: dict):
+        try:
+            count = batch_delete_review_cards(body)
+        except LookupError as err:
+            return self._send_json(404, {"error": str(err)})
+        except ValueError as err:
+            return self._send_json(400, {"error": str(err)})
+        except sqlite3.DatabaseError as err:
+            return self._send_json(500, {"error": f"批量删除卡片失败：{err}"})
+        self._send_json(200, {"ok": True, "count": count})
+
+    def _api_review_deck_create(self, body: dict):
+        try:
+            deck = create_review_deck(body)
+        except ValueError as err:
+            return self._send_json(400, {"error": str(err)})
+        except sqlite3.DatabaseError as err:
+            return self._send_json(500, {"error": f"创建卡组失败：{err}"})
+        self._send_json(200, {"ok": True, "deck": deck})
+
+    def _api_review_deck_update(self, body: dict):
+        try:
+            deck = update_review_deck(body)
+        except LookupError as err:
+            return self._send_json(404, {"error": str(err)})
+        except ValueError as err:
+            return self._send_json(400, {"error": str(err)})
+        except sqlite3.DatabaseError as err:
+            return self._send_json(500, {"error": f"更新卡组失败：{err}"})
+        self._send_json(200, {"ok": True, "deck": deck})
+
+    def _api_review_deck_delete(self, body: dict):
+        try:
+            delete_review_deck(body.get("id"))
+        except LookupError as err:
+            return self._send_json(404, {"error": str(err)})
+        except ValueError as err:
+            return self._send_json(400, {"error": str(err)})
+        except sqlite3.DatabaseError as err:
+            return self._send_json(500, {"error": f"删除卡组失败：{err}"})
+        self._send_json(200, {"ok": True})
+
+    def _api_review_settings(self, body: dict):
+        try:
+            settings = update_review_settings(body)
+        except ValueError as err:
+            return self._send_json(400, {"error": str(err)})
+        except sqlite3.DatabaseError as err:
+            return self._send_json(500, {"error": f"保存复习设置失败：{err}"})
+        self._send_json(200, {"ok": True, "settings": settings})
+
     def _api_review_mark(self, body: dict):
-        raw = (body.get("canvasPath") or body.get("path") or "").strip()
-        node_id = (body.get("nodeId") or "").strip()
-        rating = (body.get("rating") or "reviewed").strip()
-        if not raw or not node_id:
-            return self._send_json(400, {"error": "缺少 canvasPath 或 nodeId"})
-        src = Path(raw)
-        if not src.is_file():
-            return self._send_json(404, {"error": "画布不存在"})
-        if not is_authorized(src):
-            return self._send_json(403, {"error": "路径未授权"})
         try:
-            data = json.loads(src.read_text(encoding="utf-8-sig"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as err:
-            return self._send_json(500, {"error": f"读取画布失败：{err}"})
-        if not isinstance(data, dict) or not isinstance(data.get("nodes"), list):
-            return self._send_json(400, {"error": "画布格式无效"})
-        target = None
-        for node in data["nodes"]:
-            if isinstance(node, dict) and str(node.get("id") or "") == node_id:
-                target = node
-                break
-        if target is None:
-            return self._send_json(404, {"error": "节点不存在"})
-        review = target.get("review") if isinstance(target.get("review"), dict) else {}
-        review = dict(review)
-        now = _study_now()
-        today = date.today()
-        old_count = review.get("count")
-        try:
-            level = int(review.get("level") or 0)
-        except (TypeError, ValueError):
-            level = 0
-        review["lastReviewedAt"] = now
-        review["count"] = int(old_count or 0) + 1 if str(old_count or "0").isdigit() else 1
-        # 间隔重复：记得=升盒拉长间隔，不会=清零今天再练，模糊=原地但至少隔天。
-        days = None
-        if rating == "remembered":
-            level = min(level + 1, REVIEW_MAX_LEVEL)
-            days = REVIEW_LEVEL_DAYS[level]
-        elif rating == "vague":
-            days = max(1, REVIEW_LEVEL_DAYS[level])
-        elif rating == "forgot":
-            level = 0
-            days = 0
-        elif rating == "ignore":
-            review["enabled"] = False
-        else:
-            days = max(1, REVIEW_LEVEL_DAYS[level])
-        review["level"] = level
-        review["maturity"] = _review_maturity_for_level(level)
-        if days is not None:
-            review["due"] = (today + timedelta(days=days)).isoformat()
-        target["review"] = review
-        data["updatedAt"] = now
-        try:
-            _atomic_write_json(src, data)
-        except OSError as err:
-            return self._send_json(500, {"error": f"写入画布失败：{err}"})
-        self._send_json(200, {
-            "ok": True,
-            "review": review,
-            "nodeId": node_id,
-            "canvasPath": _norm(src),
-        })
+            card = mark_review_card(body.get("cardId") or body.get("id"), body.get("rating"))
+        except LookupError as err:
+            return self._send_json(404, {"error": str(err)})
+        except ValueError as err:
+            return self._send_json(400, {"error": str(err)})
+        except sqlite3.DatabaseError as err:
+            return self._send_json(500, {"error": f"记录复习结果失败：{err}"})
+        self._send_json(200, {"ok": True, "card": card})
 
     def _api_focus_log(self, body: dict):
         """落一条专注记录：前端每完成一段专注时调用，追加写入 data/focus.json。"""
@@ -5377,6 +6226,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             "edgeCount": len(result["edges"]),
             "arrowCount": len(result["arrows"]),
         })
+
+    def _api_start_sticky_notes_save(self, body: dict):
+        """覆盖保存起步页跨页便签；数据与速记墙、画布和学习任务完全隔离。"""
+        if not isinstance(body, dict) or not isinstance(body.get("notes"), list):
+            return self._send_json(400, {"error": "缺少 notes 数组"})
+        try:
+            result = save_start_sticky_notes(body)
+        except OSError as err:
+            return self._send_json(500, {"error": f"保存失败：{err}"})
+        self._send_json(200, {"ok": True, "count": len(result["notes"])})
 
     def _api_templates_save(self, body: dict):
         """整库覆盖保存模板：前端持有完整列表，整体写回（save_templates 里已清洗）。

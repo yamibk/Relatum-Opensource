@@ -272,6 +272,8 @@
 
   function startViewCleanupDelay(previous, next) {
     const calendarMotion = previous === 'calendar' || next === 'calendar';
+    if (next === 'review') return Math.max(760, startTurnSpeed + 500);
+    if (previous === 'review') return Math.max(480, startTurnSpeed + 220);
     return Math.max(calendarMotion ? 480 : 280, startTurnSpeed + (calendarMotion ? 220 : 140));
   }
 
