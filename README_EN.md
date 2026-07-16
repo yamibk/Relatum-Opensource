@@ -62,6 +62,7 @@ No account is required. Canvases, preferences, and optional AI credentials stay 
 
 - Pomodoro and stopwatch focus modes linked to study or daily tasks.
 - Daily tasks, study boards, calendar and diary, countdowns, quick notes, and spaced review.
+- A standalone review-card library with scheduled due reviews, unlimited shuffled free review, and an on-demand organization mode, independent of canvas nodes.
 - Activity statistics, yearly progress, and task archives.
 
 ### Personalization, templates, and optional AI

@@ -347,46 +347,339 @@
               <h1>复习卡片</h1>
             </div>
             <div class="review-head-right">
-              <button type="button" class="page-refresh" data-action="review-refresh"
-                aria-label="重新读取复习池" title="重新扫描复习池（平时翻进来用上次结果秒开；在别处改了复习卡，点这里才更新）">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
-                <span>更新</span>
-              </button>
+              <div class="review-primary-actions">
+                <div class="review-view-switch" aria-label="复习页面">
+                  <span class="review-view-switch-slider" aria-hidden="true"></span>
+                  <button type="button" class="review-head-action" data-action="review-show-free" aria-pressed="false">自由复习</button>
+                  <button type="button" class="review-head-action is-active" data-action="review-show-scheduled" aria-pressed="true">计划复习</button>
+                  <button type="button" class="review-head-action" data-action="review-show-library" aria-pressed="false">卡片库</button>
+                </div>
+                <button type="button" class="review-create-button" data-action="review-card-new"><span aria-hidden="true">＋</span>新建卡片</button>
+              </div>
               <div class="review-stats" aria-label="复习统计">
-                <div><strong data-role="review-total">0</strong><span>待复习</span></div>
-                <div><strong data-role="review-seen">0</strong><span>今日复习</span></div>
+                <div><strong data-role="review-total">0</strong><span data-role="review-total-label">待复习</span></div>
+                <div><strong data-role="review-seen">0</strong><span data-role="review-seen-label">今日复习</span></div>
               </div>
             </div>
           </header>
-          <section class="review-card" data-role="review-card">
+          <div class="review-stage" data-role="review-stage">
+          <section class="review-card" data-role="review-session">
+            <div class="review-session-toolbar">
+              <label class="review-scope-picker">
+                <span>复习范围</span>
+                <select data-role="review-scope-select" aria-label="选择复习范围">
+                  <option value="all">全部卡组</option>
+                </select>
+              </label>
+              <span class="review-session-progress" data-role="review-session-progress">本轮 0 / 0</span>
+              <div class="review-session-tools">
+                <button type="button" data-action="review-settings-open">设置</button>
+                <button type="button" class="review-help-button" data-action="review-help-open" aria-label="复习说明">?</button>
+              </div>
+            </div>
             <div class="review-card-empty" data-role="review-empty">
-              <strong>还没有可复习节点</strong>
-              <span>在画布里写几个正文节点，或在编辑模式里打开「加入复习」。</span>
+              <strong>还没有复习卡片</strong>
+              <span>从一个真正想记住的问题开始，不需要先创建画布。</span>
+              <button type="button" class="review-empty-cta" data-action="review-card-new">创建第一张卡片</button>
             </div>
             <div class="review-card-content" data-role="review-content" hidden>
-              <div class="review-roam-banner" aria-hidden="true">✦ 自由复习中 · 不计进度、不改间隔</div>
+              <div class="review-free-banner" aria-hidden="true">✦ 随机无限 · 不计进度、不改间隔</div>
               <div class="review-card-meta">
-                <span data-role="review-canvas">画布</span>
-                <span data-role="review-kind">节点</span>
+                <span>基础卡片</span>
+                <span data-role="review-card-deck" hidden></span>
+                <span data-role="review-card-tags" hidden></span>
+                <span data-role="review-count">尚未复习</span>
                 <span data-role="review-maturity">生</span>
                 <button type="button" class="review-answer-pill" data-action="review-show-answer" data-role="review-answer-pill" hidden>查看答案</button>
               </div>
-              <h2 data-role="review-title">未命名节点</h2>
-              <div class="review-body" data-role="review-body" hidden></div>
-              <p class="review-question" data-role="review-question">你还记得这个节点在讲什么吗？</p>
-              <div class="review-answer-reveal" data-role="review-answer-reveal" hidden></div>
-              <textarea class="review-answer" data-role="review-answer" placeholder="随手写几句，不评分，只帮你把旧知识重新接上。"></textarea>
+              <h2 data-role="review-prompt" data-user-content>未命名问题</h2>
+              <div class="review-body" data-role="review-notes" data-user-content hidden></div>
+              <p class="review-question" data-role="review-question-hint">想好后可以直接评分，也可以查看答案再核对。</p>
+              <div class="review-answer-reveal" data-role="review-answer-reveal" data-user-content hidden></div>
+              <textarea class="review-answer" data-role="review-draft" placeholder="可选的临时自测草稿，不会保存。"></textarea>
               <div class="review-actions">
-                <button type="button" class="review-action primary" data-action="review-remembered">记得</button>
-                <button type="button" class="review-action" data-action="review-vague">模糊</button>
-                <button type="button" class="review-action" data-action="review-forgot">不会</button>
-                <button type="button" class="review-action" data-action="review-question">换个问题</button>
-                <button type="button" class="review-action" data-action="review-open">打开画布</button>
-                <button type="button" class="review-action ghost" data-action="review-next">再来一张</button>
-                <button type="button" class="review-action review-roam-only" data-action="review-exit-roam">退出漫游</button>
+                <div class="review-rating-group" aria-label="选择记忆程度">
+                  <button type="button" class="review-action primary" data-action="review-remembered"><kbd aria-hidden="true">1</kbd><span>记得</span></button>
+                  <button type="button" class="review-action" data-action="review-vague"><kbd aria-hidden="true">2</kbd><span>模糊</span></button>
+                  <button type="button" class="review-action" data-action="review-forgot"><kbd aria-hidden="true">3</kbd><span>不会</span></button>
+                </div>
+                <button type="button" class="review-action ghost" data-action="review-next"><span data-role="review-next-label">再来一张</span><kbd aria-hidden="true">N</kbd></button>
               </div>
             </div>
           </section>
+
+          <section class="review-library" data-role="review-library" hidden>
+            <header class="review-library-head">
+              <div>
+                <p class="study-eyebrow">CARD LIBRARY</p>
+                <h2>管理卡片</h2>
+                <p><span data-role="review-library-count">0</span> 张卡片 · 内容与复习进度独立保存</p>
+              </div>
+              <div class="review-library-tools">
+                <input type="search" data-role="review-search" placeholder="搜索问题、答案、说明或标签" autocomplete="off">
+                <button type="button" class="review-help-button" data-action="review-library-help-open" aria-label="卡片库说明">?</button>
+              </div>
+            </header>
+            <div class="review-library-simplebar">
+              <div class="review-status-tabs" role="group" aria-label="筛选卡片状态">
+                <button type="button" class="is-active" data-action="review-status-filter" data-status="all" aria-pressed="true">全部</button>
+                <button type="button" data-action="review-status-filter" data-status="active" aria-pressed="false">复习中</button>
+                <button type="button" data-action="review-status-filter" data-status="suspended" aria-pressed="false">已暂停</button>
+                <button type="button" data-action="review-status-filter" data-status="archived" aria-pressed="false">已归档</button>
+              </div>
+              <select data-role="review-deck-filter-select" aria-label="筛选卡片卡组">
+                <option value="all">全部卡组</option>
+              </select>
+              <button type="button" data-action="review-deck-edit-current" data-role="review-deck-edit-current" hidden>卡组设置</button>
+              <button type="button" data-action="review-deck-new">新建卡组</button>
+              <span class="review-library-simple-spacer"></span>
+              <button type="button" data-action="review-batch-mode" data-role="review-batch-mode" aria-pressed="false">批量整理</button>
+              <label class="review-select-visible" data-role="review-select-visible" hidden>
+                <input type="checkbox" data-role="review-select-all">
+                <span>全选当前结果</span>
+              </label>
+            </div>
+            <div class="review-batch-bar" data-role="review-batch-bar" hidden>
+              <strong><span data-role="review-selected-count">0</span> 张已选</strong>
+              <select data-role="review-batch-deck" aria-label="批量移动到卡组">
+                <option value="__keep__">移动到卡组…</option>
+              </select>
+              <select data-role="review-batch-status" aria-label="批量修改状态">
+                <option value="__keep__">修改状态…</option>
+                <option value="active">恢复复习</option>
+                <option value="suspended">暂停复习</option>
+                <option value="archived">归档</option>
+              </select>
+              <button type="button" class="is-danger" data-action="review-batch-delete" data-role="review-batch-delete">删除所选</button>
+            </div>
+            <div class="review-library-list" data-role="review-library-list"></div>
+            <div class="review-library-empty" data-role="review-library-empty" hidden>
+              <strong>没有符合条件的卡片</strong>
+              <span>调整筛选条件，或者创建一张新卡片。</span>
+              <button type="button" class="review-empty-cta" data-action="review-card-new">新建卡片</button>
+            </div>
+          </section>
+          </div>
+        </div>
+
+        <div class="study-dialog review-card-dialog" data-role="review-card-dialog" hidden>
+          <button type="button" class="study-dialog-backdrop" data-action="review-dialog-close" aria-label="关闭"></button>
+          <form class="study-dialog-card" data-role="review-card-form">
+            <header class="study-dialog-head">
+              <div>
+                <p class="study-eyebrow">REVIEW CARD</p>
+                <h2 data-role="review-dialog-title">新建卡片</h2>
+              </div>
+              <button type="button" class="study-icon-button" data-action="review-dialog-close" aria-label="关闭">×</button>
+            </header>
+            <input type="hidden" name="id">
+            <label class="study-field study-field-wide">
+              <span>问题 <small>卡片正面</small></span>
+              <textarea name="prompt" rows="4" maxlength="12000" placeholder="写下一个清楚、可以作答的问题" required></textarea>
+            </label>
+            <label class="study-field study-field-wide">
+              <span>答案 <small>支持 Markdown 与公式</small></span>
+              <textarea name="answer" rows="5" maxlength="50000" placeholder="写下用于核对的答案"></textarea>
+            </label>
+            <details class="review-card-more" data-role="review-card-more">
+              <summary>更多选项</summary>
+              <div class="review-card-more-body">
+                <label class="study-field study-field-wide">
+                  <span>补充说明 <small>可选，不作为答案的一部分</small></span>
+                  <textarea name="notes" rows="4" maxlength="100000" placeholder="背景、线索或延伸阅读"></textarea>
+                </label>
+                <div class="review-card-organize">
+                  <label class="study-field">
+                    <span>卡组</span>
+                    <select name="deckId" data-role="review-card-deck-select">
+                      <option value="">未分类</option>
+                    </select>
+                  </label>
+                  <label class="study-field">
+                    <span>标签 <small>最多 12 个</small></span>
+                    <input name="tags" maxlength="420" placeholder="重点，考试，公式">
+                  </label>
+                  <label class="study-field">
+                    <span>状态</span>
+                    <select name="status">
+                      <option value="active">复习中</option>
+                      <option value="suspended">暂停复习</option>
+                      <option value="archived">归档</option>
+                    </select>
+                  </label>
+                </div>
+              </div>
+            </details>
+            <div class="study-dialog-actions">
+              <button type="button" class="study-action study-danger" data-action="review-card-delete" data-role="review-card-delete" hidden>删除卡片</button>
+              <span class="study-action-spacer"></span>
+              <button type="button" class="study-action" data-action="review-dialog-close">取消</button>
+              <button type="submit" class="study-action primary" data-role="review-card-save">保存卡片</button>
+            </div>
+          </form>
+        </div>
+
+        <div class="study-dialog review-deck-dialog" data-role="review-deck-dialog" hidden>
+          <button type="button" class="study-dialog-backdrop" data-action="review-deck-dialog-close" aria-label="关闭"></button>
+          <form class="study-dialog-card" data-role="review-deck-form">
+            <header class="study-dialog-head">
+              <div>
+                <p class="study-eyebrow">REVIEW DECK</p>
+                <h2 data-role="review-deck-dialog-title">新建卡组</h2>
+              </div>
+              <button type="button" class="study-icon-button" data-action="review-deck-dialog-close" aria-label="关闭">×</button>
+            </header>
+            <input type="hidden" name="id">
+            <label class="study-field study-field-wide">
+              <span>卡组名称</span>
+              <input name="name" maxlength="80" placeholder="例如：高等数学" required>
+            </label>
+            <p class="review-deck-dialog-note">删除卡组不会删除卡片，卡片会回到“未分类”。</p>
+            <div class="study-dialog-actions">
+              <button type="button" class="study-action study-danger" data-action="review-deck-delete" data-role="review-deck-delete" hidden>删除卡组</button>
+              <span class="study-action-spacer"></span>
+              <button type="button" class="study-action" data-action="review-deck-dialog-close">取消</button>
+              <button type="submit" class="study-action primary" data-role="review-deck-save">保存卡组</button>
+            </div>
+          </form>
+        </div>
+
+        <div class="study-dialog review-settings-dialog" data-role="review-settings-dialog" hidden>
+          <button type="button" class="study-dialog-backdrop" data-action="review-settings-close" aria-label="关闭"></button>
+          <form class="study-dialog-card" data-role="review-settings-form">
+            <header class="study-dialog-head">
+              <div>
+                <p class="study-eyebrow">REVIEW SESSION</p>
+                <h2>复习设置</h2>
+              </div>
+              <button type="button" class="study-icon-button" data-action="review-settings-close" aria-label="关闭">×</button>
+            </header>
+            <label class="study-field">
+              <span>每轮卡片</span>
+              <select name="sessionLimit">
+                <option value="10">10 张</option>
+                <option value="20">20 张</option>
+                <option value="50">50 张</option>
+              </select>
+            </label>
+            <label class="study-field">
+              <span>出题顺序</span>
+              <select name="orderMode">
+                <option value="due">到期优先</option>
+                <option value="random">随机</option>
+                <option value="weak">薄弱优先</option>
+              </select>
+            </label>
+            <div class="study-dialog-actions">
+              <span class="study-action-spacer"></span>
+              <button type="button" class="study-action" data-action="review-settings-close">取消</button>
+              <button type="submit" class="study-action primary" data-role="review-settings-save">保存设置</button>
+            </div>
+          </form>
+        </div>
+
+        <div class="study-dialog review-help-dialog" data-role="review-help-dialog" hidden>
+          <button type="button" class="study-dialog-backdrop" data-action="review-help-close" aria-label="关闭"></button>
+          <article class="study-dialog-card">
+            <header class="study-dialog-head">
+              <div>
+                <p class="study-eyebrow">QUICK GUIDE</p>
+                <h2 data-role="review-help-title">怎么复习</h2>
+              </div>
+              <button type="button" class="study-icon-button" data-action="review-help-close" aria-label="关闭">×</button>
+            </header>
+            <div class="review-help-content" data-role="review-help-scheduled">
+              <ol>
+                <li>先选择要复习的卡组。</li>
+                <li>在心里作答，需要时写一点临时草稿。</li>
+                <li>直接选择记忆程度；需要核对时再查看答案。</li>
+              </ol>
+              <p>草稿不会保存；评分只会调整下次复习时间。</p>
+              <div class="review-shortcuts" aria-label="复习快捷键">
+                <span><kbd>Space</kbd> 查看答案</span>
+                <span><kbd>1</kbd> 记得</span>
+                <span><kbd>2</kbd> 模糊</span>
+                <span><kbd>3</kbd> 不会</span>
+                <span><kbd>N</kbd> 换一张</span>
+              </div>
+            </div>
+            <div class="review-help-content" data-role="review-help-free" hidden>
+              <ol>
+                <li>选择范围后，系统会把其中正在复习的卡片随机打乱。</li>
+                <li>每张卡只用于练习；不会改变熟练度、到期日或今日统计。</li>
+                <li>一轮看完会自动重新洗牌，可以一直复习下去。</li>
+              </ol>
+              <p>自由复习没有每轮数量和出题顺序设置。</p>
+              <div class="review-shortcuts" aria-label="自由复习快捷键">
+                <span><kbd>Space</kbd> 查看答案</span>
+                <span><kbd>N</kbd> 下一张</span>
+              </div>
+            </div>
+            <div class="study-dialog-actions">
+              <span class="study-action-spacer"></span>
+              <button type="button" class="study-action primary" data-action="review-help-close">知道了</button>
+            </div>
+          </article>
+        </div>
+
+        <div class="study-dialog review-help-dialog review-library-help-dialog" data-role="review-library-help-dialog" hidden>
+          <button type="button" class="study-dialog-backdrop" data-action="review-library-help-close" aria-label="关闭"></button>
+          <article class="study-dialog-card">
+            <header class="study-dialog-head">
+              <div>
+                <p class="study-eyebrow">LIBRARY GUIDE</p>
+                <h2>卡片库与推送规则</h2>
+              </div>
+              <button type="button" class="study-icon-button" data-action="review-library-help-close" aria-label="关闭">×</button>
+            </header>
+            <div class="review-library-guide">
+              <p class="review-guide-lead"><strong>一句话：</strong>只有处于“复习中”、位于当前复习范围，并且已经到期的卡片，才会进入《计划复习》。</p>
+
+              <section class="review-guide-section">
+                <h3><span>1</span>卡片怎样进入《计划复习》</h3>
+                <ul>
+                  <li>新建卡片会在创建当天进入待复习。</li>
+                  <li>范围可以是全部卡组、未分类或一个卡组；每轮最多取设置中的 10 / 20 / 50 张。</li>
+                  <li>没有到期的卡片不会因为切换出题顺序而提前出现。</li>
+                </ul>
+              </section>
+
+              <section class="review-guide-section">
+                <h3><span>2</span>评分怎样改变下次日期</h3>
+                <div class="review-guide-ratings">
+                  <p><b>记得</b><span>升一级，依次在 1、3、7、16、35 天后再见。</span></p>
+                  <p><b>模糊</b><span>不升级，沿用当前级别的间隔；新卡至少隔天再见。</span></p>
+                  <p><b>不会</b><span>回到初始级并继续算作今天到期；本轮先移出，再开一轮可再次出现。</span></p>
+                </div>
+              </section>
+
+              <section class="review-guide-section">
+                <h3><span>3</span>顺序与熟练度</h3>
+                <ul>
+                  <li><b>到期优先</b>：到期日最早的先出现。</li>
+                  <li><b>随机</b>：把已经到期的卡片随机排列。</li>
+                  <li><b>薄弱优先</b>：在到期卡片中，从较低熟练度开始。</li>
+                  <li>“生”是初始级，“疑”是第 1–2 级，“熟”是第 3–5 级。</li>
+                </ul>
+              </section>
+
+              <section class="review-guide-section">
+                <h3><span>4</span>暂停、归档与删除</h3>
+                <ul>
+                  <li><b>复习中</b>：到期后正常进入《计划复习》。</li>
+                  <li><b>已暂停</b>：临时停止推送，内容、进度和下次日期都保留。</li>
+                  <li><b>已归档</b>：长期收起、不再推送，也可重新恢复为复习中。</li>
+                  <li>暂停和归档在推送上都等于“不出现”，区别只是管理用途。</li>
+                </ul>
+              </section>
+
+              <p class="review-guide-tip">卡组只决定筛选与复习范围，标签只用于搜索，都不会改变复习日期。删除卡组时卡片会回到“未分类”；删除卡片后内容无法恢复，但已有的复习统计仍会保留。“再来一张”只会跳过当前卡，自由复习不会改变进度或间隔。</p>
+            </div>
+            <div class="study-dialog-actions">
+              <span class="study-action-spacer"></span>
+              <button type="button" class="study-action primary" data-action="review-library-help-close">知道了</button>
+            </div>
+          </article>
         </div>
       </section>
 
@@ -883,6 +1176,7 @@
   <script src="i18n.js" defer></script>
   <script src="desktop-shell.js" defer></script>
   <script src="start.js" defer></script>
+  <script src="start-sticky-notes.js" defer></script>
   <script src="graph-gl.js" defer></script>
   <script src="graph-engine.js" defer></script>
   <script src="study-graph.js" defer></script>

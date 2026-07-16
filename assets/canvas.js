@@ -5842,8 +5842,6 @@
     let enSwitchKindWrap, enSwitchPreview, enSwitchText, enSwitchCard, enSwitchCode, enConvertNormalWrap, enConvertNormal;
     let enCodeLanguageWrap, enCodeLanguage;
     let enBodyWrap, enBody, enBodyRich, enBodyNote, enBodyHint;
-    let enReviewWrap, enReviewEnabled, enReviewQuestions, enReviewAnswer;
-    let enReviewBatchWrap, enReviewBatch;
     let enBodyDirty = false;
     let eeCurveBtns, eeLineStyleBtns, eeArrowBtns, eeWidth, eeWidthVal, eeArrowSize, eeArrowSizeVal, eeColor;
     let eeCurveState, eeLineStyleState, eeArrowState, eeColorState, eeResetAppearance;
@@ -5946,16 +5944,6 @@
         enBatchNote.hidden = !multiN;
         if (multiN) enBatchNote.textContent = tc('epBatchNote').replace('N', nodeTargets.length);
       }
-      if (enReviewBatchWrap) {
-        // 多选正文节点使用三态复选框：横线明确表示仅部分节点已加入。
-        // （editNodeTargets 已过滤装饰节点，nodeTargets 全是可复习的正文节点）
-        enReviewBatchWrap.hidden = !multiN;
-        if (multiN && enReviewBatch) {
-          const enabledCount = nodeTargets.filter((t) => t.review && t.review.enabled === true).length;
-          enReviewBatch.indeterminate = enabledCount > 0 && enabledCount < nodeTargets.length;
-          enReviewBatch.checked = enabledCount === nodeTargets.length;
-        }
-      }
       if (enCreateGroup) enCreateGroup.hidden = nodeTargets.length < 2;
       if (eeBatchNote) {
         eeBatchNote.hidden = !multiE;
@@ -6030,20 +6018,6 @@
           enBodyDirty = false;
         }
         if (enBodyRich && !bodyNode) enBodyRich.textContent = '';
-        if (enReviewWrap) enReviewWrap.hidden = !single || isDecorationNode(n);
-        if (enReviewEnabled && single) {
-          const review = (n.review && typeof n.review === 'object') ? n.review : {};
-          enReviewEnabled.checked = review.enabled === true;
-        }
-        if (enReviewQuestions && single && document.activeElement !== enReviewQuestions) {
-          const review = (n.review && typeof n.review === 'object') ? n.review : {};
-          const questions = Array.isArray(review.questions) ? review.questions : [];
-          enReviewQuestions.value = questions.join('\n');
-        }
-        if (enReviewAnswer && single && document.activeElement !== enReviewAnswer) {
-          const review = (n.review && typeof n.review === 'object') ? n.review : {};
-          enReviewAnswer.value = typeof review.answer === 'string' ? review.answer : '';
-        }
         const shapeState = editSharedState(nodeTargets, (item) => item.shape || 'rect');
         setActiveBtns(enShapeBtns, 'shape', shapeState.mixed ? '' : shapeState.value);
         if (enShapeState) enShapeState.textContent = shapeState.mixed ? '混合' : '';
@@ -6143,8 +6117,6 @@
       } else {
         if (enBody) { enBody.value = ''; enBody.hidden = true; }
         if (enBodyRich) { enBodyRich.textContent = ''; enBodyRich.hidden = true; }
-        if (enReviewWrap) enReviewWrap.hidden = true;
-        if (enReviewQuestions) enReviewQuestions.value = '';
         enBodyDirty = false;
       }
       if (animateSelectionChange) animateEditSelectionSections();
@@ -6905,12 +6877,6 @@
       enBodyRich = q('[data-role="en-body-rich"]');
       enBodyNote = q('[data-role="en-body-note"]');
       enBodyHint = q('[data-role="en-body-hint"]');
-      enReviewWrap = q('[data-role="en-review-wrap"]');
-      enReviewEnabled = q('[data-role="en-review-enabled"]');
-      enReviewQuestions = q('[data-role="en-review-questions"]');
-      enReviewAnswer = q('[data-role="en-review-answer"]');
-      enReviewBatchWrap = q('[data-role="en-review-batch-wrap"]');
-      enReviewBatch = q('[data-role="en-review-batch"]');
       eeCurveBtns = qa('[data-role="ee-curve"] button');
       eeCurveState = q('[data-role="ee-curve-state"]');
       eeLineStyleBtns = qa('[data-role="ee-line-style"] button');
@@ -7083,51 +7049,6 @@
           pushHistory();
         });
       }
-      if (enReviewEnabled) enReviewEnabled.addEventListener('change', () => {
-        const n = editGetNode();
-        if (!n) return;
-        const review = (n.review && typeof n.review === 'object') ? n.review : {};
-        n.review = Object.assign({}, review, { enabled: !!enReviewEnabled.checked });
-        pushHistory();
-        notify();
-        refreshEditPanel();
-      });
-      if (enReviewQuestions) {
-        enReviewQuestions.addEventListener('input', () => {
-          const n = editGetNode();
-          if (!n) return;
-          const lines = enReviewQuestions.value.split(/\r?\n/)
-            .map((line) => line.trim())
-            .filter(Boolean)
-            .slice(0, 12);
-          const review = (n.review && typeof n.review === 'object') ? n.review : {};
-          n.review = Object.assign({}, review, { questions: lines });
-          notify();
-        });
-        enReviewQuestions.addEventListener('change', () => pushHistory());
-      }
-      if (enReviewAnswer) {
-        enReviewAnswer.addEventListener('input', () => {
-          const n = editGetNode();
-          if (!n) return;
-          const review = (n.review && typeof n.review === 'object') ? n.review : {};
-          n.review = Object.assign({}, review, { answer: enReviewAnswer.value });
-          notify();
-        });
-        enReviewAnswer.addEventListener('change', () => pushHistory());
-      }
-      if (enReviewBatch) enReviewBatch.addEventListener('click', () => {
-        const targets = editNodeTargets();   // 已是正文节点（装饰被过滤）
-        if (targets.length < 2) return;        // 仅多选时有效
-        const enable = !!enReviewBatch.checked;
-        targets.forEach((t) => {
-          const review = (t.review && typeof t.review === 'object') ? t.review : {};
-          t.review = Object.assign({}, review, { enabled: enable });
-        });
-        pushHistory();
-        notify();
-        refreshEditPanel();
-      });
 
       // 连线：线型/箭头（离散）；粗细/箭头大小 input 预览、change 入历史
       eeCurveBtns.forEach((b) => b.addEventListener('click', () => {
@@ -9586,10 +9507,7 @@
       const bez = edgeGeom(edge, nodeRect(src), nodeRect(tgt));
       refs.path.setAttribute('d', bez.d);
       refs.hit.setAttribute('d', bez.d);
-      const mid = measureEdgePathMidpoint(refs.path, bez);
-      edgeMidpointCache.set(edge.id, { d: bez.d, x: mid.x, y: mid.y });
-      refs.labelEl.style.left = mid.x + 'px';
-      refs.labelEl.style.top = mid.y + 'px';
+      updateEdgeMidpoint(edge, refs, bez);
       edgePathCache.delete(edge.id);   // 几何可能变了 → 让 canvas 层下次重建 Path2D
       requestEdgesCanvasRender();
     }
@@ -9607,6 +9525,49 @@
         // 非 SVG 环境或路径尚不可测量时回退旧几何值，保持兼容。
       }
       return { x: fallback.midX, y: fallback.midY };
+    }
+
+    function edgeNeedsExactMidpoint(edge) {
+      return !!(edge && edge.text)
+        || selectedEdgeIds.has(edge.id)
+        || editingEdgeId === edge.id;
+    }
+
+    // 无文字、未选中、未编辑的连线没有可见中点元素，不触发 SVG 路径测量。
+    // 一旦需要显示标签/选中标记/编辑框，再测量并缓存真实曲线中点。
+    function updateEdgeMidpoint(edge, refs, geom, forceExact) {
+      if (!edge || !refs || !geom) return null;
+      const pathD = refs.path.getAttribute('d') || geom.d;
+      const cached = edgeMidpointCache.get(edge.id);
+      if (!forceExact && !edgeNeedsExactMidpoint(edge)) {
+        if (cached && cached.d !== pathD) edgeMidpointCache.delete(edge.id);
+        return null;
+      }
+      const mid = cached && cached.d === pathD
+        ? cached
+        : measureEdgePathMidpoint(refs.path, geom);
+      if (!cached || cached.d !== pathD) {
+        edgeMidpointCache.set(edge.id, { d: pathD, x: mid.x, y: mid.y });
+      }
+      refs.labelEl.style.left = mid.x + 'px';
+      refs.labelEl.style.top = mid.y + 'px';
+      return mid;
+    }
+
+    function ensureEdgeExactMidpoint(edge) {
+      const refs = edge && edgeMap.get(edge.id);
+      if (!refs) return;
+      const pathD = refs.path.getAttribute('d') || '';
+      const cached = edgeMidpointCache.get(edge.id);
+      if (cached && cached.d === pathD) {
+        refs.labelEl.style.left = cached.x + 'px';
+        refs.labelEl.style.top = cached.y + 'px';
+        return;
+      }
+      const rects = edgeCanvasRects(edge);
+      if (!rects) return;
+      const geom = edgeGeom(edge, rects.srcRect, rects.tgtRect);
+      updateEdgeMidpoint(edge, refs, geom, true);
     }
 
     function cachedEdgeMidpoint(edge, geom) {
@@ -9856,10 +9817,7 @@
       const bez = edgeGeom(edge, srcRect, tgtRect);
       refs.path.setAttribute('d', bez.d);
       refs.hit.setAttribute('d', bez.d);
-      const mid = measureEdgePathMidpoint(refs.path, bez);
-      edgeMidpointCache.set(edge.id, { d: bez.d, x: mid.x, y: mid.y });
-      refs.labelEl.style.left = mid.x + 'px';
-      refs.labelEl.style.top = mid.y + 'px';
+      updateEdgeMidpoint(edge, refs, bez);
       edgeCanvasLiveCoords = liveCoords;
       requestEdgesCanvasRender();
     }
@@ -9970,6 +9928,10 @@
       });
       edgeMap.forEach((refs, id) => {
         const sel = selectedEdgeIds.has(id);
+        if (sel) {
+          const edge = findEdge(id);
+          if (edge) ensureEdgeExactMidpoint(edge);
+        }
         refs.path.classList.toggle('selected', sel);
         refs.labelEl.classList.toggle('selected', sel);
       });
@@ -11581,6 +11543,7 @@
         additive: isSelectionToggleEvent(e),
         baselineNodes: new Set(selectedNodeIds),
         baselineEdges: new Set(selectedEdgeIds),
+        nodeSizes: null,                   // 首次框选计算时拍一次尺寸快照，后续帧复用
       };
       // 框选矩形元素在第一次真实移动时才创建，避免单击残影
     }
@@ -12482,7 +12445,6 @@
         c.x = Math.round((Number(n.x) || 0) - minX);
         c.y = Math.round((Number(n.y) || 0) - minY);
         delete c.assetPath;   // 纯结构模板：不带任何素材引用
-        delete c.review;      // 间隔重复进度属于具体节点，不随模板复制
         if (isTextBoxNode(c) && c.textBindTarget && !pickedIds.has(c.textBindTarget)) clearTextBinding(c);
         return c;
       });
@@ -12539,8 +12501,22 @@
         .catch(function () { showCanvasToast('保存模板失败了，请重试'); });
     }
 
+    function snapshotFrameNodeSizes() {
+      const sizes = new Map();
+      // 只读不写：浏览器至多在首个 offset 读取时完成一次布局，随后整次框选不再读尺寸。
+      data.nodes.forEach((node) => {
+        const el = nodeMap.get(node.id);
+        sizes.set(node.id, {
+          w: el ? el.offsetWidth : 160,
+          h: el ? el.offsetHeight : 36,
+        });
+      });
+      return sizes;
+    }
+
     function nodeIdsInFrame(rect, options) {
       const forTemplate = !!(options && options.forTemplate);
+      const nodeSizes = options && options.nodeSizes;
       const out = [];
       data.nodes.forEach((n) => {
         if (forTemplate) {
@@ -12550,8 +12526,9 @@
           if (currentMode() !== 'decor' && isShapeNode(n)) return;   // 图案仍限图案模式；图片可随框选选中
         }
         const el = nodeMap.get(n.id);
-        const w = el ? el.offsetWidth : 160;
-        const h = el ? el.offsetHeight : 36;
+        const size = nodeSizes && nodeSizes.get(n.id);
+        const w = size ? size.w : (el ? el.offsetWidth : 160);
+        const h = size ? size.h : (el ? el.offsetHeight : 36);
         const overlaps = n.x < rect.x + rect.w
           && n.x + w > rect.x
           && n.y < rect.y + rect.h
@@ -12742,6 +12719,7 @@
           dragRaf = requestAnimationFrame(() => {
             dragRaf = null;
             if (!drag || drag.mode !== 'frame-select') return;
+            if (!drag.nodeSizes) drag.nodeSizes = snapshotFrameNodeSizes();
             updateFrameEl();
             const rect = {
               x: Math.min(drag.startX, drag.currentX),
@@ -12749,7 +12727,10 @@
               w: Math.abs(drag.currentX - drag.startX),
               h: Math.abs(drag.currentY - drag.startY),
             };
-            const inFrame = nodeIdsInFrame(rect, { forTemplate: drag.forTemplate });
+            const inFrame = nodeIdsInFrame(rect, {
+              forTemplate: drag.forTemplate,
+              nodeSizes: drag.nodeSizes,
+            });
             selectedNodeIds.clear();
             selectedEdgeIds.clear();
             if (drag.additive) {
@@ -20508,7 +20489,6 @@
         node.x = Math.round((Number(raw.x) || 0) + offX);
         node.y = Math.round((Number(raw.y) || 0) + offY);
         delete node.assetPath;
-        delete node.review;
         prepareNewDecorationNode(node);
         data.nodes.push(node);
         indexNodeData(node);

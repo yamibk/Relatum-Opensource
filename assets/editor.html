@@ -755,17 +755,6 @@
           </select>
           <div class="sp-hint" data-editor-i18n="codeLangHint">只影响当前代码节点的着色；代码不会执行。</div>
         </div>
-        <label class="sp-check">
-          <input type="checkbox" data-role="pro-review-enabled">
-          <span data-editor-i18n="reviewEnabled">加入复习卡片</span>
-        </label>
-        <textarea class="sp-text-body sp-review-questions" data-role="pro-review-questions"
-                  placeholder="每行一个自定义问题；留空时使用系统预设问题。"
-                  spellcheck="false"></textarea>
-        <div class="sp-hint">复习页会优先抽这些问题，再混合系统预设问题。</div>
-        <textarea class="sp-text-body sp-review-answer" data-role="pro-review-answer"
-                  placeholder="参考答案（可留空）：复习时点「查看答案」才显示。"
-                  spellcheck="false"></textarea>
       </div>
     </div>
     <div class="side-panel-note" data-role="pro-note" data-editor-i18n="proNoteDefaults">只影响之后新建的节点与连线；选中单个节点时可直接编辑其属性。</div>
@@ -910,27 +899,6 @@
           <div class="sp-text-body sp-rich-body" data-role="en-body-rich" contenteditable="true"
                aria-label="正文富文本编辑器" data-editor-i18n-aria="richBodyEditor" spellcheck="false" hidden></div>
           <div class="sp-hint" data-role="en-body-hint">选中文字可添加高光、字色或字号；回到画布后按 F 阅读。</div>
-        </div>
-        <div class="sp-field" data-role="en-review-wrap" hidden>
-          <label class="sp-check sp-check-inline">
-            <input type="checkbox" data-role="en-review-enabled">
-            <span>加入复习卡片</span>
-          </label>
-          <textarea class="sp-text-body sp-review-questions" data-role="en-review-questions"
-                    placeholder="每行一个自定义问题；留空时使用系统预设问题。"
-                    spellcheck="false"></textarea>
-          <div class="sp-hint" data-role="pro-review-hint" data-editor-i18n="reviewHint">复习页会优先抽这些问题，再混合系统预设问题。</div>
-          <textarea class="sp-text-body sp-review-answer" data-role="en-review-answer"
-                    placeholder="参考答案（可留空）：复习时点「查看答案」才显示。"
-                    spellcheck="false"></textarea>
-          <div class="sp-hint">写给未来的自己对照用；复习卡片右上角「查看答案」会显示它。</div>
-        </div>
-        <div class="sp-field" data-role="en-review-batch-wrap" hidden>
-          <label class="sp-check sp-check-inline">
-            <input type="checkbox" data-role="en-review-batch">
-            <span data-editor-i18n="reviewEnabled">加入复习卡片</span>
-          </label>
-          <div class="sp-hint" data-editor-i18n="epReviewBatchHint">横线表示仅部分节点已加入；点击会统一加入，再次取消则全部移出。</div>
         </div>
         <div class="canvas-style-main-actions">
           <button type="button" class="sp-reset" data-role="en-apply-defaults" data-editor-i18n="applyCurrentNewStyle">应用当前新建样式</button>
@@ -1938,8 +1906,6 @@
         <button type="button" class="text-dock-btn td-size-choice" data-text-size="xl" data-editor-i18n-title="textSizeXL" title="特大字号"><span class="td-size-xl">A</span></button>
       </div>
       <span class="text-dock-sep" aria-hidden="true"></span>
-      <button type="button" class="text-dock-btn td-bold" data-text-action="bold"
-              data-editor-i18n-title="textBold" data-editor-i18n-aria="textBold" title="加粗" aria-label="加粗">B</button>
       <button type="button" class="text-dock-btn td-highlight" data-text-action="highlight"
               data-editor-i18n-title="textHighlight" data-editor-i18n-aria="textHighlight" title="应用高光" aria-label="应用高光">
         <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m7 3 7 7-5 5-5-5 5-5M3 16h10"/></svg><i aria-hidden="true"></i>
