@@ -118,7 +118,6 @@
   let batchBarCloseTimer = 0;
   let panelTransitionTimer = 0;
   let libraryFilterTimer = 0;
-  let cardEnterTimer = 0;
   let libraryItemEnterTimer = 0;
   let libraryEmptyEnterTimer = 0;
   let settingsDialogCloseTimer = 0;
@@ -305,13 +304,10 @@
   }
 
   function clearTransientMotion() {
-    clearTimeout(cardEnterTimer);
     clearTimeout(libraryItemEnterTimer);
     clearTimeout(libraryEmptyEnterTimer);
-    cardEnterTimer = 0;
     libraryItemEnterTimer = 0;
     libraryEmptyEnterTimer = 0;
-    if (contentEl) contentEl.classList.remove('enter');
     if (libraryEmptyEl) libraryEmptyEl.classList.remove('empty-enter');
     if (libraryListEl) {
       libraryListEl.querySelectorAll('.item-enter').forEach((item) => {
@@ -537,19 +533,6 @@
     if (draftEl) draftEl.value = '';
     resetAnswerReveal(current);
     updateSessionProgress();
-    // 整页正从日历/其它页面横滑进入时，不再叠一层卡片上浮动画；
-    // 页面稳定后换卡仍保留原来的轻入场反馈。
-    clearTimeout(cardEnterTimer);
-    if (root.classList.contains('view-entering')) {
-      contentEl.classList.remove('enter');
-      cardEnterTimer = 0;
-    } else {
-      replay(contentEl, 'enter');
-      cardEnterTimer = window.setTimeout(() => {
-        contentEl.classList.remove('enter');
-        cardEnterTimer = 0;
-      }, 470);
-    }
   }
 
   function nextCard() {
