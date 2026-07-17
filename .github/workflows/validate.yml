@@ -39,3 +39,7 @@ jobs:
           Get-ChildItem assets -Recurse -Filter *.js |
             Where-Object { $_.FullName -notmatch '\\vendor\\' } |
             ForEach-Object { node --check $_.FullName }
+
+      - name: Run rich-text regression tests
+        shell: pwsh
+        run: node tests/richtext-regression.js
