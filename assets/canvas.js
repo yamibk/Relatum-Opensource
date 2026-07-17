@@ -13033,6 +13033,19 @@
     // ── 节点文字编辑 ───────────────────────
     function enterNodeEdit(node, isNew, caretPoint) {
       if (isDecorationNode(node)) return;
+      // 已在编辑同一个节点时，双击只移动光标，绝不能用尚未提交的模型值
+      // 重建 DOM；否则多行输入会在一次双击中被旧内容覆盖，且不进入历史栈。
+      if (editingNodeId === node.id) {
+        const activeEl = nodeMap.get(node.id);
+        const activeText = activeEl && activeEl.querySelector('.node-text');
+        if (!activeEl || !activeText) return;
+        activeEl.classList.add('editing');
+        selectNodes([node.id], false);
+        activeText.focus();
+        if (caretPoint) placeEditableCaretFromPoint(activeText, caretPoint.x, caretPoint.y);
+        if (!isCodeNode(node)) applyMarkHighlight(activeText);
+        return;
+      }
       if (editingNodeId !== null && editingNodeId !== node.id) commitNodeEdit();
       if (editingEdgeId !== null) commitEdgeEdit();
 
@@ -13239,27 +13252,29 @@
       const wasNew = editingIsNew;
       const oldText = editingOriginalText;
       const oldMarks = editingOriginalMarks;
-      editingNodeId = null;
-      editingIsNew = false;
-      editingOriginalText = '';
-      editingOriginalMarks = [];
-      scheduleTextDock();
-
       const node = findNode(id);
       const el = nodeMap.get(id);
       if (!node || !el) return;
       const textEl = el.querySelector('.node-text');
-      // 代码保留首尾空白与缩进；普通标题多行仍只 trim 首尾。
+      // 先完整读取并规范化草稿，再切换编辑状态。读取阶段若意外失败，节点仍
+      // 保持原编辑态与实时 DOM，不会落入“模型是旧值、界面是新值”的半提交状态。
       const draft = isCodeNode(node)
         ? { text: textEl.textContent || '', marks: [] }
         : canonicalRichDraft(readRichEditable(textEl));
       const rawText = draft.text;
+      // 代码保留首尾空白与缩进；普通标题多行仍只 trim 首尾。
       const leading = isCodeNode(node) ? 0 : (rawText.match(/^\s*/) || [''])[0].length;
       const trailing = isCodeNode(node) ? 0 : (rawText.match(/\s*$/) || [''])[0].length;
       const newText = isCodeNode(node) ? rawText : rawText.slice(leading, Math.max(leading, rawText.length - trailing));
       const newMarks = isCodeNode(node) || !RichText ? []
         : RichText.slice(rawText, draft.marks, leading, rawText.length - trailing);
       const marksChanged = JSON.stringify(newMarks) !== JSON.stringify(oldMarks);
+
+      editingNodeId = null;
+      editingIsNew = false;
+      editingOriginalText = '';
+      editingOriginalMarks = [];
+      scheduleTextDock();
 
       clearMarkHighlight();        // Y2：退出编辑清掉标记高亮
       hideSelToolbar();            // 退出编辑收起选中工具栏
