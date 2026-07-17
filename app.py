@@ -3151,6 +3151,44 @@ def _review_deck_id(conn: sqlite3.Connection, value: object) -> str | None:
     return deck_id
 
 
+def _review_resolve_deck_name(conn: sqlite3.Connection, value: object) -> str | None:
+    """按名称复用卡组；不存在时在调用方事务中创建。空名称表示未分类。"""
+    raw_name = str(value or "").strip()
+    if not raw_name:
+        return None
+    name = _review_deck_name(raw_name)
+    name_key = name.casefold()
+    row = conn.execute(
+        "SELECT id FROM review_decks WHERE name_key = ?",
+        (name_key,),
+    ).fetchone()
+    if row is not None:
+        return str(row["id"])
+
+    deck_id = "rd_" + uuid.uuid4().hex
+    order = int(conn.execute(
+        "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM review_decks"
+    ).fetchone()[0])
+    now = _study_now()
+    try:
+        conn.execute(
+            """INSERT INTO review_decks
+               (id, name, name_key, sort_order, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (deck_id, name, name_key, order, now, now),
+        )
+    except sqlite3.IntegrityError:
+        # 本地服务通常只有一个写入者；这里仍兜住并发创建同名卡组的极短窗口。
+        row = conn.execute(
+            "SELECT id FROM review_decks WHERE name_key = ?",
+            (name_key,),
+        ).fetchone()
+        if row is None:
+            raise
+        return str(row["id"])
+    return deck_id
+
+
 def _review_card_row(conn: sqlite3.Connection, card_id: str) -> sqlite3.Row | None:
     return conn.execute(
         """SELECT c.*, d.name AS deck_name
@@ -3469,8 +3507,10 @@ def create_review_card(raw: dict) -> dict:
     card_id = "rc_" + uuid.uuid4().hex
     conn = _review_connect()
     try:
-        deck_id = _review_deck_id(conn, raw.get("deckId"))
         with conn:
+            deck_id = (_review_resolve_deck_name(conn, raw.get("deckName"))
+                       if "deckName" in raw
+                       else _review_deck_id(conn, raw.get("deckId")))
             conn.execute(
                 """
                 INSERT INTO review_cards
@@ -3502,15 +3542,18 @@ def update_review_card(raw: dict) -> dict:
         existing = conn.execute("SELECT * FROM review_cards WHERE id = ?", (card_id,)).fetchone()
         if existing is None:
             raise LookupError("卡片不存在")
-        deck_id = _review_deck_id(
-            conn,
-            raw.get("deckId") if "deckId" in raw else existing["deck_id"],
-        )
         if "tags" in raw:
             tags = _review_tag_names(raw.get("tags"))
         else:
             tags = _review_tags_by_card(conn, [card_id]).get(card_id, [])
         with conn:
+            if "deckName" in raw:
+                deck_id = _review_resolve_deck_name(conn, raw.get("deckName"))
+            else:
+                deck_id = _review_deck_id(
+                    conn,
+                    raw.get("deckId") if "deckId" in raw else existing["deck_id"],
+                )
             changed = conn.execute(
                 """
                 UPDATE review_cards
@@ -3519,9 +3562,10 @@ def update_review_card(raw: dict) -> dict:
                 """,
                 (prompt, answer, notes, status, deck_id, _study_now(), card_id),
             ).rowcount
+            if not changed:
+                # 与按名称新建卡组处于同一事务；卡片并发删除时不要留下空卡组。
+                raise LookupError("卡片不存在")
             _review_replace_tags(conn, card_id, tags)
-        if not changed:
-            raise LookupError("卡片不存在")
         row = _review_card_row(conn, card_id)
         return _review_card_payload(row, tags)
     finally:

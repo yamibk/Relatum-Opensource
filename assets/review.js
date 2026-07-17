@@ -57,6 +57,10 @@
   const deleteEl = root.querySelector('[data-role="review-card-delete"]');
   const saveEl = root.querySelector('[data-role="review-card-save"]');
   const cardMoreEl = root.querySelector('[data-role="review-card-more"]');
+  const cardDeckPickerEl = root.querySelector('[data-role="review-card-deck-picker"]');
+  const cardDeckInputEl = root.querySelector('input[name="deckName"]');
+  const cardDeckOptionsEl = root.querySelector('[data-role="review-card-deck-options"]');
+  const cardDeckStateEl = root.querySelector('[data-role="review-card-deck-state"]');
   const deckDialogEl = root.querySelector('[data-role="review-deck-dialog"]');
   const deckFormEl = root.querySelector('[data-role="review-deck-form"]');
   const deckDialogTitleEl = root.querySelector('[data-role="review-deck-dialog-title"]');
@@ -108,6 +112,9 @@
   let freeInitialized = false;
   let viewMode = 'session';
   let dialogCloseTimer = 0;
+  let deckPickerCloseTimer = 0;
+  let deckPickerItems = [];
+  let deckPickerIndex = -1;
   let deleteArmTimer = 0;
   let deleteArmed = false;
   let deckDialogCloseTimer = 0;
@@ -702,6 +709,117 @@
     return reviewDecks.find((deck) => deck.id === deckId) || null;
   }
 
+  function deckNameKey(value) {
+    return String(value || '').trim().toLocaleLowerCase();
+  }
+
+  function deckByName(name) {
+    const key = deckNameKey(name);
+    if (!key) return null;
+    return reviewDecks.find((deck) => deckNameKey(deck.name) === key) || null;
+  }
+
+  function syncDeckPickerState() {
+    if (!cardDeckInputEl || !cardDeckPickerEl || !cardDeckStateEl) return;
+    const name = String(cardDeckInputEl.value || '').trim();
+    const existing = deckByName(name);
+    cardDeckPickerEl.classList.toggle('is-existing', Boolean(name && existing));
+    cardDeckPickerEl.classList.toggle('is-new', Boolean(name && !existing));
+    cardDeckStateEl.hidden = !name;
+    cardDeckStateEl.textContent = name ? tr(existing ? '已有' : '新建') : '';
+  }
+
+  function syncDeckPickerActiveOption() {
+    if (!cardDeckInputEl || !cardDeckOptionsEl) return;
+    const options = Array.from(cardDeckOptionsEl.querySelectorAll('[role="option"]'));
+    options.forEach((option, index) => {
+      const active = index === deckPickerIndex;
+      option.classList.toggle('is-active', active);
+      option.setAttribute('aria-selected', active ? 'true' : 'false');
+    });
+    const active = options[deckPickerIndex];
+    if (active) cardDeckInputEl.setAttribute('aria-activedescendant', active.id);
+    else cardDeckInputEl.removeAttribute('aria-activedescendant');
+  }
+
+  function renderDeckPickerOptions() {
+    if (!cardDeckInputEl || !cardDeckOptionsEl) return;
+    const query = String(cardDeckInputEl.value || '').trim();
+    const key = deckNameKey(query);
+    const matches = reviewDecks
+      .filter((deck) => !key || deckNameKey(deck.name).includes(key))
+      .sort((left, right) => {
+        const leftKey = deckNameKey(left.name);
+        const rightKey = deckNameKey(right.name);
+        const leftRank = leftKey === key ? 0 : (leftKey.startsWith(key) ? 1 : 2);
+        const rightRank = rightKey === key ? 0 : (rightKey.startsWith(key) ? 1 : 2);
+        return leftRank - rightRank;
+      })
+      .slice(0, 7);
+    const exact = deckByName(query);
+    deckPickerItems = [];
+    if (!query) deckPickerItems.push({ kind: 'unfiled', name: '' });
+    matches.forEach((deck) => deckPickerItems.push({ kind: 'deck', name: deck.name }));
+    if (query && !exact) deckPickerItems.push({ kind: 'create', name: query });
+    if (query) deckPickerItems.push({ kind: 'unfiled', name: '' });
+
+    cardDeckOptionsEl.innerHTML = '';
+    deckPickerItems.forEach((item, index) => {
+      const option = document.createElement('button');
+      option.type = 'button';
+      option.id = 'review-card-deck-option-' + index;
+      option.className = 'review-card-deck-option';
+      option.setAttribute('role', 'option');
+      option.dataset.deckPickerIndex = String(index);
+
+      const label = document.createElement('span');
+      const note = document.createElement('small');
+      if (item.kind === 'deck') {
+        label.textContent = item.name;
+        note.textContent = tr('已有卡组');
+      } else if (item.kind === 'create') {
+        label.textContent = tr('新建卡组') + ' “' + item.name + '”';
+        note.textContent = tr('保存卡片时创建');
+      } else {
+        label.textContent = tr('未分类');
+        note.textContent = tr('留空保存');
+      }
+      option.append(label, note);
+      cardDeckOptionsEl.appendChild(option);
+    });
+    deckPickerIndex = deckPickerItems.length ? 0 : -1;
+    syncDeckPickerActiveOption();
+  }
+
+  function openDeckPicker() {
+    if (!cardDeckInputEl || !cardDeckOptionsEl) return;
+    clearTimeout(deckPickerCloseTimer);
+    renderDeckPickerOptions();
+    cardDeckOptionsEl.hidden = false;
+    cardDeckInputEl.setAttribute('aria-expanded', 'true');
+    requestAnimationFrame(() => cardDeckOptionsEl.classList.add('show'));
+  }
+
+  function closeDeckPicker() {
+    if (!cardDeckInputEl || !cardDeckOptionsEl) return;
+    clearTimeout(deckPickerCloseTimer);
+    cardDeckOptionsEl.classList.remove('show');
+    cardDeckInputEl.setAttribute('aria-expanded', 'false');
+    cardDeckInputEl.removeAttribute('aria-activedescendant');
+    deckPickerCloseTimer = window.setTimeout(() => {
+      if (!cardDeckOptionsEl.classList.contains('show')) cardDeckOptionsEl.hidden = true;
+    }, 150);
+  }
+
+  function chooseDeckPickerItem(index) {
+    const item = deckPickerItems[index];
+    if (!item || !cardDeckInputEl) return;
+    cardDeckInputEl.value = item.kind === 'unfiled' ? '' : item.name;
+    syncDeckPickerState();
+    closeDeckPicker();
+    cardDeckInputEl.focus();
+  }
+
   function addDeckOption(select, value, label) {
     const option = document.createElement('option');
     option.value = value;
@@ -735,14 +853,7 @@
       batchModeEl.textContent = tr(libraryBatchMode ? '完成整理' : '批量整理');
       batchModeEl.setAttribute('aria-pressed', libraryBatchMode ? 'true' : 'false');
     }
-    const cardDeckSelect = formControl('deckId');
-    if (cardDeckSelect) {
-      const currentDeck = cardDeckSelect.value;
-      cardDeckSelect.innerHTML = '';
-      addDeckOption(cardDeckSelect, '', tr('未分类'));
-      reviewDecks.forEach((deck) => addDeckOption(cardDeckSelect, deck.id, deck.name));
-      cardDeckSelect.value = deckById(currentDeck) ? currentDeck : '';
-    }
+    syncDeckPickerState();
     if (batchDeckEl) {
       batchDeckEl.innerHTML = '';
       addDeckOption(batchDeckEl, '__keep__', tr('移动到卡组…'));
@@ -1139,7 +1250,9 @@
     formControl('answer').value = card ? card.answer : '';
     formControl('notes').value = card ? card.notes : '';
     syncLibraryOrganizers();
-    formControl('deckId').value = card && deckById(card.deckId) ? card.deckId : '';
+    formControl('deckName').value = card && deckById(card.deckId) ? card.deckName : '';
+    syncDeckPickerState();
+    closeDeckPicker();
     formControl('tags').value = card && Array.isArray(card.tags) ? card.tags.join(', ') : '';
     formControl('status').value = card ? card.status : 'active';
     if (cardMoreEl) cardMoreEl.open = false;
@@ -1162,6 +1275,7 @@
     if (!dialogEl) return;
     clearTimeout(deleteArmTimer);
     deleteArmed = false;
+    closeDeckPicker();
     dialogEl.classList.remove('show');
     clearTimeout(dialogCloseTimer);
     dialogCloseTimer = setTimeout(() => {
@@ -1178,7 +1292,7 @@
       prompt: formControl('prompt').value,
       answer: formControl('answer').value,
       notes: formControl('notes').value,
-      deckId: formControl('deckId').value,
+      deckName: formControl('deckName').value,
       tags: formControl('tags').value,
       status: formControl('status').value,
     };
@@ -1396,6 +1510,56 @@
     event.preventDefault();
     saveCard();
   });
+  if (cardDeckInputEl) {
+    cardDeckInputEl.addEventListener('focus', openDeckPicker);
+    cardDeckInputEl.addEventListener('input', () => {
+      syncDeckPickerState();
+      openDeckPicker();
+    });
+    cardDeckInputEl.addEventListener('blur', () => {
+      clearTimeout(deckPickerCloseTimer);
+      deckPickerCloseTimer = window.setTimeout(closeDeckPicker, 100);
+    });
+    cardDeckInputEl.addEventListener('keydown', (event) => {
+      if (event.isComposing) return;
+      const isOpen = cardDeckOptionsEl && !cardDeckOptionsEl.hidden;
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        if (!isOpen) {
+          openDeckPicker();
+          return;
+        }
+        const direction = event.key === 'ArrowDown' ? 1 : -1;
+        const length = deckPickerItems.length;
+        if (length) {
+          deckPickerIndex = (deckPickerIndex + direction + length) % length;
+          syncDeckPickerActiveOption();
+        }
+        return;
+      }
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        event.stopPropagation();
+        if (isOpen && deckPickerIndex >= 0) chooseDeckPickerItem(deckPickerIndex);
+        else openDeckPicker();
+        return;
+      }
+      if (event.key === 'Escape' && isOpen) {
+        event.preventDefault();
+        event.stopPropagation();
+        closeDeckPicker();
+      }
+      if (event.key === 'Tab') closeDeckPicker();
+    });
+  }
+  if (cardDeckOptionsEl) {
+    cardDeckOptionsEl.addEventListener('pointerdown', (event) => event.preventDefault());
+    cardDeckOptionsEl.addEventListener('click', (event) => {
+      const option = event.target.closest('[data-deck-picker-index]');
+      if (!option) return;
+      chooseDeckPickerItem(Number(option.dataset.deckPickerIndex));
+    });
+  }
   if (deckFormEl) deckFormEl.addEventListener('submit', (event) => {
     event.preventDefault();
     saveDeck();
@@ -1454,6 +1618,8 @@
         renderLibrary(false);
       }
       syncPrimaryModeControls();
+      syncDeckPickerState();
+      if (cardDeckOptionsEl && !cardDeckOptionsEl.hidden) renderDeckPickerOptions();
       if (viewMode === 'session') {
         if (current) renderCard(current);
         else renderEmpty();
@@ -1464,6 +1630,7 @@
   }
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {
+      if (cardDeckOptionsEl && !cardDeckOptionsEl.hidden) { closeDeckPicker(); return; }
       if (dialogEl && dialogEl.classList.contains('show')) { closeDialog(); return; }
       if (deckDialogEl && deckDialogEl.classList.contains('show')) { closeDeckDialog(); return; }
       if (settingsDialogEl && settingsDialogEl.classList.contains('show')) { closeSettingsDialog(); return; }

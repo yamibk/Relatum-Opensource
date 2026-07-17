@@ -132,7 +132,8 @@
       mindmapInspector: '启动思维导图模式的属性检查器',
       decorInspector: '启动图案模式的属性检查器',
       indexHover: '悬停弹出目录',
-      selectionIndex: '框选生成索引目录', boxCreate: '框选创建盒子/分组', darkLines: '深色模式线条优化',
+      selectionIndex: '框选生成索引目录', boxCreate: '空白框选创建盒子', groupCreate: '框选节点创建分组',
+      darkLines: '深色模式线条优化',
       darkUi: '深色语义 UI 优化', autosave: '自动保存', view: '视图',
       locateLatest: '定位最近节点', space: '空格', spaceLocate: '空格键定位最近节点',
       centerZoom: '偏好缩放并居中', zoomLevel: '缩放比例',
@@ -253,7 +254,8 @@
       mindmapInspector: 'Enable inspector in Mind Map mode',
       decorInspector: 'Enable inspector in Shapes mode',
       indexHover: 'Preview index on hover',
-      selectionIndex: 'Offer index from selection', boxCreate: 'Drag to create box/group', darkLines: 'Optimize lines on dark backgrounds',
+      selectionIndex: 'Offer index from selection', boxCreate: 'Box from empty selection', groupCreate: 'Group selected nodes',
+      darkLines: 'Optimize lines on dark backgrounds',
       darkUi: 'Dark semantic UI', autosave: 'Autosave', view: 'View',
       locateLatest: 'Locate latest node', space: 'Space', spaceLocate: 'Space locates latest node',
       centerZoom: 'Center at preferred zoom', zoomLevel: 'Zoom level',
@@ -1950,11 +1952,24 @@
     });
   })();
 
-  // 框选创建盒子/分组：默认开启，关闭后左键框选不再浮出「+ 盒子」「+ 分组」按钮（canvas.js 读同名键）
+  // 空白框选创建盒子：默认开启，仅控制空选区后的「+ 盒子」按钮（canvas.js 读同名键）
   (function setupBoxCreateToggle() {
     const cb = document.querySelector('[data-role="enable-box-create"]');
     if (!cb) return;
     const KEY = 'canvas:boxCreateEnabled';
+    let on = true;
+    try { on = localStorage.getItem(KEY) !== '0'; } catch (e) {}
+    cb.checked = on;
+    cb.addEventListener('change', () => {
+      try { localStorage.setItem(KEY, cb.checked ? '1' : '0'); } catch (e) {}
+    });
+  })();
+
+  // 框选节点创建分组：默认开启，仅控制框选节点后的「+ 分组」按钮（canvas.js 读同名键）
+  (function setupGroupCreateToggle() {
+    const cb = document.querySelector('[data-role="enable-group-create"]');
+    if (!cb) return;
+    const KEY = 'canvas:groupCreateEnabled';
     let on = true;
     try { on = localStorage.getItem(KEY) !== '0'; } catch (e) {}
     cb.checked = on;
@@ -2517,6 +2532,20 @@
         document.dispatchEvent(new CustomEvent('editor:default-kind-change', { detail: { kind: n.kind || 'card' } }));
       }
     }));
+    // 数字键 3–7 始终只改“接下来新建”的默认类型；即使当前有单选节点，
+    // 也不能复用上面的检查器点击路径去转换现有内容。
+    document.addEventListener('editor:quick-new-kind', (event) => {
+      if (document.body.dataset.mode !== 'normal' || document.body.dataset.modeSubmode !== 'full') return;
+      const kind = event.detail && event.detail.kind;
+      if (!['index', 'preview', 'card', 'sticky', 'code'].includes(kind)) return;
+      n.kind = kind;
+      pushEffectiveKind();
+      writeNode();
+      if (!activeNodeId) syncUI();
+      document.dispatchEvent(new CustomEvent('editor:default-kind-change', {
+        detail: { kind: kind, source: 'keyboard-full' },
+      }));
+    });
     shapeBtns.forEach((b) => b.addEventListener('click', () => {
       if (activeNodeId && cm()) {
         cm().editSingleNodeField(activeNodeId, 'shape', b.dataset.shape, b.dataset.shape === 'rect');
@@ -2632,16 +2661,6 @@
     });
     radiusInput.addEventListener('change', () => {
       if (activeNodeId && cm()) cm().pushHistory();
-    });
-    fontWeightInput.addEventListener('discrete-range:restore-default', () => {
-      if (activeNodeId && cm() && typeof cm().resetSingleNodeFontWeight === 'function') {
-        if (cm().resetSingleNodeFontWeight(activeNodeId)) cm().pushHistory();
-        updatePanelForNode(cm().findNode(activeNodeId));
-      } else {
-        delete n.fontWeight;
-        writeNode();
-        syncUI();
-      }
     });
     fontWeightInput.addEventListener('input', () => {
       var v = parseInt(fontWeightInput.value, 10);
@@ -2891,6 +2910,19 @@
         detail: { kind: pref, source: 'clean-quick' },
       }));
     }));
+    document.addEventListener('editor:quick-new-kind', (event) => {
+      if (document.body.dataset.mode !== 'normal' || document.body.dataset.modeSubmode !== 'clean') return;
+      const kind = event.detail && event.detail.kind;
+      if (!ALLOWED.includes(kind)) return;
+      pref = kind;
+      effective = kind;
+      persistPref();
+      syncUI();
+      pushEffective();
+      document.dispatchEvent(new CustomEvent('editor:default-kind-change', {
+        detail: { kind: kind, source: 'keyboard-clean' },
+      }));
+    });
     document.addEventListener('editor:default-kind-change', (event) => {
       const kind = event.detail && event.detail.kind;
       if (!ALLOWED.includes(kind)) return;
@@ -3141,15 +3173,6 @@
       }
     });
     radiusInput.addEventListener('change', () => { if (activeNode() && cm()) cm().pushHistory(); });
-    fontWeightInput.addEventListener('discrete-range:restore-default', () => {
-      if (activeNode() && cm() && typeof cm().resetSingleNodeFontWeight === 'function') {
-        if (cm().resetSingleNodeFontWeight(activeNodeId)) cm().pushHistory();
-      } else {
-        delete n.fontWeight;
-        writeNode();
-      }
-      syncUI();
-    });
     fontWeightInput.addEventListener('input', () => {
       const value = parseInt(fontWeightInput.value, 10);
       fontWeightVal.textContent = String(value);
