@@ -12399,7 +12399,9 @@ body.panels-dimmed .panel-dim-btn {
 
 .mindmap-panel-preview {
   position: relative;
-  height: 94px;
+  flex: 0 0 116px;
+  height: 116px;
+  min-height: 116px;
   border: 1px solid rgba(90, 158, 171, 0.20);
   border-radius: 14px;
   background:
@@ -12408,54 +12410,64 @@ body.panels-dimmed .panel-dim-btn {
   overflow: hidden;
 }
 
-.mmp-node,
-.mmp-branch {
-  position: absolute;
+.mmp-preview-svg {
   display: block;
+  width: 100%;
+  height: 100%;
 }
 
-.mmp-node {
-  height: 18px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.84);
-  border: 1px solid rgba(90, 158, 171, 0.24);
-  box-shadow: 0 5px 14px rgba(90, 158, 171, 0.14);
+.mmp-preview-edges path {
+  fill: none;
+  stroke: rgba(90, 158, 171, 0.76);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+  transition: stroke 160ms ease, stroke-width 160ms ease, opacity 160ms ease;
 }
 
-.mmp-node-center {
-  left: 22px;
-  top: 38px;
-  width: 56px;
-  background: #5a9eab;
-  border-color: rgba(255, 255, 255, 0.62);
+.mmp-preview-node rect {
+  vector-effect: non-scaling-stroke;
+  stroke-width: 1;
+  transition: fill 160ms ease, stroke 160ms ease, fill-opacity 160ms ease, stroke-opacity 160ms ease;
 }
 
-.mmp-node-a { left: 152px; top: 17px; width: 70px; }
-.mmp-node-b { left: 139px; top: 39px; width: 84px; }
-.mmp-node-c { left: 158px; top: 62px; width: 58px; }
-
-.mmp-branch {
-  left: 76px;
-  height: 2px;
-  background: rgba(90, 158, 171, 0.50);
-  transform-origin: left center;
+.mmp-preview-node text {
+  fill: #1a1a1a;
+  font-size: 10px;
+  font-weight: 650;
+  font-family: inherit;
+  text-anchor: middle;
+  dominant-baseline: central;
+  pointer-events: none;
+  transition: fill 160ms ease;
 }
 
-.mmp-branch-a {
-  top: 43px;
-  width: 83px;
-  transform: rotate(-17deg);
+.mmp-preview-node[data-transparent="1"] text {
+  font-weight: 580;
 }
 
-.mmp-branch-b {
-  top: 48px;
-  width: 68px;
+.mindmap-preview-readout {
+  display: grid;
+  flex: 0 0 auto;
+  gap: 3px;
+  margin: 7px 2px 12px;
+  color: rgba(26, 26, 26, 0.66);
+  font-size: 11px;
+  line-height: 1.38;
 }
 
-.mmp-branch-c {
-  top: 51px;
-  width: 89px;
-  transform: rotate(14deg);
+.mindmap-preview-readout > span:first-child {
+  color: rgba(26, 26, 26, 0.82);
+  font-weight: 650;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mmp-preview-edges path,
+  .mmp-preview-node rect,
+  .mmp-preview-node text {
+    transition: none;
+  }
 }
 
 .mindmap-preset-grid {
@@ -12498,6 +12510,12 @@ body.panels-dimmed .panel-dim-btn {
   border-radius: 999px;
   background: var(--c);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.38);
+}
+
+.mindmap-preset-card > i.preset-transparent {
+  border: 1px dashed color-mix(in srgb, var(--c) 72%, transparent);
+  background: transparent;
+  box-shadow: none;
 }
 
 .mindmap-preset-card > svg {
@@ -13935,17 +13953,16 @@ html.dark-semantic-ui {
     rgba(255, 255, 255, 0.035);
 }
 
-.editor-page[data-background-tone="dark"] .mmp-node {
-  background: rgba(245, 245, 242, 0.88);
-  border-color: rgba(168, 217, 223, 0.28);
+.editor-page[data-background-tone="dark"] .mindmap-preview-readout {
+  color: rgba(247, 246, 242, 0.58);
 }
 
-.editor-page[data-background-tone="dark"] .mmp-node-center {
-  background: #76b7c1;
+.editor-page[data-background-tone="dark"] .mindmap-preview-readout > span:first-child {
+  color: rgba(247, 246, 242, 0.82);
 }
 
-.editor-page[data-background-tone="dark"] .mmp-branch {
-  background: rgba(168, 217, 223, 0.50);
+.editor-page[data-background-tone="dark"] .mmp-preview-node[data-transparent="1"] text {
+  fill: #f7f6f2;
 }
 
 .editor-page[data-background-tone="dark"] .mindmap-preset-card {
@@ -15299,7 +15316,7 @@ body.canvas-ready .canvas-empty-hint:not([hidden]) {
   text-align: var(--node-text-align, left);
   letter-spacing: -0.008em;
   line-height: 1.5;
-  color: var(--text);
+  color: var(--node-text-color, var(--text));
   cursor: default;
   user-select: none;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.07);   /* 边缘淡淡的浅灰阴影 */
@@ -17241,6 +17258,14 @@ body:not(.show-mindmap-folds) .node-mindmap-fold {
   box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.18);
 }
 
+/* 脑图深色实心节点使用局部反白语义；富文本显式字色仍可覆盖。 */
+.node.mindmap-inverse-text:not(.node-chrome-hidden) {
+  --node-text-color: #f7f6f2;
+  --text: #f7f6f2;
+  --text-secondary: rgba(247, 246, 242, 0.82);
+  --text-tertiary: rgba(247, 246, 242, 0.64);
+}
+
 .node:not(.decor-object) {
   z-index: 20;
 }
@@ -18507,6 +18532,7 @@ html.dark-semantic-ui .editor-page[data-background-tone="dark"] .normal-kind-fab
 .rt-run[data-rt-color="cyan"] { color: #347b84; }
 .rt-run[data-rt-color="green"] { color: #3d7d50; }
 .rt-run[data-rt-color="gray"] { color: #69716d; }
+.rt-run[data-rt-color="white"] { color: #f7f6f2; }
 .rt-run[data-rt-highlight] {
   padding: 0 0.06em;
   border-radius: 0.15em;
@@ -18602,6 +18628,7 @@ mark[data-hl="gray"]   { background: rgba(183, 190, 187, 0.42); }
 .md-color[data-tc="cyan"]   { --md-text-color: #347b84; color: var(--md-text-color); }
 .md-color[data-tc="green"]  { --md-text-color: #3d7d50; color: var(--md-text-color); }
 .md-color[data-tc="gray"]   { --md-text-color: #69716d; color: var(--md-text-color); }
+.md-color[data-tc="white"]  { --md-text-color: #f7f6f2; color: var(--md-text-color); }
 .md-color[data-tc] strong,
 .md-color[data-tc] code,
 .md-color[data-tc] .node-link {
@@ -19305,6 +19332,11 @@ mark[data-hl="gray"]   { background: rgba(183, 190, 187, 0.42); }
 .td-swatch[data-color="cyan"] { background: rgba(126, 205, 207, 0.9); }
 .td-swatch[data-color="green"] { background: rgba(150, 212, 162, 0.9); }
 .td-swatch[data-color="gray"] { background: rgba(183, 190, 187, 0.9); }
+.td-swatch[data-color="white"] {
+  background: #f7f6f2;
+  border-color: rgba(34, 40, 37, 0.34);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.82);
+}
 /* 文本框靠近内容节点时的临时对齐参考线；落点后即移除，不写入画布数据。 */
 .text-snap-guide {
   position: absolute;

@@ -4017,7 +4017,8 @@ def _rename_study_linked_canvas(data: dict, raw_path: str, title: str) -> str:
     return new_path
 
 
-_RICH_TEXT_COLORS = {"yellow", "orange", "red", "purple", "blue", "cyan", "green", "gray"}
+_RICH_TEXT_COLORS = {"yellow", "orange", "red", "purple", "blue", "cyan", "green", "gray", "white"}
+_RICH_TEXT_HIGHLIGHTS = _RICH_TEXT_COLORS - {"white"}
 _RICH_TEXT_SIZES = {"sm", "lg", "xl"}
 
 
@@ -4056,7 +4057,7 @@ def _serialize_rich_text(text: object, raw_marks: object) -> str:
             style["size"] = raw["size"]
         if raw.get("color") in _RICH_TEXT_COLORS:
             style["color"] = raw["color"]
-        if raw.get("highlight") in _RICH_TEXT_COLORS:
+        if raw.get("highlight") in _RICH_TEXT_HIGHLIGHTS:
             style["highlight"] = raw["highlight"]
         if raw.get("bold") is True:
             style["bold"] = True
@@ -6598,12 +6599,29 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if not raw:
             return self._send_json(400, {"error": "缺少 path"})
         src = Path(raw)
+        indexed = _norm(src) in recent_paths()
         if not src.is_file():
+            # 文件可能已被用户从资源管理器移走或删除。此时没有实体可放进
+            # 回收站，但显式执行“移到回收站”仍应清掉失效的最近记录，
+            # 否则前端刷新后该卡片会再次出现，造成操作成功的假象。
+            if indexed:
+                remove_from_recent(src)
+                forget_viewport_state(src)
+                return self._send_json(200, {"ok": True, "missing": True})
             return self._send_json(404, {"error": "文件不存在"})
         if not is_authorized(src):
             return self._send_json(403, {"error": "路径未授权"})
         try:
             dst = move_canvas_to_trash(src)
+        except FileNotFoundError as err:
+            # 处理 is_file() 与 rename() 之间文件恰好被外部删除的竞态。
+            # 若源文件仍在，说明更可能是伴生资源目录发生竞态，应按失败返回，
+            # 不能误删仍然有效的最近记录。
+            if indexed and not src.is_file():
+                remove_from_recent(src)
+                forget_viewport_state(src)
+                return self._send_json(200, {"ok": True, "missing": True})
+            return self._send_json(500, {"error": f"移到回收站失败：{err}"})
         except OSError as err:
             return self._send_json(500, {"error": f"移到回收站失败：{err}"})
         self._send_json(200, {"ok": True, "trashedTo": _norm(dst)})

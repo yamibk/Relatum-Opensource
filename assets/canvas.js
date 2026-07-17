@@ -531,6 +531,13 @@
     return EDGE_LINE_STYLES.indexOf(style) >= 0 ? style : 'solid';
   }
 
+  function edgeCornerRadius(edge) {
+    const raw = edge && edge.cornerRadius;
+    if (raw === undefined || raw === null || raw === '') return 18;
+    const value = Number(raw);
+    return Number.isFinite(value) ? clampValue(value, 2, 48) : 18;
+  }
+
   function darkEdgeOptimizationActive() {
     if (!document.body || document.body.dataset.backgroundTone !== 'dark') return false;
     try { return localStorage.getItem('canvas:darkEdgeOptimization') !== '0'; }
@@ -634,17 +641,17 @@
     return { x: (pts[k].x + pts[k + 1].x) / 2, y: (pts[k].y + pts[k + 1].y) / 2 };
   }
   // 5-3：有拐点时，两端锚点朝向相邻的拐点（而非对方节点中心）
-  function geomFromPoints(pts, rounded) {
+  function geomFromPoints(pts, rounded, radius) {
     const mid = midOfPolyline(pts);
     return {
-      d: rounded ? roundedPolylineD(pts, 18) : polylineD(pts),
+      d: rounded ? roundedPolylineD(pts, radius) : polylineD(pts),
       midX: mid.x,
       midY: mid.y,
     };
   }
 
-  function elbowBetween(srcRect, tgtRect, rounded) {
-    return geomFromPoints(orthogonalRoutePoints(srcRect, tgtRect, 'auto'), rounded);
+  function elbowBetween(srcRect, tgtRect, rounded, radius) {
+    return geomFromPoints(orthogonalRoutePoints(srcRect, tgtRect, 'auto'), rounded, radius);
   }
 
   function smoothBetween(srcRect, tgtRect) {
@@ -781,8 +788,8 @@
     const curve = edgeCurveType(edge);
     if (!wps) {
       if (curve === 'straight') return straightBetween(srcRect, tgtRect);
-      if (curve === 'elbow') return elbowBetween(srcRect, tgtRect, false);
-      if (curve === 'rounded-elbow') return elbowBetween(srcRect, tgtRect, true);
+      if (curve === 'elbow') return elbowBetween(srcRect, tgtRect, false, 0);
+      if (curve === 'rounded-elbow') return elbowBetween(srcRect, tgtRect, true, edgeCornerRadius(edge));
       if (curve === 's-curve') return sCurveBetween(srcRect, tgtRect);
       if (curve === 'smooth') return smoothBetween(srcRect, tgtRect);
       if (curve === 'branch') return cubicCurveGeom(branchCurvePoints(srcRect, tgtRect));
@@ -796,7 +803,7 @@
       .concat([{ x: a.t.x, y: a.t.y }]);
     const d = (curve === 'straight' || curve === 'elbow')
       ? polylineD(pts)
-      : (curve === 'rounded-elbow' ? roundedPolylineD(pts, 18) : smoothD(pts));
+      : (curve === 'rounded-elbow' ? roundedPolylineD(pts, edgeCornerRadius(edge)) : smoothD(pts));
     const mid = midOfPolyline(pts);
     return { d: d, midX: mid.x, midY: mid.y };
   }
@@ -3600,6 +3607,43 @@
       return 'rgba(' + r + ',' + g + ',' + b + ',' + alpha + ')';
     }
 
+    function nodeHexRgb(hex) {
+      const raw = String(hex || '').trim().replace('#', '');
+      if (!/^[0-9a-f]{6}$/i.test(raw)) return null;
+      return {
+        r: parseInt(raw.slice(0, 2), 16),
+        g: parseInt(raw.slice(2, 4), 16),
+        b: parseInt(raw.slice(4, 6), 16),
+      };
+    }
+
+    function relativeNodeLuminance(rgb) {
+      function channel(value) {
+        const next = value / 255;
+        return next <= 0.04045 ? next / 12.92 : Math.pow((next + 0.055) / 1.055, 2.4);
+      }
+      return channel(rgb.r) * 0.2126 + channel(rgb.g) * 0.7152 + channel(rgb.b) * 0.0722;
+    }
+
+    function mindmapNodeNeedsInverseText(node) {
+      if (!node || node.hideChrome || !(node.mindmapStyleRole || node.mindmapStylePreset || node.mindmapRoot)) return false;
+      const fill = nodeHexRgb(node.bgColor);
+      if (!fill) return false;
+      const rawOpacity = node.opacity == null ? 1 : Number(node.opacity);
+      const opacity = Number.isFinite(rawOpacity) ? clampValue(rawOpacity, 0, 1) : 1;
+      const blended = {
+        r: fill.r * opacity + 255 * (1 - opacity),
+        g: fill.g * opacity + 255 * (1 - opacity),
+        b: fill.b * opacity + 255 * (1 - opacity),
+      };
+      const background = relativeNodeLuminance(blended);
+      const warmWhite = relativeNodeLuminance({ r: 247, g: 246, b: 242 });
+      const ink = relativeNodeLuminance({ r: 26, g: 26, b: 26 });
+      const lightContrast = (warmWhite + 0.05) / (background + 0.05);
+      const darkContrast = (background + 0.05) / (ink + 0.05);
+      return lightContrast > darkContrast;
+    }
+
     function applyNodeStyle(el, node) {
       if (isDecorationNode(node)) {
         el.dataset.kind = node.kind;
@@ -3608,7 +3652,7 @@
         else el.removeAttribute('data-shape-type');
         el.dataset.layer = node.layer === 'front' ? 'front' : 'back';
         el.classList.add('decor-object');
-        el.classList.remove('node-chrome-hidden');
+        el.classList.remove('node-chrome-hidden', 'mindmap-inverse-text');
         el.style.width = Math.max(20, Number(node.width) || 240) + 'px';
         el.style.height = Math.max(8, Number(node.height) || 120) + 'px';
         el.style.setProperty('--decor-rotation', (Number(node.rotation) || 0) + 'deg');
@@ -3736,6 +3780,7 @@
         el.style.removeProperty('--node-body-height');
       }
       el.classList.toggle('node-chrome-hidden', !!node.hideChrome);
+      el.classList.toggle('mindmap-inverse-text', mindmapNodeNeedsInverseText(node));
       if (isIndexNode(node)) el.dataset.kind = 'index';
       else if (isPreviewNode(node)) el.dataset.kind = 'preview';
       else if (isCardNode(node)) el.dataset.kind = 'card';
@@ -6158,6 +6203,7 @@
       if (!targets.length) return;
       targets.forEach((ed) => {
         if (isDefault) delete ed[prop]; else ed[prop] = value;
+        if (prop === 'curve' && value !== 'rounded-elbow') delete ed.cornerRadius;
         const refs = edgeMap.get(ed.id); if (refs) applyEdgeStyle(refs, ed);
         updateEdgePath(ed);
       });
@@ -6386,6 +6432,7 @@
       ordinary.forEach((edge) => {
         const curve = d.curve && d.curve !== 'bezier' ? d.curve : '';
         if (curve) edge.curve = curve; else delete edge.curve;
+        delete edge.cornerRadius;
         const lineStyle = d.lineStyle && d.lineStyle !== 'solid' ? d.lineStyle : '';
         if (lineStyle) edge.lineStyle = lineStyle; else delete edge.lineStyle;
         const arrow = d.arrow && d.arrow !== 'none' ? d.arrow : '';
@@ -6423,6 +6470,7 @@
           bgColor: preset.center.bgColor,
           borderColor: preset.center.borderColor,
           opacity: preset.center.opacity,
+          hideChrome: !!preset.center.hideChrome,
         }, presetId, preset.center.borderColor, 0, 'auto');
       } else {
         const level = depth === 1 ? preset.branch : preset.leaf;
@@ -6431,6 +6479,7 @@
           bgColor: mixMindmapHex(branchColor, '#ffffff', level.bgMix),
           borderColor: branchColor,
           opacity: level.opacity,
+          hideChrome: !!level.hideChrome,
         }, presetId, branchColor, depth, 'auto');
       }
       return true;
@@ -6508,7 +6557,7 @@
       if (!targets.length) return;
       targets.forEach((edge) => {
         if (restoreEditMindmapEdgeForPreset(edge)) return;
-        ['curve', 'lineStyle', 'arrow', 'width', 'arrowSize', 'color'].forEach((prop) => { delete edge[prop]; });
+        ['curve', 'lineStyle', 'arrow', 'width', 'arrowSize', 'color', 'cornerRadius'].forEach((prop) => { delete edge[prop]; });
         const refs = edgeMap.get(edge.id);
         if (refs) applyEdgeStyle(refs, edge);
         updateEdgePath(edge);
@@ -6559,6 +6608,7 @@
         width: level.width,
         curve: level.curve,
         lineStyle: level.lineStyle,
+        cornerRadius: level.cornerRadius,
       };
     }
     function restoreEditMindmapEdgeForPreset(edge) {
@@ -10745,7 +10795,8 @@
       if (depth === 0) {
         return border === normalizeMindmapHex(preset.center.borderColor)
           && bg === normalizeMindmapHex(preset.center.bgColor)
-          && Math.abs(opacity - Number(preset.center.opacity)) < 0.025;
+          && Math.abs(opacity - Number(preset.center.opacity)) < 0.025
+          && !!node.hideChrome === !!preset.center.hideChrome;
       }
       const level = depth === 1 ? preset.branch : preset.leaf;
       const paletteHit = (preset.colors || []).some(function (color) {
@@ -10753,7 +10804,8 @@
       });
       if (!paletteHit || !border) return false;
       return bg === normalizeMindmapHex(mixMindmapHex(border, '#ffffff', level.bgMix))
-        && Math.abs(opacity - Number(level.opacity)) < 0.025;
+        && Math.abs(opacity - Number(level.opacity)) < 0.025
+        && !!node.hideChrome === !!level.hideChrome;
     }
 
     function readMindmapColorIntent(node, depth) {
@@ -10805,6 +10857,10 @@
       node.bgColor = palette.bgColor;
       node.borderColor = palette.borderColor;
       node.opacity = palette.opacity;
+      if (Object.prototype.hasOwnProperty.call(palette, 'hideChrome')) {
+        if (palette.hideChrome) node.hideChrome = true;
+        else delete node.hideChrome;
+      }
       delete node.color;
       writeMindmapColorMeta(node, presetId, branchColor, depth, mode || 'auto');
       const el = nodeMap.get(node.id);
@@ -10877,6 +10933,7 @@
           bgColor: mixMindmapHex(branchColor, '#ffffff', level.bgMix),
           borderColor: branchColor,
           opacity: level.opacity,
+          hideChrome: !!level.hideChrome,
         }, presetId, branchColor, depth, 'auto');
       });
       data.edges.forEach(function (edge) {
@@ -11064,6 +11121,7 @@
           bgColor: mixMindmapHex(branchColor, '#ffffff', level.bgMix),
           borderColor: branchColor,
           opacity: level.opacity,
+          hideChrome: !!level.hideChrome,
         }, presetId, branchColor, depth, 'auto');
         const parentId = tree.parentOf.get(id);
         const incoming = data.edges.find(function (edge) {
@@ -11169,6 +11227,7 @@
         width: Number(level.width) || Number(edge.width) || 1.8,
         curve: EDGE_CURVES.indexOf(curveRaw) >= 0 ? curveRaw : (level.curve || edgeCurveType(edge)),
         lineStyle: EDGE_LINE_STYLES.indexOf(lineStyleRaw) >= 0 ? lineStyleRaw : (level.lineStyle || edgeLineStyle(edge)),
+        cornerRadius: level.cornerRadius,
       }, true);
     }
 
@@ -16742,8 +16801,8 @@
     }
     const INLINE_HL_CODE = { y: 'yellow', o: 'orange', r: 'red', p: 'purple', b: 'blue', c: 'cyan', g: 'green', k: 'gray' };
     const INLINE_HL_NAME = { yellow: 'y', orange: 'o', red: 'r', purple: 'p', blue: 'b', cyan: 'c', green: 'g', gray: 'k' };
-    const INLINE_TC_CODE = { y: 'yellow', o: 'orange', r: 'red', p: 'purple', b: 'blue', c: 'cyan', g: 'green', k: 'gray' };
-    const INLINE_TC_NAME = { yellow: 'y', orange: 'o', red: 'r', purple: 'p', blue: 'b', cyan: 'c', green: 'g', gray: 'k' };
+    const INLINE_TC_CODE = { y: 'yellow', o: 'orange', r: 'red', p: 'purple', b: 'blue', c: 'cyan', g: 'green', k: 'gray', w: 'white' };
+    const INLINE_TC_NAME = { yellow: 'y', orange: 'o', red: 'r', purple: 'p', blue: 'b', cyan: 'c', green: 'g', gray: 'k', white: 'w' };
     // 格式变换：工具栏始终把组合样式规范为 {hl:red|{tc:blue|{fs:lg|文字}}}，
     // 这样无论先点哪个按钮，换样式和单独清除都不会不断套娃。
     function readInlineStyle(seln) {
@@ -16765,7 +16824,7 @@
           changed = true;
           continue;
         }
-        m = /^\{tc:(yellow|orange|red|purple|blue|cyan|green|gray)\|([\s\S]*)\}$/.exec(style.inner);
+        m = /^\{tc:(yellow|orange|red|purple|blue|cyan|green|gray|white)\|([\s\S]*)\}$/.exec(style.inner);
         if (m && style.textColor === null) {
           style.textColor = INLINE_TC_NAME[m[1]] || 'r';
           style.inner = m[2];
@@ -16849,7 +16908,7 @@
           style.textColor = null;
           seg = writeInlineStyle(style);
         } else {
-          seg = line.replace(/\{tc:(?:yellow|orange|red|purple|blue|cyan|green|gray)\|([^{}\n]+?)\}/g, '$1');
+          seg = line.replace(/\{tc:(?:yellow|orange|red|purple|blue|cyan|green|gray|white)\|([^{}\n]+?)\}/g, '$1');
         }
         return seg;
       });
@@ -16893,7 +16952,7 @@
           out = out
             .replace(/==([^=\n]+?)==/g, '$1')
             .replace(/\{hl:(?:yellow|orange|red|purple|blue|cyan|green|gray)\|([^{}\n]+?)\}/g, '$1')
-            .replace(/\{tc:(?:yellow|orange|red|purple|blue|cyan|green|gray)\|([^{}\n]+?)\}/g, '$1')
+            .replace(/\{tc:(?:yellow|orange|red|purple|blue|cyan|green|gray|white)\|([^{}\n]+?)\}/g, '$1')
             .replace(/\{fs:(?:sm|lg|xl)\|([^{}\n]+?)\}/g, '$1')
             .replace(/\*\*([^*\n]+?)\*\*/g, '$1');
           if (out === before) break;
@@ -17032,10 +17091,10 @@
       b: 'rgba(140, 197, 240, 0.92)', c: 'rgba(126, 205, 207, 0.92)',
       g: 'rgba(150, 212, 162, 0.92)', k: 'rgba(183, 190, 187, 0.92)',
     };
-    const TEXT_DOCK_TC_HEX = { y: '#98721d', o: '#ae692c', r: '#b64f49', p: '#7754a5', b: '#356ca8', c: '#347b84', g: '#3d7d50', k: '#69716d' };
-    const TEXT_DOCK_TONE_TO_TC = { y: 'y', o: 'o', r: 'r', p: 'p', b: 'b', c: 'c', g: 'g', k: 'k' };
-    const TEXT_DOCK_TC_TO_TONE = { y: 'y', o: 'o', r: 'r', p: 'p', b: 'b', c: 'c', g: 'g', k: 'k' };
-    const TEXT_DOCK_TONE_TO_RICH = { y: 'yellow', o: 'orange', r: 'red', p: 'purple', b: 'blue', c: 'cyan', g: 'green', k: 'gray' };
+    const TEXT_DOCK_TC_HEX = { y: '#98721d', o: '#ae692c', r: '#b64f49', p: '#7754a5', b: '#356ca8', c: '#347b84', g: '#3d7d50', k: '#69716d', w: '#f7f6f2' };
+    const TEXT_DOCK_TONE_TO_TC = { y: 'y', o: 'o', r: 'r', p: 'p', b: 'b', c: 'c', g: 'g', k: 'k', w: 'w' };
+    const TEXT_DOCK_TC_TO_TONE = { y: 'y', o: 'o', r: 'r', p: 'p', b: 'b', c: 'c', g: 'g', k: 'k', w: 'w' };
+    const TEXT_DOCK_TONE_TO_RICH = { y: 'yellow', o: 'orange', r: 'red', p: 'purple', b: 'blue', c: 'cyan', g: 'green', k: 'gray', w: 'white' };
     const TEXT_DOCK_ABS_SIZE = { sm: 22, '': 34, lg: 48, xl: 64 };
     const TEXT_DOCK_REL_SIZE = { sm: 0.86, '': 1, lg: 1.22, xl: 1.48 };
     const TEXT_DOCK_COLLAPSED_KEY = 'canvas:textToolbarCollapsed';
@@ -17050,9 +17109,10 @@
       const savedTc = localStorage.getItem('canvas:textInlineColor');
       const savedCollapsed = localStorage.getItem(TEXT_DOCK_COLLAPSED_KEY);
       textDockCollapsed = savedCollapsed === null ? true : savedCollapsed === '1';
-      if (TEXT_DOCK_HL_CSS[savedHl]) lastTextTone = savedHl;
+      if (TEXT_DOCK_TC_TO_TONE[savedTc] === 'w') lastTextTone = 'w';
+      else if (TEXT_DOCK_HL_CSS[savedHl]) lastTextTone = savedHl;
       else if (TEXT_DOCK_TC_TO_TONE[savedTc]) lastTextTone = TEXT_DOCK_TC_TO_TONE[savedTc];
-      lastTextHighlight = lastTextTone;
+      lastTextHighlight = TEXT_DOCK_HL_CSS[savedHl] ? savedHl : (TEXT_DOCK_HL_CSS[lastTextTone] ? lastTextTone : 'y');
       lastTextColor = TEXT_DOCK_TONE_TO_TC[lastTextTone];
     } catch (e) {}
 
@@ -17206,7 +17266,7 @@
       const clear = textDock.querySelector('[data-text-action="clear"]');
       const canHighlight = localOnly;
       const canColor = !!ctx && (localOnly || ctx.scope === 'text-box' || ctx.scope === 'defaults');
-      if (highlight) highlight.disabled = !canHighlight;
+      if (highlight) highlight.disabled = !canHighlight || !TEXT_DOCK_HL_CSS[lastTextTone];
       if (color) color.disabled = !canColor;
       if (colorRail) colorRail.hidden = false;
       if (bold) bold.disabled = !ctx;
@@ -17377,13 +17437,13 @@
       scheduleTextDock();
     }
     function applyTextDockTone(tone) {
-      if (!TEXT_DOCK_HL_CSS[tone]) return;
+      if (!TEXT_DOCK_TONE_TO_TC[tone]) return;
       lastTextTone = tone;
-      lastTextHighlight = tone;
+      if (TEXT_DOCK_HL_CSS[tone]) lastTextHighlight = tone;
       lastTextColor = TEXT_DOCK_TONE_TO_TC[tone];
-      persistTextDockChoice('highlight', lastTextHighlight);
+      if (TEXT_DOCK_HL_CSS[tone]) persistTextDockChoice('highlight', lastTextHighlight);
       persistTextDockChoice('color', lastTextColor);
-      textDock.style.setProperty('--td-hl', TEXT_DOCK_HL_CSS[lastTextTone]);
+      textDock.style.setProperty('--td-hl', TEXT_DOCK_HL_CSS[lastTextHighlight]);
       textDock.style.setProperty('--td-tc', TEXT_DOCK_TC_HEX[lastTextColor]);
       scheduleTextDock();
     }
@@ -21408,51 +21468,63 @@
     const MINDMAP_STYLE_PRESETS = {
       paper: {
         colors: ['#5a9eab', '#d0ad4e', '#b66c82', '#6f8a61', '#8e6bc2', '#c98562'],
-        center: { bgColor: '#f8fbfa', borderColor: '#305b62', opacity: 0.98, scale: 1.06, nodeWidth: 240, minWidth: 132, maxWidth: 300, fontWeight: 650, radius: 8, textAlign: 'center' },
-        branch: { bgMix: 0.88, opacity: 0.96, scale: 0.95, nodeWidth: 198, minWidth: 104, maxWidth: 240, fontWeight: 590, radius: 7, textAlign: 'left', width: 2.4, curve: 'branch', lineStyle: 'solid' },
-        leaf: { bgMix: 0.94, opacity: 0.92, scale: 0.86, nodeWidth: 168, minWidth: 72, maxWidth: 210, fontWeight: 470, radius: 6, textAlign: 'left', width: 1.8, curve: 'branch', lineStyle: 'solid' },
+        center: { bgColor: '#f8fbfa', borderColor: '#305b62', opacity: 0.98, hideChrome: false, scale: 1.06, nodeWidth: 240, minWidth: 132, maxWidth: 300, fontWeight: 650, radius: 8, textAlign: 'center' },
+        branch: { bgMix: 0.88, opacity: 0.96, hideChrome: false, scale: 0.95, nodeWidth: 198, minWidth: 104, maxWidth: 240, fontWeight: 590, radius: 7, textAlign: 'left', width: 2.4, curve: 'branch', lineStyle: 'solid' },
+        leaf: { bgMix: 0.94, opacity: 0.92, hideChrome: false, scale: 0.86, nodeWidth: 168, minWidth: 72, maxWidth: 210, fontWeight: 470, radius: 6, textAlign: 'left', width: 1.8, curve: 'branch', lineStyle: 'solid' },
+      },
+      focus: {
+        colors: ['#5d8792', '#b08c4d', '#a96f75', '#718b67', '#7772a0', '#b4775c'],
+        center: { bgColor: '#124d67', borderColor: '#124d67', opacity: 1, hideChrome: false, scale: 1.08, nodeWidth: 250, minWidth: 154, maxWidth: 328, fontWeight: 720, radius: 11, textAlign: 'center' },
+        branch: { bgMix: 0.82, opacity: 0.98, hideChrome: false, scale: 0.96, nodeWidth: 204, minWidth: 112, maxWidth: 264, fontWeight: 620, radius: 8, textAlign: 'left', width: 2.2, curve: 'rounded-elbow', cornerRadius: 20, lineStyle: 'solid' },
+        leaf: { bgMix: 0.96, opacity: 1, hideChrome: true, scale: 0.86, nodeWidth: 168, minWidth: 70, maxWidth: 224, fontWeight: 470, radius: 4, textAlign: 'left', width: 1.55, curve: 'rounded-elbow', cornerRadius: 14, lineStyle: 'solid' },
+      },
+      rounded: {
+        colors: ['#527b73', '#b17e4d', '#a86669', '#657f9a', '#7c6d97', '#718957'],
+        center: { bgColor: '#f4efe5', borderColor: '#36564f', opacity: 1, hideChrome: false, scale: 1.07, nodeWidth: 246, minWidth: 150, maxWidth: 320, fontWeight: 690, radius: 12, textAlign: 'center' },
+        branch: { bgMix: 0.82, opacity: 0.98, hideChrome: false, scale: 0.96, nodeWidth: 202, minWidth: 110, maxWidth: 258, fontWeight: 620, radius: 10, textAlign: 'left', width: 2.5, curve: 'rounded-elbow', cornerRadius: 30, lineStyle: 'solid' },
+        leaf: { bgMix: 0.93, opacity: 0.94, hideChrome: false, scale: 0.86, nodeWidth: 168, minWidth: 74, maxWidth: 220, fontWeight: 480, radius: 8, textAlign: 'left', width: 1.75, curve: 'rounded-elbow', cornerRadius: 22, lineStyle: 'soft' },
       },
       scholar: {
         colors: ['#526c92', '#6f8a61', '#a77252', '#7b6ea8', '#9d6d73', '#4f8080'],
-        center: { bgColor: '#f5f2ea', borderColor: '#2f3437', opacity: 0.98, scale: 1.04, nodeWidth: 244, minWidth: 154, maxWidth: 324, fontWeight: 680, radius: 4, textAlign: 'left' },
-        branch: { bgMix: 0.90, opacity: 0.94, scale: 0.94, nodeWidth: 204, minWidth: 118, maxWidth: 260, fontWeight: 620, radius: 4, textAlign: 'left', width: 2.2, curve: 'bezier', lineStyle: 'solid' },
-        leaf: { bgMix: 0.96, opacity: 0.90, scale: 0.85, nodeWidth: 172, minWidth: 82, maxWidth: 230, fontWeight: 460, radius: 3, textAlign: 'left', width: 1.6, curve: 'bezier', lineStyle: 'soft' },
+        center: { bgColor: '#f5f2ea', borderColor: '#2f3437', opacity: 0.98, hideChrome: false, scale: 1.04, nodeWidth: 244, minWidth: 154, maxWidth: 324, fontWeight: 680, radius: 4, textAlign: 'left' },
+        branch: { bgMix: 0.90, opacity: 0.94, hideChrome: false, scale: 0.94, nodeWidth: 204, minWidth: 118, maxWidth: 260, fontWeight: 620, radius: 4, textAlign: 'left', width: 2.2, curve: 'bezier', lineStyle: 'solid' },
+        leaf: { bgMix: 0.96, opacity: 0.90, hideChrome: false, scale: 0.85, nodeWidth: 172, minWidth: 82, maxWidth: 230, fontWeight: 460, radius: 3, textAlign: 'left', width: 1.6, curve: 'bezier', lineStyle: 'soft' },
       },
       journal: {
         colors: ['#e49488', '#77b9a9', '#d6b96a', '#9aaed6', '#c692b4', '#8fb783'],
-        center: { bgColor: '#fff8ed', borderColor: '#b67f59', opacity: 0.98, scale: 1.06, nodeWidth: 236, minWidth: 128, maxWidth: 286, fontWeight: 650, radius: 8, textAlign: 'center' },
-        branch: { bgMix: 0.82, opacity: 0.96, scale: 0.96, nodeWidth: 196, minWidth: 96, maxWidth: 232, fontWeight: 590, radius: 8, textAlign: 'left', width: 2.6, curve: 'organic', lineStyle: 'solid' },
-        leaf: { bgMix: 0.91, opacity: 0.92, scale: 0.87, nodeWidth: 166, minWidth: 68, maxWidth: 204, fontWeight: 470, radius: 7, textAlign: 'left', width: 1.8, curve: 'organic', lineStyle: 'soft' },
+        center: { bgColor: '#fff8ed', borderColor: '#b67f59', opacity: 0.98, hideChrome: false, scale: 1.06, nodeWidth: 236, minWidth: 128, maxWidth: 286, fontWeight: 650, radius: 8, textAlign: 'center' },
+        branch: { bgMix: 0.82, opacity: 0.96, hideChrome: false, scale: 0.96, nodeWidth: 196, minWidth: 96, maxWidth: 232, fontWeight: 590, radius: 8, textAlign: 'left', width: 2.6, curve: 'organic', lineStyle: 'solid' },
+        leaf: { bgMix: 0.91, opacity: 0.92, hideChrome: false, scale: 0.87, nodeWidth: 166, minWidth: 68, maxWidth: 204, fontWeight: 470, radius: 7, textAlign: 'left', width: 1.8, curve: 'organic', lineStyle: 'soft' },
       },
       ink: {
         colors: ['#2f3437', '#6f777c', '#8d8378', '#57676a', '#7a6f87', '#75806b'],
-        center: { bgColor: '#fbfbfa', borderColor: '#1f2325', opacity: 1, scale: 1.03, nodeWidth: 232, minWidth: 142, maxWidth: 300, fontWeight: 690, radius: 3, textAlign: 'left' },
-        branch: { bgMix: 0.96, opacity: 0.94, scale: 0.93, nodeWidth: 192, minWidth: 108, maxWidth: 248, fontWeight: 620, radius: 2, textAlign: 'left', width: 2, curve: 'straight', lineStyle: 'solid' },
-        leaf: { bgMix: 0.985, opacity: 0.90, scale: 0.84, nodeWidth: 162, minWidth: 74, maxWidth: 220, fontWeight: 460, radius: 2, textAlign: 'left', width: 1.4, curve: 'straight', lineStyle: 'soft' },
+        center: { bgColor: '#fbfbfa', borderColor: '#1f2325', opacity: 1, hideChrome: false, scale: 1.03, nodeWidth: 232, minWidth: 142, maxWidth: 300, fontWeight: 690, radius: 3, textAlign: 'left' },
+        branch: { bgMix: 0.96, opacity: 0.94, hideChrome: false, scale: 0.93, nodeWidth: 192, minWidth: 108, maxWidth: 248, fontWeight: 620, radius: 2, textAlign: 'left', width: 2, curve: 'straight', lineStyle: 'solid' },
+        leaf: { bgMix: 0.985, opacity: 0.90, hideChrome: false, scale: 0.84, nodeWidth: 162, minWidth: 74, maxWidth: 220, fontWeight: 460, radius: 2, textAlign: 'left', width: 1.4, curve: 'straight', lineStyle: 'soft' },
       },
       forest: {
         colors: ['#4f7b62', '#bb8e3d', '#9b5f5f', '#4d7f86', '#786b48', '#74628a'],
-        center: { bgColor: '#f3f6f0', borderColor: '#315945', opacity: 1, scale: 1.08, nodeWidth: 242, minWidth: 160, maxWidth: 326, fontWeight: 720, radius: 5, textAlign: 'left' },
-        branch: { bgMix: 0.78, opacity: 0.98, scale: 0.97, nodeWidth: 200, minWidth: 132, maxWidth: 270, fontWeight: 660, radius: 5, textAlign: 'left', width: 2.8, curve: 'branch', lineStyle: 'solid' },
-        leaf: { bgMix: 0.94, opacity: 0.96, scale: 0.86, nodeWidth: 168, minWidth: 64, maxWidth: 224, fontWeight: 490, radius: 4, textAlign: 'left', width: 1.7, curve: 'branch', lineStyle: 'soft' },
+        center: { bgColor: '#f3f6f0', borderColor: '#315945', opacity: 1, hideChrome: false, scale: 1.08, nodeWidth: 242, minWidth: 160, maxWidth: 326, fontWeight: 720, radius: 5, textAlign: 'left' },
+        branch: { bgMix: 0.78, opacity: 0.98, hideChrome: false, scale: 0.97, nodeWidth: 200, minWidth: 132, maxWidth: 270, fontWeight: 660, radius: 5, textAlign: 'left', width: 2.8, curve: 'branch', lineStyle: 'solid' },
+        leaf: { bgMix: 0.94, opacity: 0.96, hideChrome: false, scale: 0.86, nodeWidth: 168, minWidth: 64, maxWidth: 224, fontWeight: 490, radius: 4, textAlign: 'left', width: 1.7, curve: 'branch', lineStyle: 'soft' },
       },
       blueprint: {
         colors: ['#3d648f', '#3f8c8c', '#d07b5d', '#c3a33b', '#6c73a6', '#658553'],
-        center: { bgColor: '#f3f7fa', borderColor: '#294d73', opacity: 0.99, scale: 1.06, nodeWidth: 246, minWidth: 148, maxWidth: 316, fontWeight: 690, radius: 6, textAlign: 'center' },
-        branch: { bgMix: 0.86, opacity: 0.97, scale: 0.95, nodeWidth: 202, minWidth: 112, maxWidth: 252, fontWeight: 610, radius: 6, textAlign: 'left', width: 2.5, curve: 's-curve', lineStyle: 'solid' },
-        leaf: { bgMix: 0.94, opacity: 0.92, scale: 0.85, nodeWidth: 170, minWidth: 76, maxWidth: 220, fontWeight: 470, radius: 5, textAlign: 'left', width: 1.7, curve: 'branch', lineStyle: 'soft' },
+        center: { bgColor: '#f3f7fa', borderColor: '#294d73', opacity: 0.99, hideChrome: false, scale: 1.06, nodeWidth: 246, minWidth: 148, maxWidth: 316, fontWeight: 690, radius: 6, textAlign: 'center' },
+        branch: { bgMix: 0.86, opacity: 0.97, hideChrome: false, scale: 0.95, nodeWidth: 202, minWidth: 112, maxWidth: 252, fontWeight: 610, radius: 6, textAlign: 'left', width: 2.5, curve: 's-curve', lineStyle: 'solid' },
+        leaf: { bgMix: 0.94, opacity: 0.92, hideChrome: false, scale: 0.85, nodeWidth: 170, minWidth: 76, maxWidth: 220, fontWeight: 470, radius: 5, textAlign: 'left', width: 1.7, curve: 'branch', lineStyle: 'soft' },
       },
       classroom: {
         colors: ['#d94f4f', '#e7a62d', '#2f9b77', '#337dc1', '#8d5eb5', '#d66d9a'],
-        center: { bgColor: '#fffdf8', borderColor: '#33383c', opacity: 1, scale: 1.08, nodeWidth: 250, minWidth: 154, maxWidth: 330, fontWeight: 760, radius: 7, textAlign: 'center' },
-        branch: { bgMix: 0.76, opacity: 0.98, scale: 0.97, nodeWidth: 206, minWidth: 126, maxWidth: 276, fontWeight: 700, radius: 6, textAlign: 'center', width: 3, curve: 'elbow', lineStyle: 'solid' },
-        leaf: { bgMix: 0.90, opacity: 0.94, scale: 0.87, nodeWidth: 172, minWidth: 82, maxWidth: 228, fontWeight: 520, radius: 5, textAlign: 'left', width: 1.9, curve: 'rounded-elbow', lineStyle: 'solid' },
+        center: { bgColor: '#fffdf8', borderColor: '#33383c', opacity: 1, hideChrome: false, scale: 1.08, nodeWidth: 250, minWidth: 154, maxWidth: 330, fontWeight: 760, radius: 7, textAlign: 'center' },
+        branch: { bgMix: 0.76, opacity: 0.98, hideChrome: false, scale: 0.97, nodeWidth: 206, minWidth: 126, maxWidth: 276, fontWeight: 700, radius: 6, textAlign: 'center', width: 3, curve: 'elbow', lineStyle: 'solid' },
+        leaf: { bgMix: 0.90, opacity: 0.94, hideChrome: false, scale: 0.87, nodeWidth: 172, minWidth: 82, maxWidth: 228, fontWeight: 520, radius: 5, textAlign: 'left', width: 1.9, curve: 'rounded-elbow', cornerRadius: 18, lineStyle: 'solid' },
       },
       editorial: {
         colors: ['#25282b', '#c5534f', '#4f8fa3', '#c0953d', '#66805a', '#88678b'],
-        center: { bgColor: '#faf9f5', borderColor: '#25282b', opacity: 1, scale: 1.05, nodeWidth: 238, minWidth: 170, maxWidth: 340, fontWeight: 740, radius: 2, textAlign: 'left' },
-        branch: { bgMix: 0.91, opacity: 0.97, scale: 0.94, nodeWidth: 198, minWidth: 124, maxWidth: 272, fontWeight: 660, radius: 2, textAlign: 'left', width: 2.4, curve: 'arc', lineStyle: 'solid' },
-        leaf: { bgMix: 0.97, opacity: 0.91, scale: 0.84, nodeWidth: 164, minWidth: 70, maxWidth: 224, fontWeight: 460, radius: 2, textAlign: 'left', width: 1.5, curve: 'straight', lineStyle: 'soft' },
+        center: { bgColor: '#faf9f5', borderColor: '#25282b', opacity: 1, hideChrome: false, scale: 1.05, nodeWidth: 238, minWidth: 170, maxWidth: 340, fontWeight: 740, radius: 2, textAlign: 'left' },
+        branch: { bgMix: 0.91, opacity: 0.97, hideChrome: false, scale: 0.94, nodeWidth: 198, minWidth: 124, maxWidth: 272, fontWeight: 660, radius: 2, textAlign: 'left', width: 2.4, curve: 'arc', lineStyle: 'solid' },
+        leaf: { bgMix: 0.97, opacity: 0.91, hideChrome: false, scale: 0.84, nodeWidth: 164, minWidth: 70, maxWidth: 224, fontWeight: 460, radius: 2, textAlign: 'left', width: 1.5, curve: 'straight', lineStyle: 'soft' },
       },
     };
 
@@ -21542,6 +21614,54 @@
         + h(ca.g * (1 - t) + cb.g * t)
         + h(ca.b * (1 - t) + cb.b * t);
     }
+    function getMindmapPresetPreview(presetId) {
+      const resolvedId = MINDMAP_STYLE_PRESETS[presetId] ? presetId : 'paper';
+      const preset = mindmapPreset(resolvedId);
+      const branchColor = normalizeMindmapHex((preset.colors || [])[0]) || '#5a9eab';
+      function nodeLevel(level, depth) {
+        const background = depth === 0
+          ? level.bgColor
+          : mixMindmapHex(branchColor, '#ffffff', level.bgMix);
+        const node = {
+          bgColor: background,
+          borderColor: depth === 0 ? level.borderColor : branchColor,
+          opacity: Number.isFinite(Number(level.opacity)) ? clampValue(Number(level.opacity), 0, 1) : 1,
+          hideChrome: !!level.hideChrome,
+          radius: Number.isFinite(Number(level.radius)) ? Math.max(0, Number(level.radius)) : 6,
+          mindmapStyleRole: mindmapStyleRole(depth),
+        };
+        const inverse = mindmapNodeNeedsInverseText(node);
+        return {
+          bgColor: node.bgColor,
+          borderColor: node.borderColor,
+          opacity: node.opacity,
+          hideChrome: node.hideChrome,
+          radius: node.radius,
+          tone: node.hideChrome ? 'transparent' : (inverse ? 'dark' : 'light'),
+          textColor: inverse ? '#f7f6f2' : '#1a1a1a',
+        };
+      }
+      function edgeLevel(level) {
+        const curve = EDGE_CURVES.indexOf(level.curve) >= 0 ? level.curve : 'branch';
+        return {
+          color: branchColor,
+          width: Number.isFinite(Number(level.width)) ? Number(level.width) : 1.8,
+          curve: curve,
+          lineStyle: EDGE_LINE_STYLES.indexOf(level.lineStyle) >= 0 ? level.lineStyle : 'solid',
+          cornerRadius: curve === 'rounded-elbow'
+            ? edgeCornerRadius({ cornerRadius: level.cornerRadius })
+            : null,
+        };
+      }
+      return {
+        id: resolvedId,
+        center: nodeLevel(preset.center, 0),
+        branch: nodeLevel(preset.branch, 1),
+        leaf: nodeLevel(preset.leaf, 2),
+        branchEdge: edgeLevel(preset.branch),
+        leafEdge: edgeLevel(preset.leaf),
+      };
+    }
     function mindmapBranchMaps(tree) {
       const parentOf = new Map();
       const branchOf = new Map([[tree.center.id, -1]]);
@@ -21601,6 +21721,15 @@
       edge.lineStyle = style.lineStyle || 'solid';
       edge.color = style.color;
       edge.width = style.width;
+      const rawCornerRadius = style.cornerRadius;
+      const cornerRadius = Number(rawCornerRadius);
+      if (edge.curve === 'rounded-elbow'
+          && rawCornerRadius !== undefined && rawCornerRadius !== null && rawCornerRadius !== ''
+          && Number.isFinite(cornerRadius)) {
+        edge.cornerRadius = clampValue(cornerRadius, 2, 48);
+      } else {
+        delete edge.cornerRadius;
+      }
       edge.arrow = 'none';
       edge.arrowSize = 12;
       if (cleanWaypoints) delete edge.waypoints;
@@ -21649,6 +21778,7 @@
         width: level.width,
         curve: curve,
         lineStyle: lineStyle,
+        cornerRadius: level.cornerRadius,
       }, true);
     }
     function applyMindmapStyle(presetId, options) {
@@ -21714,6 +21844,7 @@
           width: level.width,
           curve: curveOverride || level.curve,
           lineStyle: lineStyleOverride || level.lineStyle,
+          cornerRadius: level.cornerRadius,
         }, !!options.cleanWaypoints);
       });
       // 强制重排：在恢复 transition 前让所有节点以最终尺寸完成布局计算，
@@ -22008,6 +22139,7 @@
     }
     global.CanvasModule.applyMindmap = applyMindmap;
     global.CanvasModule.applyMindmapStyle = applyMindmapStyle;
+    global.CanvasModule.getMindmapPresetPreview = getMindmapPresetPreview;
     global.CanvasModule.alignMindmapLevels = alignMindmapLevels;
     global.CanvasModule.startMindmapColorBrush = startMindmapColorBrush;
     global.CanvasModule.cancelMindmapColorBrush = function () { return cancelMindmapColorBrush(false); };
