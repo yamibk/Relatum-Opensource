@@ -118,7 +118,7 @@
       textColorOrange: '橙色文字', textColorPurple: '紫色文字',
       textColorRailAria: '柔和颜色', textToneYellow: '柔和黄', textToneOrange: '柔和橙',
       textToneRed: '柔和红', textTonePurple: '柔和紫', textToneBlue: '柔和蓝',
-      textToneCyan: '柔和青', textToneGreen: '柔和绿', textToneGray: '柔和灰',
+      textToneCyan: '柔和青', textToneGreen: '柔和绿', textToneGray: '柔和灰', textToneWhite: '暖白·仅字色',
       textAlignLeft: '左对齐', textAlignCenter: '居中', textAlignRight: '右对齐',
       textBindToggle: '绑定到所选节点 / 解除跟随', textConvertMindmap: '将文本框转为所选节点的导图子节点',
       canvasSettings: '画布设置', panSpeed: '方向键平移速度', panInertia: '拖拽惯性',
@@ -149,6 +149,7 @@
       sketchEllipse: '手绘椭圆', insertImage: '插入本地图片',
       insertAttachment: '插入 PDF / Markdown 附件', groupPresets: '盒子 / 分组预设',
       globalDefault: '全局默认', classicBranches: '经典枝桠', academicCurves: '学术曲线',
+      focusedCenter: '中心聚焦', roundedBranches: '圆角树枝',
       softOrganic: '柔彩自然', monoLines: '黑白直线', tieredTitles: '层级标题',
       blueprintS: '蓝图 S 线', highContrastElbow: '高对比折线', editorialArcs: '杂志弧线',
       nodeContent: '节点内容', contentHint: '选中一个节点后可编辑正文',
@@ -238,7 +239,7 @@
       textColorOrange: 'Orange text', textColorPurple: 'Purple text',
       textColorRailAria: 'Soft colors', textToneYellow: 'Soft yellow', textToneOrange: 'Soft orange',
       textToneRed: 'Soft red', textTonePurple: 'Soft purple', textToneBlue: 'Soft blue',
-      textToneCyan: 'Soft cyan', textToneGreen: 'Soft green', textToneGray: 'Soft gray',
+      textToneCyan: 'Soft cyan', textToneGreen: 'Soft green', textToneGray: 'Soft gray', textToneWhite: 'Warm white · text only',
       textAlignLeft: 'Align left', textAlignCenter: 'Center', textAlignRight: 'Align right',
       textBindToggle: 'Bind to selected node / stop following', textConvertMindmap: 'Convert text box to child of selected node',
       canvasSettings: 'Canvas Settings', panSpeed: 'Arrow-key pan speed', panInertia: 'Drag momentum',
@@ -269,6 +270,7 @@
       sketchEllipse: 'Sketch Ellipse', insertImage: 'Insert Local Image',
       insertAttachment: 'Insert PDF / Markdown', groupPresets: 'Box / Group Presets',
       globalDefault: 'Global Default', classicBranches: 'Classic Branches', academicCurves: 'Academic Curves',
+      focusedCenter: 'Focused Center', roundedBranches: 'Rounded Branches',
       softOrganic: 'Soft Organic', monoLines: 'Monochrome Lines', tieredTitles: 'Tiered Titles',
       blueprintS: 'Blueprint S', highContrastElbow: 'High-Contrast Elbow', editorialArcs: 'Editorial Arcs',
       nodeContent: 'Node Content', contentHint: 'Select a node to edit its body',
@@ -1045,6 +1047,11 @@
   (function setupMindmapModePanel() {
     if (!mindmapPanel) return;
     const presetBtns = mindmapPanel.querySelectorAll('[data-mm-preset]');
+    const presetPreview = mindmapPanel.querySelector('[data-role="mindmap-preset-preview"]');
+    const previewHierarchy = mindmapPanel.querySelector('[data-role="mindmap-preview-hierarchy"]');
+    const previewLines = mindmapPanel.querySelector('[data-role="mindmap-preview-lines"]');
+    const previewNodes = presetPreview ? presetPreview.querySelectorAll('[data-mm-preview-node]') : [];
+    const previewEdges = presetPreview ? presetPreview.querySelectorAll('[data-mm-preview-edge]') : [];
     const layoutBtns = mindmapPanel.querySelectorAll('[data-mm-layout]');
     const densityBtns = mindmapPanel.querySelectorAll('[data-mm-density]');
     const selectionState = mindmapPanel.querySelector('[data-role="mindmap-selection-state"]');
@@ -1081,7 +1088,7 @@
       balanced: { levelGap: 92, branchGap: 32, radialGap: 220 },
       relaxed: { levelGap: 122, branchGap: 46, radialGap: 270 },
     };
-    const presetIds = new Set(['paper', 'scholar', 'journal', 'ink', 'forest', 'blueprint', 'classroom', 'editorial']);
+    const presetIds = new Set(['paper', 'focus', 'rounded', 'scholar', 'journal', 'ink', 'forest', 'blueprint', 'classroom', 'editorial']);
     const clamp = (n, min, max, fallback) => Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : fallback;
     const finiteSize = (value) => {
       if (value == null || value === '') return null;
@@ -1109,6 +1116,172 @@
     let sizePreviewRaf = null;
     let sizeReflowTimer = null;
     let lastColorState = { mode: 'none', count: 0, matchable: 0 };
+    const previewCurveNames = {
+      'zh-CN': {
+        bezier: '曲线', straight: '直线', elbow: '折线', 'rounded-elbow': '圆角折线',
+        's-curve': 'S 曲线', smooth: '平滑曲线', branch: '树枝曲线', arc: '弧线', organic: '自然曲线',
+      },
+      en: {
+        bezier: 'Curve', straight: 'Straight', elbow: 'Elbow', 'rounded-elbow': 'Rounded elbow',
+        's-curve': 'S curve', smooth: 'Smooth curve', branch: 'Branch curve', arc: 'Arc', organic: 'Organic curve',
+      },
+    };
+    const previewLineNames = {
+      'zh-CN': { solid: '实线', dashed: '虚线', dotted: '点线', soft: '柔线', glow: '荧光' },
+      en: { solid: 'Solid', dashed: 'Dashed', dotted: 'Dotted', soft: 'Soft', glow: 'Glow' },
+    };
+    const previewEdgePath = (curve, start, end, cornerRadius) => {
+      const x1 = start.x;
+      const y1 = start.y;
+      const x2 = end.x;
+      const y2 = end.y;
+      const dx = Math.max(1, x2 - x1);
+      const dy = y2 - y1;
+      const mid = x1 + dx * 0.5;
+      if (curve === 'straight') return `M${x1} ${y1} L${x2} ${y2}`;
+      if (curve === 'elbow') return `M${x1} ${y1} H${mid} V${y2} H${x2}`;
+      if (curve === 'rounded-elbow') {
+        if (Math.abs(dy) < 0.5) return `M${x1} ${y1} H${x2}`;
+        const direction = dy > 0 ? 1 : -1;
+        const scaledRadius = clamp((Number(cornerRadius) || 18) * 0.45, 2, 14, 8);
+        const radius = Math.min(scaledRadius, Math.abs(dy) / 2, dx * 0.32);
+        return `M${x1} ${y1} H${mid - radius} Q${mid} ${y1} ${mid} ${y1 + direction * radius}`
+          + ` V${y2 - direction * radius} Q${mid} ${y2} ${mid + radius} ${y2} H${x2}`;
+      }
+      if (curve === 'arc') {
+        const lift = dy > 0 ? -Math.min(13, Math.abs(dy) * 0.35 + 5) : Math.min(13, Math.abs(dy) * 0.35 + 5);
+        return `M${x1} ${y1} Q${mid} ${((y1 + y2) / 2) + lift} ${x2} ${y2}`;
+      }
+      if (curve === 's-curve') {
+        return `M${x1} ${y1} C${x1 + dx * 0.28} ${y1 - dy * 0.18} ${x1 + dx * 0.70} ${y2 + dy * 0.18} ${x2} ${y2}`;
+      }
+      if (curve === 'organic') {
+        return `M${x1} ${y1} C${x1 + dx * 0.25} ${y1 + dy * 0.05} ${x1 + dx * 0.58} ${y2 - dy * 0.22} ${x2} ${y2}`;
+      }
+      if (curve === 'smooth') {
+        return `M${x1} ${y1} C${x1 + dx * 0.34} ${y1} ${x1 + dx * 0.66} ${y2} ${x2} ${y2}`;
+      }
+      const firstControl = curve === 'branch' ? 0.44 : 0.36;
+      return `M${x1} ${y1} C${x1 + dx * firstControl} ${y1} ${x1 + dx * 0.58} ${y2} ${x2} ${y2}`;
+    };
+    const renderPresetPreview = () => {
+      if (!presetPreview) return;
+      const api = window.CanvasModule;
+      if (!api || typeof api.getMindmapPresetPreview !== 'function') return;
+      const model = api.getMindmapPresetPreview(preset);
+      if (!model) return;
+      const branchEdge = Object.assign({}, model.branchEdge || {});
+      const leafEdge = Object.assign({}, model.leafEdge || {});
+      if (curveOverride !== 'preset') {
+        [branchEdge, leafEdge].forEach((edge) => {
+          const preservedRadius = edge.curve === 'rounded-elbow' ? edge.cornerRadius : null;
+          edge.curve = curveOverride;
+          edge.cornerRadius = curveOverride === 'rounded-elbow' ? (preservedRadius || 18) : null;
+        });
+      }
+      if (lineStyleOverride !== 'preset') {
+        branchEdge.lineStyle = lineStyleOverride;
+        leafEdge.lineStyle = lineStyleOverride;
+      }
+      const centerWidth = 72 * clamp(centerSize / defaultNodeSizes.center, 0.78, 1.24, 1);
+      const branchWidth = 80 * clamp(branchSize / defaultNodeSizes.branch, 0.78, 1.24, 1);
+      const leafWidth = 58 * clamp(leafSize / defaultNodeSizes.leaf, 0.78, 1.24, 1);
+      const boxes = {
+        center: { x: 87 - centerWidth, y: 42, width: centerWidth, height: 26 },
+        'branch-top': { x: 132, y: 19, width: branchWidth, height: 22 },
+        'branch-bottom': { x: 132, y: 69, width: branchWidth, height: 22 },
+        'leaf-top': { x: 270, y: 5, width: leafWidth, height: 19 },
+        'leaf-bottom': { x: 270, y: 86, width: leafWidth, height: 19 },
+      };
+      const levels = { center: model.center, branch: model.branch, leaf: model.leaf };
+      const levelLabels = toolbarLanguage === 'en'
+        ? { center: 'Center', branch: 'Level 1', leaf: 'Level 2' }
+        : { center: '中心', branch: '一级', leaf: '二级' };
+      previewNodes.forEach((group) => {
+        const levelName = group.dataset.mmPreviewNode;
+        const level = levels[levelName];
+        const box = boxes[group.dataset.mmPreviewSlot];
+        const rect = group.querySelector('rect');
+        const label = group.querySelector('text');
+        if (!level || !box || !rect || !label) return;
+        const radius = Math.min(box.height / 2, Math.max(1.5, Number(level.radius || 0) * 0.72));
+        rect.setAttribute('x', String(box.x));
+        rect.setAttribute('y', String(box.y));
+        rect.setAttribute('width', String(box.width));
+        rect.setAttribute('height', String(box.height));
+        rect.setAttribute('rx', String(radius));
+        rect.setAttribute('fill', level.hideChrome ? 'transparent' : level.bgColor);
+        rect.setAttribute('stroke', level.hideChrome ? 'transparent' : level.borderColor);
+        rect.setAttribute('fill-opacity', level.hideChrome ? '0' : String(level.opacity));
+        rect.setAttribute('stroke-opacity', level.hideChrome ? '0' : '1');
+        label.setAttribute('x', String(box.x + box.width / 2));
+        label.setAttribute('y', String(box.y + box.height / 2));
+        if (level.hideChrome) label.style.removeProperty('fill');
+        else label.style.fill = level.textColor;
+        label.textContent = levelLabels[levelName];
+        group.dataset.transparent = level.hideChrome ? '1' : '0';
+      });
+      const points = {
+        centerRight: { x: boxes.center.x + boxes.center.width, y: boxes.center.y + boxes.center.height / 2 },
+        branchTopLeft: { x: boxes['branch-top'].x, y: boxes['branch-top'].y + boxes['branch-top'].height / 2 },
+        branchTopRight: { x: boxes['branch-top'].x + boxes['branch-top'].width, y: boxes['branch-top'].y + boxes['branch-top'].height / 2 },
+        branchBottomLeft: { x: boxes['branch-bottom'].x, y: boxes['branch-bottom'].y + boxes['branch-bottom'].height / 2 },
+        branchBottomRight: { x: boxes['branch-bottom'].x + boxes['branch-bottom'].width, y: boxes['branch-bottom'].y + boxes['branch-bottom'].height / 2 },
+        leafTopLeft: { x: boxes['leaf-top'].x, y: boxes['leaf-top'].y + boxes['leaf-top'].height / 2 },
+        leafBottomLeft: { x: boxes['leaf-bottom'].x, y: boxes['leaf-bottom'].y + boxes['leaf-bottom'].height / 2 },
+      };
+      const edgeGeometry = {
+        'branch-top': [branchEdge, points.centerRight, points.branchTopLeft],
+        'branch-bottom': [branchEdge, points.centerRight, points.branchBottomLeft],
+        'leaf-top': [leafEdge, points.branchTopRight, points.leafTopLeft],
+        'leaf-bottom': [leafEdge, points.branchBottomRight, points.leafBottomLeft],
+      };
+      previewEdges.forEach((path) => {
+        const geometry = edgeGeometry[path.dataset.mmPreviewEdge];
+        if (!geometry) return;
+        const edge = geometry[0];
+        const lineStyle = edge.lineStyle || 'solid';
+        const baseWidth = clamp(Number(edge.width) * 0.92, 1.15, 3.4, 1.8);
+        path.setAttribute('d', previewEdgePath(edge.curve, geometry[1], geometry[2], edge.cornerRadius));
+        path.setAttribute('stroke', edge.color || '#5a9eab');
+        path.setAttribute('stroke-width', String(lineStyle === 'glow' ? baseWidth + 0.9 : baseWidth));
+        path.setAttribute('stroke-opacity', lineStyle === 'soft' ? '0.55' : (lineStyle === 'glow' ? '0.92' : '0.82'));
+        path.setAttribute('stroke-dasharray', lineStyle === 'dashed' ? '7 5' : (lineStyle === 'dotted' ? '1 5' : 'none'));
+      });
+      const nodeTone = (level) => {
+        if (toolbarLanguage === 'en') {
+          if (level.hideChrome) return 'transparent';
+          return level.tone === 'dark' ? 'dark' : 'light';
+        }
+        if (level.hideChrome) return '透明';
+        return level.tone === 'dark' ? '深色' : '浅色';
+      };
+      const hierarchyCopy = toolbarLanguage === 'en'
+        ? `Center ${nodeTone(model.center)} · Level 1 ${nodeTone(model.branch)} · Level 2 ${nodeTone(model.leaf)}`
+        : `中心${nodeTone(model.center)} · 一级${nodeTone(model.branch)} · 二级${nodeTone(model.leaf)}`;
+      const curveNames = previewCurveNames[toolbarLanguage] || previewCurveNames['zh-CN'];
+      const lineNames = previewLineNames[toolbarLanguage] || previewLineNames['zh-CN'];
+      const edgeCopy = (edge) => {
+        const radius = edge.curve === 'rounded-elbow' ? ` ${Math.round(Number(edge.cornerRadius) || 18)}px` : '';
+        return `${curveNames[edge.curve] || edge.curve}${radius} · ${lineNames[edge.lineStyle] || edge.lineStyle}`;
+      };
+      const branchCopy = edgeCopy(branchEdge);
+      const leafCopy = edgeCopy(leafEdge);
+      const linesCopy = branchCopy === leafCopy
+        ? (toolbarLanguage === 'en' ? `Lines: ${branchCopy}` : `连线：${branchCopy}`)
+        : (toolbarLanguage === 'en'
+          ? `Lines: Level 1 ${branchCopy}; Level 2 ${leafCopy}`
+          : `连线：一级 ${branchCopy}；二级 ${leafCopy}`);
+      if (previewHierarchy) previewHierarchy.textContent = hierarchyCopy;
+      if (previewLines) previewLines.textContent = linesCopy;
+      presetPreview.dataset.preset = model.id;
+      presetPreview.dataset.branchCurve = branchEdge.curve;
+      presetPreview.dataset.leafCurve = leafEdge.curve;
+      presetPreview.dataset.branchCornerRadius = branchEdge.cornerRadius == null ? '' : String(branchEdge.cornerRadius);
+      presetPreview.dataset.leafCornerRadius = leafEdge.cornerRadius == null ? '' : String(leafEdge.cornerRadius);
+      presetPreview.dataset.leafTransparent = model.leaf.hideChrome ? '1' : '0';
+      presetPreview.setAttribute('aria-label', `${hierarchyCopy}. ${linesCopy}`);
+    };
     const detectDensity = () => {
       const hit = Object.keys(densityValues).find((key) => {
         const v = densityValues[key];
@@ -1348,6 +1521,7 @@
       document.body.dataset.mindmapBranchSize = String(branchSize);
       document.body.dataset.mindmapLeafSize = String(leafSize);
       document.body.dataset.mindmapNodeSize = String(branchSize);
+      renderPresetPreview();
     };
     presetBtns.forEach((card) => {
       const selectCard = () => {
@@ -1500,6 +1674,8 @@
     document.addEventListener('canvas:mindmap-size-state', (event) => {
       renderSizeState(event && event.detail ? event.detail : null);
     });
+    document.addEventListener('editor:canvasready', renderPresetPreview);
+    document.addEventListener('editor:languagechange', renderPresetPreview);
     document.addEventListener('editor:selectionchange', (event) => {
       if (selectionStatusTimer) {
         window.clearTimeout(selectionStatusTimer);
@@ -4220,6 +4396,7 @@
           onViewportChange: queueViewportSave,
           onChange: markDirty,
         });
+        document.dispatchEvent(new CustomEvent('editor:canvasready'));
         if (LOCATE_NODE && typeof window.CanvasModule.revealNode === 'function') {
           window.setTimeout(() => {
             try { window.CanvasModule.revealNode(LOCATE_NODE); } catch (e) {}

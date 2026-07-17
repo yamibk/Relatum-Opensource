@@ -6,7 +6,8 @@
 (function (global) {
   'use strict';
 
-  const COLORS = new Set(['yellow', 'orange', 'red', 'purple', 'blue', 'cyan', 'green', 'gray']);
+  const TEXT_COLORS = new Set(['yellow', 'orange', 'red', 'purple', 'blue', 'cyan', 'green', 'gray', 'white']);
+  const HIGHLIGHT_COLORS = new Set(['yellow', 'orange', 'red', 'purple', 'blue', 'cyan', 'green', 'gray']);
   const SIZES = new Set(['sm', 'lg', 'xl']);
   const STYLE_KEYS = ['size', 'color', 'highlight', 'bold'];
 
@@ -14,8 +15,8 @@
     const out = {};
     if (!raw || typeof raw !== 'object') return out;
     if (SIZES.has(raw.size)) out.size = raw.size;
-    if (COLORS.has(raw.color)) out.color = raw.color;
-    if (COLORS.has(raw.highlight)) out.highlight = raw.highlight;
+    if (TEXT_COLORS.has(raw.color)) out.color = raw.color;
+    if (HIGHLIGHT_COLORS.has(raw.highlight)) out.highlight = raw.highlight;
     if (raw.bold === true) out.bold = true;
     return out;
   }
@@ -245,10 +246,11 @@
       }
 
       const custom = input[i] === '{'
-        ? /^\{(hl|tc|fs):(yellow|orange|red|purple|blue|cyan|green|gray|sm|lg|xl)\|/.exec(input.slice(i))
+        ? /^\{(hl|tc|fs):(yellow|orange|red|purple|blue|cyan|green|gray|white|sm|lg|xl)\|/.exec(input.slice(i))
         : null;
       if (custom) {
-        const valid = custom[1] === 'fs' ? SIZES.has(custom[2]) : COLORS.has(custom[2]);
+        const valid = custom[1] === 'fs' ? SIZES.has(custom[2])
+          : (custom[1] === 'hl' ? HIGHLIGHT_COLORS.has(custom[2]) : TEXT_COLORS.has(custom[2]));
         const close = valid ? matchingBrace(input, i) : -1;
         if (close > i + custom[0].length) {
           const inner = parseLegacyInline(input.slice(i + custom[0].length, close));
@@ -432,7 +434,8 @@
   }
 
   global.RelatumRichText = {
-    COLORS: Array.from(COLORS),
+    COLORS: Array.from(TEXT_COLORS),
+    HIGHLIGHTS: Array.from(HIGHLIGHT_COLORS),
     SIZES: Array.from(SIZES),
     normalize: normalize,
     apply: apply,

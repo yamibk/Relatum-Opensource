@@ -1140,14 +1140,41 @@
       </button>
     </div>
     <div class="side-panel-body">
-      <div class="mindmap-panel-preview" aria-hidden="true">
-        <span class="mmp-node mmp-node-center"></span>
-        <span class="mmp-node mmp-node-a"></span>
-        <span class="mmp-node mmp-node-b"></span>
-        <span class="mmp-node mmp-node-c"></span>
-        <span class="mmp-branch mmp-branch-a"></span>
-        <span class="mmp-branch mmp-branch-b"></span>
-        <span class="mmp-branch mmp-branch-c"></span>
+      <div class="mindmap-panel-preview" data-role="mindmap-preset-preview" data-preset="paper"
+           data-branch-curve="branch" data-leaf-curve="branch" data-leaf-transparent="0"
+           role="img" aria-label="当前思维导图预设的三层效果预览">
+        <svg class="mmp-preview-svg" viewBox="0 0 340 110" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+          <g class="mmp-preview-edges">
+            <path data-mm-preview-edge="branch-top" d="M87 55 C105 55 112 30 132 30"></path>
+            <path data-mm-preview-edge="branch-bottom" d="M87 55 C105 55 112 80 132 80"></path>
+            <path data-mm-preview-edge="leaf-top" d="M212 30 C234 30 246 14.5 270 14.5"></path>
+            <path data-mm-preview-edge="leaf-bottom" d="M212 80 C234 80 246 95.5 270 95.5"></path>
+          </g>
+          <g class="mmp-preview-node" data-mm-preview-node="center" data-mm-preview-slot="center">
+            <rect x="15" y="42" width="72" height="26" rx="5" fill="#f8fbfa" stroke="#305b62"></rect>
+            <text x="51" y="55">中心</text>
+          </g>
+          <g class="mmp-preview-node" data-mm-preview-node="branch" data-mm-preview-slot="branch-top">
+            <rect x="132" y="19" width="80" height="22" rx="5" fill="#e8f1f2" stroke="#5a9eab"></rect>
+            <text x="172" y="30">一级</text>
+          </g>
+          <g class="mmp-preview-node" data-mm-preview-node="branch" data-mm-preview-slot="branch-bottom">
+            <rect x="132" y="69" width="80" height="22" rx="5" fill="#e8f1f2" stroke="#5a9eab"></rect>
+            <text x="172" y="80">一级</text>
+          </g>
+          <g class="mmp-preview-node" data-mm-preview-node="leaf" data-mm-preview-slot="leaf-top">
+            <rect x="270" y="5" width="58" height="19" rx="4" fill="#f1f6f7" stroke="#5a9eab"></rect>
+            <text x="299" y="14.5">二级</text>
+          </g>
+          <g class="mmp-preview-node" data-mm-preview-node="leaf" data-mm-preview-slot="leaf-bottom">
+            <rect x="270" y="86" width="58" height="19" rx="4" fill="#f1f6f7" stroke="#5a9eab"></rect>
+            <text x="299" y="95.5">二级</text>
+          </g>
+        </svg>
+      </div>
+      <div class="mindmap-preview-readout" data-role="mindmap-preview-readout">
+        <span data-role="mindmap-preview-hierarchy">中心浅色 · 一级浅色 · 二级浅色</span>
+        <span data-role="mindmap-preview-lines">连线：树枝曲线 · 实线</span>
       </div>
       <div class="sp-subhead" data-editor-i18n="presets">预设</div>
       <div class="mindmap-preset-grid" data-role="mindmap-presets">
@@ -1156,6 +1183,18 @@
           <button type="button" class="mindmap-preset-apply" data-mm-preset-apply aria-label="应用经典枝桠并整理" title="应用并整理">✓</button>
           <svg viewBox="0 0 80 16" aria-hidden="true"><path d="M2 12 C26 12 29 4 46 4 C62 4 66 11 78 11"/></svg>
           <i style="--c:#5a9eab"></i><i style="--c:#d0ad4e"></i><i style="--c:#b66c82"></i>
+        </div>
+        <div class="mindmap-preset-card" data-mm-preset="focus" role="button" tabindex="0" title="中心聚焦：深色中心、浅色一级与透明叶节点">
+          <span class="mindmap-preset-name" data-editor-i18n="focusedCenter">中心聚焦</span>
+          <button type="button" class="mindmap-preset-apply" data-mm-preset-apply aria-label="应用中心聚焦并整理" title="应用并整理">✓</button>
+          <svg viewBox="0 0 80 16" aria-hidden="true"><path d="M2 12 H30 Q38 12 38 5 V4 H78"/></svg>
+          <i style="--c:#124d67"></i><i style="--c:#dfe8ea"></i><i class="preset-transparent" style="--c:#5d8792"></i>
+        </div>
+        <div class="mindmap-preset-card" data-mm-preset="rounded" role="button" tabindex="0" title="圆角树枝：柔和卡片与连续圆角转折">
+          <span class="mindmap-preset-name" data-editor-i18n="roundedBranches">圆角树枝</span>
+          <button type="button" class="mindmap-preset-apply" data-mm-preset-apply aria-label="应用圆角树枝并整理" title="应用并整理">✓</button>
+          <svg viewBox="0 0 80 16" aria-hidden="true"><path d="M2 13 H25 Q38 13 38 5 Q38 3 43 3 H78"/></svg>
+          <i style="--c:#527b73"></i><i style="--c:#b17e4d"></i><i style="--c:#7c6d97"></i>
         </div>
         <div class="mindmap-preset-card" data-mm-preset="scholar" role="button" tabindex="0" title="学术曲线：低饱和配色与规整贝塞尔曲线">
           <span class="mindmap-preset-name" data-editor-i18n="academicCurves">学术曲线</span>
@@ -1896,6 +1935,8 @@
         <button type="button" class="td-swatch" data-text-tone="c" data-color="cyan" data-editor-i18n-title="textToneCyan" title="柔和青"></button>
         <button type="button" class="td-swatch" data-text-tone="g" data-color="green" data-editor-i18n-title="textToneGreen" title="柔和绿"></button>
         <button type="button" class="td-swatch" data-text-tone="k" data-color="gray" data-editor-i18n-title="textToneGray" title="柔和灰"></button>
+        <button type="button" class="td-swatch td-swatch-color-only" data-text-tone="w" data-color="white"
+                data-text-color-only="1" data-editor-i18n-title="textToneWhite" title="暖白·仅字色"></button>
       </div>
       <span class="text-dock-sep" aria-hidden="true"></span>
       <div class="text-dock-inline-group text-dock-size-group" role="group"

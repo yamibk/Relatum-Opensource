@@ -54,6 +54,7 @@
   let panelFiles = [];       // 右栏当前显示的文件（= filesOf(activeGroup)）
   let selectedIndex = -1;    // 右栏键盘选中项下标（-1=未选）
   let pendingDeleteIndex = -1; // 右方向键：待确认删除（再按一次右键执行）
+  const trashingPaths = new Set(); // 防止右键菜单与键盘对同一画布重复提交
   let studyActive = false;
   let cadenceActive = false;   // 活跃热力图前置页（在学习页更左一格）是否展开
   let notesActive = false;     // 速记便签墙前置页（在活跃页更左一格）是否展开
@@ -374,7 +375,7 @@
       ['速记创建与关联', '无需寻找按钮，鼠标位置和当前便签就是新内容的落点。新建后会直接进入输入。', [['<kbd>N</kbd>', '在鼠标位置新建便签；鼠标不在墙面时在视野中央新建。'], ['<kbd>Enter</kbd>', '在当前便签右侧续写一张便签。'], ['<kbd>Shift</kbd> + <kbd>Enter</kbd>', '在当前便签下方续写。'], ['<kbd>Tab</kbd>', '在右侧新建便签并自动连接当前便签。'], ['<kbd>Shift</kbd> + <kbd>Tab</kbd>', '在下方新建便签并自动连接。']]],
       ['速记墙视野', '速记墙可以像画布一样平移、缩放和惯性滑行。左上角齿轮里的「速记惯性」同时控制便签拖动与整面墙拖动的滑行强度。', [['空白处滚轮', '平滑移动整面速记墙。'], ['<kbd>Ctrl</kbd> + 滚轮', '以鼠标所在位置为中心缩放。'], ['<kbd>Shift</kbd> + 滚轮', '横向移动视野。'], ['<kbd>Space</kbd> + 拖动空白处', '抓住整面墙平移，松手后按惯性滑行。'], ['<kbd>↑</kbd> / <kbd>↓</kbd> / <kbd>←</kbd> / <kbd>→</kbd>', '移动视野；按住 <kbd>Shift</kbd> 会更快。'], ['<kbd>0</kbd>', '缩放到可以总览全部便签。'], ['<kbd>F</kbd>', '聚焦当前便签。'], ['再次点击「速记」图标', '回到默认缩放与位置。']]],
       ['速记搜索与键盘整理', '鼠标悬停、最近操作或键盘轮廓所指的便签会成为当前便签。搜索和浏览都不显示工具栏。', [['<kbd>/</kbd>', '进入搜索并直接输入关键词；左侧速记图标会亮起黄色呼吸光圈。'], ['搜索中 <kbd>Enter</kbd> / <kbd>Shift</kbd> + <kbd>Enter</kbd>', '跳到下一条 / 上一条匹配结果。'], ['搜索中 <kbd>Esc</kbd>', '退出搜索并恢复全部便签。'], ['<kbd>J</kbd> / <kbd>K</kbd>', '切换下一张 / 上一张便签；屏幕外的便签会自动进入视野。'], ['<kbd>Esc</kbd>', '取消当前便签的键盘轮廓。'], ['<kbd>C</kbd>', '切换当前便签颜色。'], ['<kbd>R</kbd> / <kbd>Shift</kbd> + <kbd>R</kbd>', '随机轻旋 / 摆正当前便签。'], ['<kbd>D</kbd>', '复制当前便签。'], ['<kbd>Ctrl</kbd> + <kbd>Z</kbd> / <kbd>Y</kbd>', '撤销 / 重做速记墙操作。']]],
-      ['分组与文件整理', '画布卡片不仅可以打开，也可以像桌面文件一样整理。', [['拖动画布卡片到圆点', '把文件归入对应分组。'], ['拖到另一张卡片附近', '调整当前分组里的文件顺序。'], ['右键画布卡片', '重命名、在资源管理器中查看、移动到分组或移除。'], ['右键分组圆点', '重命名或删除分组；删除分组不会删除画布文件。'], ['左侧回收站', '恢复误删画布，或手动清空回收站。']]],
+      ['分组与文件整理', '画布卡片不仅可以打开，也可以像桌面文件一样整理。', [['拖动画布卡片到圆点', '把文件归入对应分组。'], ['拖到另一张卡片附近', '调整当前分组里的文件顺序。'], ['右键画布卡片', '重命名、在资源管理器中查看、移动到分组、移到回收站或从列表移除。'], ['右键分组圆点', '重命名或删除分组；删除分组不会删除画布文件。'], ['左侧回收站', '恢复误删画布，或手动清空回收站。']]],
       ['键盘整理', '先按方向键选中一张画布，再继续操作。', [['<kbd>↑</kbd> / <kbd>↓</kbd>', '选择上一张 / 下一张画布。'], ['<kbd>Shift</kbd> + <kbd>↑</kbd> / <kbd>↓</kbd>', '把选中的画布向上 / 向下调整顺序。'], ['<kbd>Enter</kbd>', '打开选中的画布。'], ['<kbd>1</kbd>–<kbd>9</kbd>', '移到第 1–9 个自定义分组。'], ['<kbd>0</kbd> 或 <kbd>Backspace</kbd>', '移回「最近」。'], ['<kbd>→</kbd> 再按一次 <kbd>→</kbd>', '二次确认后移到回收站。'], ['<kbd>←</kbd> 或 <kbd>Esc</kbd>', '取消待删除状态。']]],
       ['客户端设置', '起始页右下角齿轮用于设置桌面客户端从最大化恢复后的窗口尺寸。可以选择紧凑、均衡、宽敞，也可以填写自定义宽高。设置会按当前显示器可用区域自动约束。'],
     ]},
@@ -1798,33 +1799,13 @@
     if (li) li.classList.remove('pending-delete');
     pendingDeleteIndex = -1;
   }
-  function confirmDelete() {
+  async function confirmDelete() {
     const idx = pendingDeleteIndex;
     pendingDeleteIndex = -1;
     const f = panelFiles[idx];
     if (!f) return;
     const li = activeItems()[idx];
-    // 即时：乐观更新数据 + 播飞出动画（不等动画完成）
-    lastFiles = lastFiles.filter((x) => x.path !== f.path);
-    panelFiles.splice(idx, 1);
-    animateOut(li);
-    renderDots();                  // 圆点计数即时更新（不动右栏）
-    showToast('已移到回收站');
-    fetch('/api/trash', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: f.path }),
-    }).then((r) => { if (!r.ok) refresh(); }).catch(() => refresh());
-    // 高亮落到下一个，并自动武装 → 连续按右键可连续删
-    selectedIndex = Math.min(idx, panelFiles.length - 1);
-    refreshSelectionHighlight();
-    if (selectedIndex >= 0) {
-      pendingDeleteIndex = selectedIndex;
-      const next = activeItems()[selectedIndex];
-      if (next) next.classList.add('pending-delete');
-    } else {
-      setTimeout(() => { if (panelFiles.length === 0) renderPanel(); }, 280);
-    }
+    await trashCanvas(f, li, true);
   }
   // 3d：顶部轻提示（淡入，~1.2s 后淡出）
   let toastTimer = null;
@@ -2036,6 +2017,12 @@
     li.addEventListener('contextmenu', (e) => {
       e.preventDefault();
       e.stopPropagation();
+      cancelPendingDelete();
+      const index = panelFiles.findIndex((item) => item.path === f.path);
+      if (index >= 0) {
+        selectedIndex = index;
+        refreshSelectionHighlight();
+      }
       openFileMenu(e.clientX, e.clientY, f, li);
     });
 
@@ -2281,6 +2268,47 @@
     } catch (err) { console.warn('[画布] 移除失败', err); }
   }
 
+  async function trashCanvas(f, li, armNext) {
+    if (!f || !f.path || trashingPaths.has(f.path)) return false;
+    trashingPaths.add(f.path);
+    try {
+      const resp = await fetch('/api/trash', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: f.path }),
+      });
+      let json = {};
+      try { json = await resp.json(); } catch (err) {}
+      if (!resp.ok) throw new Error(json.error || '移到回收站失败');
+
+      const idx = panelFiles.findIndex((item) => item.path === f.path);
+      const currentLi = Array.from(activeItems()).find((item) => item.dataset.path === f.path) || li;
+      lastFiles = lastFiles.filter((item) => item.path !== f.path);
+      if (idx >= 0) panelFiles.splice(idx, 1);
+      animateOut(currentLi);
+      renderDots();
+      showToast(json.missing ? '文件已不存在，已从列表移除' : '已移到回收站');
+
+      if (idx >= 0) selectedIndex = Math.min(idx, panelFiles.length - 1);
+      else if (selectedIndex >= panelFiles.length) selectedIndex = panelFiles.length - 1;
+      refreshSelectionHighlight();
+      if (armNext && selectedIndex >= 0) {
+        pendingDeleteIndex = selectedIndex;
+        const next = activeItems()[selectedIndex];
+        if (next) next.classList.add('pending-delete');
+      } else if (panelFiles.length === 0) {
+        setTimeout(() => { if (panelFiles.length === 0) renderPanel(); }, 280);
+      }
+      return true;
+    } catch (err) {
+      showToast(err && err.message ? err.message : '移到回收站失败');
+      await refresh();
+      return false;
+    } finally {
+      trashingPaths.delete(f.path);
+    }
+  }
+
   function revealPath(path) {
     fetch('/api/reveal', {
       method: 'POST',
@@ -2353,6 +2381,8 @@
       d.textContent = '（还没有分组，先在左栏新建一个）';
       ctxMenu.appendChild(d);
     }
+    addMenuSep();
+    addMenuItem('移到回收站', () => trashCanvas(f, li, false), true);
     showMenuAt(x, y);
   }
 

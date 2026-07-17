@@ -50,7 +50,7 @@
       s = s.replace(/\{fs:(sm|lg|xl)\|([^{}\n]+?)\}/g, function (_, size, txt) {
         return '<span class="md-size" data-fs="' + size + '">' + txt + '</span>';
       });
-      s = s.replace(/\{tc:(yellow|orange|red|purple|blue|cyan|green|gray)\|([^{}\n]+?)\}/g, function (_, color, txt) {
+      s = s.replace(/\{tc:(yellow|orange|red|purple|blue|cyan|green|gray|white)\|([^{}\n]+?)\}/g, function (_, color, txt) {
         return '<span class="md-color" data-tc="' + color + '">' + txt + '</span>';
       });
       s = s.replace(/\{hl:(yellow|orange|red|purple|blue|cyan|green|gray)\|([^{}\n]+?)\}/g, function (_, color, txt) {
@@ -515,7 +515,7 @@
   }
 
   function collectStyledTags(line, base, out) {
-    const re = /\{(?:hl:(?:yellow|orange|red|purple|blue|cyan|green|gray)|tc:(?:yellow|orange|red|purple|blue|cyan|green|gray)|fs:(?:sm|lg|xl))\|/g;
+    const re = /\{(?:hl:(?:yellow|orange|red|purple|blue|cyan|green|gray)|tc:(?:yellow|orange|red|purple|blue|cyan|green|gray|white)|fs:(?:sm|lg|xl))\|/g;
     let m;
     while ((m = re.exec(line)) !== null) {
       let depth = 1;
