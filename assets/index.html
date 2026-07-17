@@ -465,10 +465,22 @@
         <div class="study-dialog review-card-dialog" data-role="review-card-dialog" hidden>
           <button type="button" class="study-dialog-backdrop" data-action="review-dialog-close" aria-label="关闭"></button>
           <form class="study-dialog-card" data-role="review-card-form">
-            <header class="study-dialog-head">
+            <header class="study-dialog-head review-card-dialog-head">
               <div>
                 <p class="study-eyebrow">REVIEW CARD</p>
                 <h2 data-role="review-dialog-title">新建卡片</h2>
+              </div>
+              <div class="review-card-deck-picker" data-role="review-card-deck-picker">
+                <label class="review-card-deck-combobox" for="review-card-deck-name">
+                  <span>卡组</span>
+                  <input id="review-card-deck-name" name="deckName" type="text" maxlength="80"
+                    placeholder="未分类 / 输入卡组" autocomplete="off" role="combobox"
+                    aria-label="卡组（可选）" aria-autocomplete="list" aria-expanded="false"
+                    aria-controls="review-card-deck-options">
+                  <small data-role="review-card-deck-state" hidden></small>
+                </label>
+                <div class="review-card-deck-options" id="review-card-deck-options"
+                  data-role="review-card-deck-options" role="listbox" hidden></div>
               </div>
               <button type="button" class="study-icon-button" data-action="review-dialog-close" aria-label="关闭">×</button>
             </header>
@@ -489,12 +501,6 @@
                   <textarea name="notes" rows="4" maxlength="100000" placeholder="背景、线索或延伸阅读"></textarea>
                 </label>
                 <div class="review-card-organize">
-                  <label class="study-field">
-                    <span>卡组</span>
-                    <select name="deckId" data-role="review-card-deck-select">
-                      <option value="">未分类</option>
-                    </select>
-                  </label>
                   <label class="study-field">
                     <span>标签 <small>最多 12 个</small></span>
                     <input name="tags" maxlength="420" placeholder="重点，考试，公式">

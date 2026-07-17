@@ -8952,6 +8952,127 @@ body.start-page[data-start-theme="dark"] .focus-round-pip.is-done { background: 
   width: min(660px, calc(100vw - 36px));
   padding: 27px 28px 24px;
 }
+.review-card-dialog-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(210px, 245px) auto;
+  align-items: center;
+  gap: 14px;
+}
+.review-card-dialog-head > .study-icon-button { justify-self: end; }
+.review-card-deck-picker {
+  position: relative;
+  z-index: 6;
+  min-width: 0;
+}
+.review-card-deck-combobox {
+  min-height: 38px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border: 1px solid color-mix(in srgb, var(--border) 94%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--surface) 76%, transparent);
+  color: var(--text-secondary);
+  transition: border-color 180ms var(--easing-soft), background 180ms var(--easing-soft),
+              box-shadow 220ms var(--easing-soft), transform 180ms var(--easing-soft);
+}
+.review-card-deck-combobox:focus-within {
+  border-color: var(--border-strong);
+  background: var(--surface);
+  box-shadow: 0 0 0 3px var(--focus-ring), 0 10px 26px rgba(39, 37, 31, 0.055);
+  transform: translateY(-1px);
+}
+.review-card-deck-combobox > span {
+  font-size: 10.5px;
+  font-weight: 690;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.review-card-deck-combobox input {
+  min-width: 0;
+  width: 100%;
+  padding: 9px 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  font: 600 11.5px/1.35 var(--font-ui);
+}
+.review-card-deck-combobox input::placeholder { color: var(--text-tertiary); font-weight: 520; }
+.review-card-deck-combobox small {
+  padding: 3px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  color: var(--text-tertiary);
+  font-size: 9.5px;
+  font-weight: 680;
+  white-space: nowrap;
+}
+.review-card-deck-picker.is-existing .review-card-deck-combobox small {
+  background: #edf5ee;
+  color: #4e7558;
+}
+.review-card-deck-picker.is-new .review-card-deck-combobox small {
+  background: #fbf3df;
+  color: #8a6a23;
+}
+.review-card-deck-options {
+  position: absolute;
+  top: calc(100% + 7px);
+  left: 0;
+  right: 0;
+  max-height: 268px;
+  overflow-y: auto;
+  padding: 6px;
+  border: 1px solid color-mix(in srgb, var(--border-strong) 88%, transparent);
+  border-radius: 13px;
+  background: color-mix(in srgb, var(--surface) 98%, #f5f2eb);
+  box-shadow: 0 18px 46px rgba(26, 26, 26, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.7);
+  opacity: 0;
+  transform: translateY(-5px) scale(0.985);
+  transform-origin: top center;
+  transition: opacity 130ms var(--easing-soft), transform 180ms var(--easing-page);
+  scrollbar-width: none;
+}
+.review-card-deck-options::-webkit-scrollbar { display: none; }
+.review-card-deck-options.show { opacity: 1; transform: translateY(0) scale(1); }
+.review-card-deck-option {
+  appearance: none;
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-secondary);
+  text-align: left;
+  cursor: pointer;
+  transition: background 140ms var(--easing-soft), color 140ms var(--easing-soft),
+              transform 160ms var(--easing-soft);
+}
+.review-card-deck-option:hover,
+.review-card-deck-option.is-active {
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  color: var(--text);
+}
+.review-card-deck-option:active { transform: scale(0.985); }
+.review-card-deck-option > span {
+  overflow: hidden;
+  font-size: 11.5px;
+  font-weight: 630;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.review-card-deck-option > small {
+  color: var(--text-tertiary);
+  font-size: 9.5px;
+  white-space: nowrap;
+}
 .review-card-dialog textarea[name="prompt"] { min-height: 86px; }
 .review-card-dialog textarea[name="answer"] { min-height: 108px; }
 .review-card-dialog textarea[name="notes"] { min-height: 88px; }
@@ -9004,7 +9125,7 @@ body.start-page[data-start-theme="dark"] .focus-round-pip.is-done { background: 
 }
 .review-card-organize {
   display: grid;
-  grid-template-columns: minmax(140px, 0.8fr) minmax(190px, 1.3fr) minmax(125px, 0.7fr);
+  grid-template-columns: minmax(190px, 1.3fr) minmax(125px, 0.7fr);
   gap: 12px;
 }
 .review-card-more {
@@ -9794,6 +9915,14 @@ body.start-page[data-start-theme="dark"] .focus-round-pip.is-done { background: 
   box-shadow: 0 0 0 3px var(--focus-ring);
 }
 @media (max-width: 720px) {
+  .review-card-dialog-head {
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: start;
+    row-gap: 12px;
+  }
+  .review-card-dialog-head > div:first-child { grid-column: 1; grid-row: 1; }
+  .review-card-dialog-head > .study-icon-button { grid-column: 2; grid-row: 1; }
+  .review-card-deck-picker { width: 100%; grid-column: 1 / -1; grid-row: 2; }
   .review-shell {
     --review-stage-height: 570px;
     min-height: auto;
@@ -10733,6 +10862,7 @@ body.start-page[data-start-theme="dark"] .start-page-note.is-selected {
   .review-help-dialog { transition: none; }
   .review-card-dialog .study-dialog-card,
   .review-deck-dialog .study-dialog-card,
+  .review-card-deck-options,
   .review-settings-dialog .study-dialog-card,
   .review-help-dialog .study-dialog-card,
   .review-card-dialog .study-dialog-head,
@@ -13570,42 +13700,13 @@ body.panels-dimmed .panel-dim-btn .pd-beam {
   z-index: 1;
   top: 50%;
   left: var(--default-position);
-  width: 14px;
-  height: 22px;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  color: var(--text-tertiary);
-  cursor: pointer;
-  pointer-events: auto;
-  transform: translate(-50%, -50%);
-}
-
-.discrete-range-default::before {
-  content: "";
-  position: absolute;
-  top: 50%;
-  left: 50%;
   width: 2px;
   height: 13px;
   border-radius: 1px;
-  background: currentColor;
+  background: var(--text-tertiary);
   opacity: 0.62;
+  pointer-events: none;
   transform: translate(-50%, -50%);
-  transition: height 130ms ease, opacity 130ms ease, color 130ms ease;
-}
-
-.discrete-range-default:hover::before,
-.discrete-range-default:focus-visible::before {
-  height: 17px;
-  color: var(--text);
-  opacity: 0.9;
-}
-
-.discrete-range-default:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 1px;
-  border-radius: 4px;
 }
 
 .discrete-range-thumb {
@@ -25598,6 +25699,32 @@ body.start-page[data-start-theme="dark"] .review-deck-new {
 body.start-page[data-start-theme="dark"] .review-deck-new:hover {
   border-color: rgba(255, 255, 255, 0.28);
   background: rgba(255, 255, 255, 0.07);
+}
+
+body.start-page[data-start-theme="dark"] .review-card-deck-combobox {
+  border-color: rgba(255, 255, 255, 0.13);
+  background: rgba(255, 255, 255, 0.045);
+}
+
+body.start-page[data-start-theme="dark"] .review-card-deck-combobox:focus-within {
+  border-color: rgba(255, 255, 255, 0.24);
+  background: rgba(255, 255, 255, 0.075);
+}
+
+body.start-page[data-start-theme="dark"] .review-card-deck-options {
+  border-color: rgba(255, 255, 255, 0.14);
+  background: rgba(30, 31, 33, 0.98);
+  box-shadow: 0 18px 46px rgba(0, 0, 0, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.065);
+}
+
+body.start-page[data-start-theme="dark"] .review-card-deck-picker.is-existing .review-card-deck-combobox small {
+  background: rgba(126, 177, 139, 0.16);
+  color: rgba(178, 218, 188, 0.88);
+}
+
+body.start-page[data-start-theme="dark"] .review-card-deck-picker.is-new .review-card-deck-combobox small {
+  background: rgba(205, 164, 74, 0.16);
+  color: rgba(235, 204, 130, 0.9);
 }
 
 body.start-page[data-start-theme="dark"] .review-select-visible:hover {

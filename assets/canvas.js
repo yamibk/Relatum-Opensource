@@ -135,7 +135,7 @@
   }
 
   // 离散滑条：保留原生 range 的键盘、触摸和指针能力，只接管视觉层。
-  // 字重以十位为可选档，整百只负责视觉主刻度；类型默认值用可点击的动态提示线标出。
+  // 字重以十位为可选档，整百只负责视觉主刻度；类型默认值用无交互的动态提示线标出。
   const discreteRangeStates = new WeakMap();
   function enhanceDiscreteRange(input, options) {
     if (!input) return null;
@@ -154,7 +154,7 @@
     const fill = document.createElement('span');
     const ticks = document.createElement('span');
     const thumb = document.createElement('span');
-    const defaultMarker = document.createElement('button');
+    const defaultMarker = document.createElement('span');
 
     wrapper.className = 'discrete-range';
     visual.className = 'discrete-range-visual';
@@ -162,9 +162,9 @@
     fill.className = 'discrete-range-fill';
     ticks.className = 'discrete-range-ticks';
     thumb.className = 'discrete-range-thumb';
-    defaultMarker.type = 'button';
     defaultMarker.className = 'discrete-range-default';
     defaultMarker.hidden = true;
+    defaultMarker.setAttribute('aria-hidden', 'true');
     track.setAttribute('aria-hidden', 'true');
     track.append(fill, ticks, thumb);
     visual.append(track, defaultMarker);
@@ -195,17 +195,9 @@
       const next = Number(value);
       const visible = Number.isFinite(next) && next >= min && next <= max;
       defaultMarker.hidden = !visible;
-      if (!visible) {
-        wrapper.removeAttribute('data-default-value');
-        return;
-      }
+      if (!visible) return;
       const progress = max === min ? 0 : ((next - min) / (max - min)) * 100;
-      wrapper.dataset.defaultValue = String(next);
       defaultMarker.style.setProperty('--default-position', progress + '%');
-      const english = document.documentElement.dataset.uiLanguage === 'en';
-      const label = english ? 'Restore default weight ' + next : '恢复默认字重 ' + next;
-      defaultMarker.title = label;
-      defaultMarker.setAttribute('aria-label', label);
     }
     function emitInput() {
       input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -236,15 +228,6 @@
         : Math.ceil(offset - 1e-9) - count;
       return min + index * detent;
     }
-
-    defaultMarker.addEventListener('click', (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      input.dispatchEvent(new CustomEvent('discrete-range:restore-default', {
-        bubbles: true,
-        detail: { value: Number(wrapper.dataset.defaultValue) },
-      }));
-    });
 
     let pointerStartX = 0;
     input.addEventListener('pointerdown', (event) => {
@@ -6348,26 +6331,6 @@
       delete node.fontScale;
       return true;
     }
-    function resetSelectedNodeFontWeight() {
-      const targets = editNodeTargets();
-      if (!targets.length) return false;
-      const changed = targets.filter((node) => {
-        if (editIsMindmapNode(node)) {
-          const next = editDefaultFontWeightForNode(node);
-          if (Number(node.mindmapFontWeight) === next) return false;
-          node.mindmapFontWeight = next;
-          node.mindmapSizeMode = 'custom';
-          return true;
-        }
-        if (!Object.prototype.hasOwnProperty.call(node, 'fontWeight')) return false;
-        delete node.fontWeight;
-        return true;
-      });
-      if (!changed.length) return false;
-      refreshEditedNodes(changed, true);
-      pushHistory();
-      return true;
-    }
     function resetSelectedNodeAppearanceSection(section) {
       const targets = editNodeTargets();
       if (!targets.length) return false;
@@ -7010,10 +6973,6 @@
         enRadius.addEventListener('change', () => { pushHistory(); refreshEditPanel(); });
       }
       if (enFontWeight) {
-        enFontWeight.addEventListener('discrete-range:restore-default', () => {
-          resetSelectedNodeFontWeight();
-          refreshEditPanel();
-        });
         enFontWeight.addEventListener('input', () => {
           const v = parseInt(enFontWeight.value, 10);
           enFontWeightVal.textContent = String(v);
@@ -12265,9 +12224,14 @@
       try { return localStorage.getItem('canvas:genIndexEnabled') === '1'; } catch (e) { return false; }
     }
 
-    // 框选创建盒子/分组：默认开启，齿轮里关闭后不再浮「+ 盒子」「+ 分组」按钮（与 editor.js 同名键）
+    // 空白框选创建盒子：默认开启，仅控制空选区后的「+ 盒子」按钮（与 editor.js 同名键）
     function boxCreateEnabled() {
       try { return localStorage.getItem('canvas:boxCreateEnabled') !== '0'; } catch (e) { return true; }
+    }
+
+    // 框选节点创建分组：默认开启，仅控制框选节点后的「+ 分组」按钮（与 editor.js 同名键）
+    function groupCreateEnabled() {
+      try { return localStorage.getItem('canvas:groupCreateEnabled') !== '0'; } catch (e) { return true; }
     }
 
     // 没点就慢慢淡出，不打扰（区别于 hideFrameActionButton 的即时收起）
@@ -13032,8 +12996,13 @@
           // 没拖动 且 没按 shift → 视为空白点击，清选
           if (!drag.moved && !drag.additive) {
             clearSelection();
-          } else if (boxCreateEnabled() && (emptyFrame || (frameCanBecomeGroupBox && groupMemberIds.length))) {
-            showFrameActionButton(rect, { x: e.clientX, y: e.clientY }, groupMemberIds);
+          } else if (frameCanBecomeGroupBox) {
+            const frameActionEnabled = emptyFrame
+              ? boxCreateEnabled()
+              : (groupMemberIds.length > 0 && groupCreateEnabled());
+            if (frameActionEnabled) {
+              showFrameActionButton(rect, { x: e.clientX, y: e.clientY }, groupMemberIds);
+            }
             if (genIndexEnabled() && indexableSelectionIds().length >= 2) {
               showIndexActionButton(rect, { x: e.clientX - 48, y: e.clientY });
             }
@@ -19214,19 +19183,23 @@
     }
 
     // ── 键盘 ──────────────────────────────────
-    // 数字键「快速切新建默认类型」：直接点一下 editor.js 里对应的「新建默认」按钮，
-    // 复用它写 localStorage + 高亮的逻辑，避免在两处各写一套。键位按模式分工见下表。
+    // 数字键「快速切新建默认类型」：简洁 / 完整画布共用同一套稳定映射。
+    // 通过事件交给 editor.js 写对应子模式的默认值，避免选中节点时误触类型转换。
     const QUICK_TYPE_MAP = {
       normal: {
         clean: {
-          '3': { sel: '[data-role="normal-kind"] .nkf-btn[data-kind="card"]', toast: '新建 · 卡片' },
-          '4': { sel: '[data-role="normal-kind"] .nkf-btn[data-kind="sticky"]', toast: '新建 · 便签' },
+          '3': { kind: 'card', toast: '新建 · 卡片' },
+          '4': { kind: 'sticky', toast: '新建 · 便签' },
+          '5': { kind: 'index', toast: '新建 · 索引' },
+          '6': { kind: 'preview', toast: '新建 · 预览' },
+          '7': { kind: 'code', toast: '新建 · 代码' },
         },
         full: {
-          '3': { sel: '[data-role="pro-kind"] button[data-kind="index"]', toast: '新建 · 索引' },
-          '4': { sel: '[data-role="pro-kind"] button[data-kind="preview"]', toast: '新建 · 预览' },
-          '5': { sel: '[data-role="pro-kind"] button[data-kind="card"]', toast: '新建 · 卡片' },
-          '6': { sel: '[data-role="pro-kind"] button[data-kind="code"]', toast: '新建 · 代码' },
+          '3': { kind: 'card', toast: '新建 · 卡片' },
+          '4': { kind: 'sticky', toast: '新建 · 便签' },
+          '5': { kind: 'index', toast: '新建 · 索引' },
+          '6': { kind: 'preview', toast: '新建 · 预览' },
+          '7': { kind: 'code', toast: '新建 · 代码' },
         },
       },
     };
@@ -19235,9 +19208,9 @@
       const entry = QUICK_TYPE_MAP[mode] && QUICK_TYPE_MAP[mode][submode]
         && QUICK_TYPE_MAP[mode][submode][key];
       if (!entry) return false;
-      const btn = document.querySelector(entry.sel);
-      if (!btn) return false;
-      btn.click();   // 复用 editor.js 的点击处理：写默认值 + 面板高亮（按钮隐藏也能触发）
+      document.dispatchEvent(new CustomEvent('editor:quick-new-kind', {
+        detail: { kind: entry.kind, mode: mode, submode: submode },
+      }));
       showCanvasToast(entry.toast);
       return true;
     }
@@ -19714,16 +19687,27 @@
         return;
       }
 
-      // 主键盘 1 / 2 → 切换左侧工具（1=选择、2=画笔），全局生效。
-      // 放在 Figma 字母键之前，所以即使选中了节点按 1/2 也是切工具（同原 1 的全局语义）。
+      // 主键盘 1 / Shift+1 / 2 → 左侧工具（1=选择、Shift+1=文本框、2=画笔/橡皮）。
+      // 放在 Figma 字符替换之前，所以即使选中了节点也优先切工具；编辑态仍正常输入。
       // Ctrl+1（fit-to-content）已在前面处理并 return，故这里一定是无修饰键。
-      if (e.key === '1' && !anyMod) {
+      if (e.key === '1' && !e.shiftKey && !anyMod) {
         e.preventDefault();
+        if (e.repeat) return;
         setDrawTool('select');
+        showCanvasToast('选择');
+        return;
+      }
+      // 用物理键位识别 Shift+1；event.key 在常见布局下是 "!"，不能拿它判断。
+      if (e.code === 'Digit1' && e.shiftKey && !anyMod) {
+        e.preventDefault();
+        if (e.repeat) return;
+        setDrawTool('text');
+        showCanvasToast('文本框');
         return;
       }
       if (e.key === '2' && !anyMod) {
         e.preventDefault();
+        if (e.repeat) return;
         // 反复按 2 在「画笔 ↔ 橡皮」间切换；从其它工具按 2 先到画笔
         const next = drawTool === 'pen' ? 'eraser' : 'pen';
         setDrawTool(next);
@@ -19735,7 +19719,8 @@
         setDrawTool('select');
         return;
       }
-      // 主键盘数字键切普通模式新建类型：简洁 3/4=卡片/便签；正常 3/4/5/6=索引/预览/卡片/代码。
+      // 主键盘数字键切普通模式新建类型：简洁 / 完整统一为
+      // 3/4/5/6/7 = 卡片/便签/索引/预览/代码。
       // 未映射的数字键照旧落到打字替换链路。
       if (!anyMod && !inEditable && e.key >= '3' && e.key <= '9') {
         const mode = currentMode();
@@ -22216,28 +22201,6 @@
     global.CanvasModule.getSingleNodeDefaultFontWeight = function (nodeId) {
       const node = findNode(nodeId);
       return node ? editDefaultFontWeightForNode(node) : null;
-    };
-
-    global.CanvasModule.resetSingleNodeFontWeight = function (nodeId) {
-      const node = findNode(nodeId);
-      if (!node) return false;
-      if (editIsMindmapNode(node)) {
-        const next = editDefaultFontWeightForNode(node);
-        if (Number(node.mindmapFontWeight) === next) return false;
-        node.mindmapFontWeight = next;
-        node.mindmapSizeMode = 'custom';
-      } else {
-        if (!Object.prototype.hasOwnProperty.call(node, 'fontWeight')) return false;
-        delete node.fontWeight;
-      }
-      const el = nodeMap.get(nodeId);
-      if (el) applyNodeStyle(el, node);
-      nodeSizeCache.delete(nodeId);
-      edgesIncidentTo(new Set([nodeId])).forEach(updateEdgePath);
-      notifyEditStyleChange();
-      refreshEditPanel();
-      document.dispatchEvent(new CustomEvent('editor:nodestylechange', { detail: { nodeId: nodeId } }));
-      return true;
     };
 
     global.CanvasModule.applySingleNodeBody = function (nodeId, value, marks) {

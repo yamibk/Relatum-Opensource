@@ -514,13 +514,17 @@
           <input type="checkbox" data-role="enable-index-hover" checked>
           <span data-editor-i18n="indexHover">悬停弹出目录</span>
         </label>
+        <label class="settings-check" title="左键框选空白区域后浮出「+ 盒子」按钮（默认开启）">
+          <input type="checkbox" data-role="enable-box-create" checked>
+          <span data-editor-i18n="boxCreate">空白框选创建盒子</span>
+        </label>
+        <label class="settings-check" title="左键框选节点后浮出「+ 分组」按钮（默认开启）">
+          <input type="checkbox" data-role="enable-group-create" checked>
+          <span data-editor-i18n="groupCreate">框选节点创建分组</span>
+        </label>
         <label class="settings-check" title="框选多个节点后浮出「生成索引」小按钮，一键收成目录卡（默认关闭）">
           <input type="checkbox" data-role="enable-gen-index">
           <span data-editor-i18n="selectionIndex">框选生成索引目录</span>
-        </label>
-        <label class="settings-check" title="左键框选空白区域后浮出「+ 盒子」按钮；框选节点后浮出「+ 分组」按钮（默认开启）">
-          <input type="checkbox" data-role="enable-box-create" checked>
-          <span data-editor-i18n="boxCreate">框选创建盒子/分组</span>
         </label>
         <label class="settings-check" title="背景语义为深色时，把画布连线临时按荧光样式显示；只改变视觉，不修改线条原始样式或 .canvas 数据。">
           <input type="checkbox" data-role="enable-dark-edge-optimization" checked>
@@ -593,10 +597,10 @@
       <div class="sp-field">
         <label>类型</label>
         <div class="sp-shape-switch sp-multi" data-role="pro-kind">
-          <button type="button" data-kind="index">索引</button>
-          <button type="button" data-kind="preview">预览</button>
           <button type="button" data-kind="card" class="active">卡片</button>
           <button type="button" data-kind="sticky">便签</button>
+          <button type="button" data-kind="index">索引</button>
+          <button type="button" data-kind="preview">预览</button>
           <button type="button" data-kind="code">代码</button>
         </div>
       </div>
@@ -1403,10 +1407,10 @@
         <div class="sp-field">
           <label>类型</label>
           <div class="sp-shape-switch sp-multi clean-kind-switch" data-role="clean-kind">
-            <button type="button" data-kind="index">索引</button>
-            <button type="button" data-kind="preview">预览</button>
             <button type="button" data-kind="card" class="active">卡片</button>
             <button type="button" data-kind="sticky">便签</button>
+            <button type="button" data-kind="index">索引</button>
+            <button type="button" data-kind="preview">预览</button>
             <button type="button" data-kind="code">代码</button>
           </div>
         </div>
@@ -2043,8 +2047,7 @@
         <section class="shortcuts-group">
           <h3>正文节点 · 阅读 · 批注</h3>
           <dl>
-            <div><dt>画布·完整 <kbd>3</kbd> / <kbd>4</kbd> / <kbd>5</kbd> / <kbd>6</kbd></dt><dd>切换接下来新建索引 / 预览 / 卡片 / 代码</dd></div>
-            <div><dt>画布·简洁 <kbd>3</kbd> / <kbd>4</kbd></dt><dd>切换接下来新建卡片 / 便签</dd></div>
+            <div><dt>画布·简洁 / 完整 <kbd>3</kbd> / <kbd>4</kbd> / <kbd>5</kbd> / <kbd>6</kbd> / <kbd>7</kbd></dt><dd>统一切换接下来新建卡片 / 便签 / 索引 / 预览 / 代码</dd></div>
             <div><dt>索引/预览/卡片/便签 + <kbd>F</kbd></dt><dd>放大阅读并编辑正文</dd></div>
             <div><dt>代码节点 + <kbd>F</kbd></dt><dd>放大读写代码（只着色，不批注）</dd></div>
             <div><dt>PDF / Markdown 附件 + <kbd>F</kbd></dt><dd>打开放大阅读与附件批注</dd></div>
@@ -2099,7 +2102,7 @@
           <h3>界面 / 工具</h3>
           <dl>
             <div><dt>鼠标移到<kbd>画布左缘</kbd></dt><dd>浮现左侧手写工具栏（笔 / 橡皮 / 文字 / 箭头 / 手绘图形）</dd></div>
-            <div><dt><kbd>1</kbd> / <kbd>2</kbd></dt><dd><kbd>1</kbd>选择；<kbd>2</kbd>画笔，再按一次切到橡皮（反复按 <kbd>2</kbd> 在画笔 ↔ 橡皮间切换）</dd></div>
+            <div><dt><kbd>1</kbd> / <kbd>Shift</kbd>+<kbd>1</kbd> / <kbd>2</kbd></dt><dd><kbd>1</kbd>选择；<kbd>Shift</kbd>+<kbd>1</kbd>文本框；<kbd>2</kbd>画笔，再按一次切到橡皮（反复按 <kbd>2</kbd> 在画笔 ↔ 橡皮间切换）</dd></div>
             <div><dt>再点<kbd>画笔</kbd>图标</dt><dd>弹出画笔配置（笔型 / 粗细 / 压感 / 书法笔锋…逐项见下表）</dd></div>
             <div><dt>再点<kbd>橡皮</kbd>图标</dt><dd>在「整笔擦 / 局部擦」间切换；局部擦只擦圆圈内一段，其余保留</dd></div>
             <div><dt>长按<kbd>画笔 / 箭头</kbd></dt><dd>恢复该工具默认设置；按钮轻弹表示已生效</dd></div>
