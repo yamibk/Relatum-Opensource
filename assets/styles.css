@@ -11988,7 +11988,7 @@ body.editor-page.topbar-pending .editor-top-bar {
   position: absolute;
   inset: 0 -320px;
   z-index: -2;
-  opacity: 0.75;
+  opacity: 0.93;
   pointer-events: none;
   transform: translate3d(0, 0, 0);
   contain: paint;
