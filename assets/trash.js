@@ -53,14 +53,14 @@
   }
 
   function groupName(gid) {
-    if (gid === '') return '最近';
+    if (gid === '') return '未分组';
     const g = lastGroups.find((x) => x.id === gid);
-    return g ? g.name : '最近';
+    return g ? g.name : '未分组';
   }
   function groupFileCount(gid) {
     const validIds = new Set(lastGroups.map((g) => g.id));
     return lastFiles.filter((f) => {
-      const g = f.group || '';
+      const g = f.groupId || '';
       const inValid = g && validIds.has(g);
       return gid === '' ? !inValid : g === gid;
     }).length;
@@ -74,7 +74,7 @@
 
   function renderRail() {
     rail.innerHTML = '';
-    const items = [{ id: '', name: '最近', special: true }].concat(lastGroups);
+    const items = [{ id: '', name: '未分组', special: true }].concat(lastGroups);
     items.forEach((g, i) => {
       const item = document.createElement('div');
       item.className = 'rail-item';
@@ -267,9 +267,9 @@
     const li = activeItems()[idx];
     trashFiles.splice(idx, 1);
     trashEntryCount = Math.max(0, trashEntryCount - (Number(f.entryCount) || 1));
-    // 乐观更新左栏计数：恢复的文件进入目标组（gid 空=最近），与主界面一致实时刷新
+    // 乐观更新左栏计数：恢复的文件进入目标组（gid 空=未分组），与主界面一致实时刷新
     const entry = { path: f.path, title: f.title };
-    if (gid) entry.group = gid;
+    entry.groupId = gid || '';
     lastFiles.push(entry);
     renderRail();
     animateOut(li);

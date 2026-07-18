@@ -4009,6 +4009,12 @@ body[data-hide-special="1"] .empty-actions [data-action="study-view"] {
   opacity: 0.52;
 }
 
+.page-dot[data-group-id="__inbox__"]::before {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px currentColor;
+  opacity: 0.56;
+}
+
 .page-dot:hover::before { opacity: 0.75; transform: scale(1.25); }
 
 .page-dot.active::before {
@@ -4059,14 +4065,17 @@ body[data-hide-special="1"] .empty-actions [data-action="study-view"] {
   z-index: 5;
 }
 .page-dot:hover .dot-bubble,
-.study-spine-tab:hover .dot-bubble {
+.study-spine-tab:hover .dot-bubble,
+.page-dot:focus-visible .dot-bubble,
+.study-spine-tab:focus-visible .dot-bubble {
   opacity: 1;
   transform: translateY(-50%) translateX(0);
 }
 
-/* 书脊保持纯图形导航：名称仍由 aria-label 提供给辅助技术，不在界面弹文字。 */
+/* 静止时仍是纯图形；悬停或键盘聚焦时显示名称与数量，降低圆点辨认成本。 */
 .left-spine .dot-bubble {
-  display: none;
+  display: block;
+  position: fixed;
 }
 
 /* 回收站入口（书脊底部）*/
@@ -11294,6 +11303,16 @@ body.start-page[data-start-theme="dark"] .start-page-note.is-selected {
   display: flex;
   flex-direction: column;
   gap: 10px;          /* 卡片间留白分隔，不靠分隔线 */
+}
+
+/* 仅在超过 80 项时降低合成压力；日常规模继续保留完整玻璃质感与过渡。 */
+.recent-list.is-large-list .recent-item {
+  content-visibility: auto;
+  contain-intrinsic-size: 78px;
+  animation: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  background: rgba(255, 255, 255, 0.88);
 }
 
 /* 外部拖入 .canvas 时，整张「书页」浮现一圈克制的虚线接收框（无文字提示）。
