@@ -32,6 +32,7 @@
   const answerRevealEl = root.querySelector('[data-role="review-answer-reveal"]');
   const questionHintEl = root.querySelector('[data-role="review-question-hint"]');
   const nextLabelEl = root.querySelector('[data-role="review-next-label"]');
+  const nextShortcutEl = root.querySelector('[data-role="review-next-shortcut"]');
   const cardDeckEl = root.querySelector('[data-role="review-card-deck"]');
   const cardTagsEl = root.querySelector('[data-role="review-card-tags"]');
   const scopeSelectEl = root.querySelector('[data-role="review-scope-select"]');
@@ -536,6 +537,7 @@
         : '想好后可以直接评分，也可以查看答案再核对。');
     }
     if (nextLabelEl) nextLabelEl.textContent = tr(reviewMode === 'free' ? '下一张' : '再来一张');
+    if (nextShortcutEl) nextShortcutEl.textContent = reviewMode === 'free' ? 'N / D' : 'N';
     if (notesEl) notesEl.hidden = !renderRich(notesEl, current.notes);
     if (draftEl) draftEl.value = '';
     resetAnswerReveal(current);
@@ -1654,10 +1656,15 @@
     if (viewMode !== 'session') return;
     if (!current) return;
     if (event.code === 'Space') { event.preventDefault(); toggleAnswer(); return; }
+    if (reviewMode === 'free' && event.key === '1') { event.preventDefault(); toggleAnswer(); return; }
     if (reviewMode === 'scheduled' && event.key === '1') { event.preventDefault(); mark('remembered'); return; }
     if (reviewMode === 'scheduled' && event.key === '2') { event.preventDefault(); mark('vague'); return; }
     if (reviewMode === 'scheduled' && event.key === '3') { event.preventDefault(); mark('forgot'); return; }
-    if (event.key.toLowerCase() === 'n') { event.preventDefault(); skipCard(); }
+    const shortcutKey = event.key.toLowerCase();
+    if (shortcutKey === 'n' || (reviewMode === 'free' && shortcutKey === 'd')) {
+      event.preventDefault();
+      skipCard();
+    }
   });
 
   async function activateReview() {

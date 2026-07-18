@@ -415,23 +415,31 @@ def save_recent(data: dict) -> None:
 
 
 def load_background_preference() -> dict:
-    """读取整个画布工具共用的背景偏好。"""
+    """读取整个画布工具共用的背景与辅助底纹偏好。"""
     if not BACKGROUND_PREF_FILE.exists():
-        return {"configured": False, "background": None}
+        return {"configured": False, "background": None, "guide": None}
     try:
         data = json.loads(BACKGROUND_PREF_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"configured": False, "background": None}
+        return {"configured": False, "background": None, "guide": None}
     if not isinstance(data, dict) or "background" not in data:
-        return {"configured": False, "background": None}
-    return {"configured": True, "background": data.get("background")}
+        return {"configured": False, "background": None, "guide": None}
+    guide = data.get("guide")
+    if not isinstance(guide, dict) or guide.get("type") not in {
+        "ruled", "dots", "grid", "major-grid"
+    }:
+        guide = None
+    else:
+        guide = {"type": guide["type"]}
+    return {"configured": True, "background": data.get("background"), "guide": guide}
 
 
-def save_background_preference(background) -> None:
-    """保存跨画布、跨入口共用的背景偏好；None 表示默认纸白。"""
+def save_background_preference(background, guide=None) -> None:
+    """保存跨画布共用的背景与辅助底纹；None 分别表示纸白或无底纹。"""
     _atomic_write_json(BACKGROUND_PREF_FILE, {
-        "version": 1,
+        "version": 2,
         "background": background,
+        "guide": guide,
     })
 
 
@@ -6927,14 +6935,22 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self._send_json(200, load_background_preference())
 
     def _api_set_background_preference(self, body: dict):
-        """更新全局背景外观；null 代表显式恢复默认纸白。"""
-        if "background" not in body:
-            return self._send_json(400, {"error": "缺少 background"})
-        background = body.get("background")
+        """更新全局背景与辅助底纹；未提交的字段沿用现有偏好。"""
+        if "background" not in body and "guide" not in body:
+            return self._send_json(400, {"error": "缺少 background 或 guide"})
+        current = load_background_preference()
+        background = body.get("background") if "background" in body else current.get("background")
         if background is not None and not isinstance(background, dict):
             return self._send_json(400, {"error": "背景设置格式无效"})
+        guide = body.get("guide") if "guide" in body else current.get("guide")
+        if guide is not None:
+            if not isinstance(guide, dict) or guide.get("type") not in {
+                "ruled", "dots", "grid", "major-grid"
+            }:
+                return self._send_json(400, {"error": "辅助底纹设置格式无效"})
+            guide = {"type": guide["type"]}
         try:
-            save_background_preference(background)
+            save_background_preference(background, guide)
         except OSError as err:
             return self._send_json(500, {"error": f"保存全局背景失败：{err}"})
         self._send_json(200, {"ok": True})
