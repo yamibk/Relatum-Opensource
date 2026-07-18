@@ -1694,15 +1694,10 @@
     renderPanel(options);
   }
 
-  // 页圆点（最近 + 收藏 + 各自定义分组）+ 末尾「+」新建分组。
+  // 页圆点（最近 + 收藏 + 各自定义分组 + 未分组）+ 末尾「+」新建分组。
   function renderDots() {
     dots.innerHTML = '';
-    const pages = [
-      { id: '', name: '最近' },
-      { id: FAVORITES_PAGE, name: '收藏' },
-      { id: INBOX_PAGE, name: '未分组' },
-    ]
-      .concat(lastGroups.map((g) => ({ id: g.id, name: g.name })));
+    const pages = pageOrder().map((id) => ({ id, name: nameOf(id) }));
     pages.forEach((g) => {
       const dot = document.createElement('button');
       dot.type = 'button';
@@ -2891,7 +2886,8 @@
   })();
 
   function pageOrder() {
-    return ['', FAVORITES_PAGE, INBOX_PAGE].concat(lastGroups.map((g) => g.id));
+    return ['', FAVORITES_PAGE]
+      .concat(lastGroups.map((g) => g.id), [INBOX_PAGE]);
   }
   function pageIndexOf(gid) {
     const i = pageOrder().indexOf(gid);
@@ -2941,7 +2937,7 @@
 
   // 相对当前页循环翻 ±1（到尾翻回头、到头翻到尾）。
   function flipBy(delta) {
-    // 隐藏特殊页：滚轮只在普通书页（最近 / 收藏 / 自定义分组）之间循环，前置页一律跳过。
+    // 隐藏特殊页：滚轮只在普通书页（最近 / 收藏 / 自定义分组 / 未分组）之间循环，前置页一律跳过。
     if (specialPagesHidden) {
       const order = pageOrder();
       const N = order.length;
