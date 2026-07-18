@@ -47,7 +47,13 @@
 
   let lastGroups = [];
   let lastFiles = [];
+  let recentLimit = 30;
+  let validGroupIds = new Set();
+  let fileBuckets = new Map();
   let recentRefreshSeq = 0;
+  let fileStatsRequestSeq = 0;
+  const fileStatsCache = new Map();
+  let fileStatsObserver = null;
   let draggingPath = null;   // 3c：正在拖拽的文件路径（dataTransfer 的兜底）
   let flashImportPath = null; // 刚从外部拖入导入的画布路径，渲染后播一次入场动画
   // 3d：键盘归类
@@ -63,6 +69,9 @@
   let focusActive = false;     // 专注钟前置页（学习更右一格、紧邻书页）是否展开
   let specialPagesHidden = false; // 「隐藏特殊页」开启：书脊只留普通书页，6 张前置页既不显示也不可翻入
   const FAVORITES_PAGE = '__favorites__';
+  const INBOX_PAGE = '__inbox__';
+  const LARGE_LIST_THRESHOLD = 80;
+  const STAGGER_LIST_LIMIT = 40;
   // 当前选中的分组 id（''=最近），记住上次选择
   let activeGroup = '';
   try { activeGroup = localStorage.getItem('canvas:activeGroup') || ''; } catch (e) {}
@@ -76,7 +85,7 @@
   const START_SPEED_MIN = 180;
   const START_SPEED_MAX = 500;
   const START_SPEED_DEFAULT = 260;
-  const EXPECTED_RUNTIME_SCHEMA = 2;
+  const EXPECTED_RUNTIME_SCHEMA = 3;
   const NOTES_INERTIA_KEY = 'canvas:notesInertia';
   const NOTES_INERTIA_DEFAULT = 0.45;
   const NOTES_STACK_HOVER_DELAY_KEY = 'canvas:notesStackHoverDelay';
@@ -376,7 +385,7 @@
       ['速记墙视野', '速记墙可以像画布一样平移、缩放和惯性滑行。左上角齿轮里的「速记惯性」同时控制便签拖动与整面墙拖动的滑行强度。', [['空白处滚轮', '平滑移动整面速记墙。'], ['<kbd>Ctrl</kbd> + 滚轮', '以鼠标所在位置为中心缩放。'], ['<kbd>Shift</kbd> + 滚轮', '横向移动视野。'], ['<kbd>Space</kbd> + 拖动空白处', '抓住整面墙平移，松手后按惯性滑行。'], ['<kbd>↑</kbd> / <kbd>↓</kbd> / <kbd>←</kbd> / <kbd>→</kbd>', '移动视野；按住 <kbd>Shift</kbd> 会更快。'], ['<kbd>0</kbd>', '缩放到可以总览全部便签。'], ['<kbd>F</kbd>', '聚焦当前便签。'], ['再次点击「速记」图标', '回到默认缩放与位置。']]],
       ['速记搜索与键盘整理', '鼠标悬停、最近操作或键盘轮廓所指的便签会成为当前便签。搜索和浏览都不显示工具栏。', [['<kbd>/</kbd>', '进入搜索并直接输入关键词；左侧速记图标会亮起黄色呼吸光圈。'], ['搜索中 <kbd>Enter</kbd> / <kbd>Shift</kbd> + <kbd>Enter</kbd>', '跳到下一条 / 上一条匹配结果。'], ['搜索中 <kbd>Esc</kbd>', '退出搜索并恢复全部便签。'], ['<kbd>J</kbd> / <kbd>K</kbd>', '切换下一张 / 上一张便签；屏幕外的便签会自动进入视野。'], ['<kbd>Esc</kbd>', '取消当前便签的键盘轮廓。'], ['<kbd>C</kbd>', '切换当前便签颜色。'], ['<kbd>R</kbd> / <kbd>Shift</kbd> + <kbd>R</kbd>', '随机轻旋 / 摆正当前便签。'], ['<kbd>D</kbd>', '复制当前便签。'], ['<kbd>Ctrl</kbd> + <kbd>Z</kbd> / <kbd>Y</kbd>', '撤销 / 重做速记墙操作。']]],
       ['分组与文件整理', '画布卡片不仅可以打开，也可以像桌面文件一样整理。', [['拖动画布卡片到圆点', '把文件归入对应分组。'], ['拖到另一张卡片附近', '调整当前分组里的文件顺序。'], ['右键画布卡片', '重命名、在资源管理器中查看、移动到分组、移到回收站或从列表移除。'], ['右键分组圆点', '重命名或删除分组；删除分组不会删除画布文件。'], ['左侧回收站', '恢复误删画布，或手动清空回收站。']]],
-      ['键盘整理', '先按方向键选中一张画布，再继续操作。', [['<kbd>↑</kbd> / <kbd>↓</kbd>', '选择上一张 / 下一张画布。'], ['<kbd>Shift</kbd> + <kbd>↑</kbd> / <kbd>↓</kbd>', '把选中的画布向上 / 向下调整顺序。'], ['<kbd>Enter</kbd>', '打开选中的画布。'], ['<kbd>1</kbd>–<kbd>9</kbd>', '移到第 1–9 个自定义分组。'], ['<kbd>0</kbd> 或 <kbd>Backspace</kbd>', '移回「最近」。'], ['<kbd>→</kbd> 再按一次 <kbd>→</kbd>', '二次确认后移到回收站。'], ['<kbd>←</kbd> 或 <kbd>Esc</kbd>', '取消待删除状态。']]],
+      ['键盘整理', '先按方向键选中一张画布，再继续操作。', [['<kbd>↑</kbd> / <kbd>↓</kbd>', '选择上一张 / 下一张画布。'], ['<kbd>Shift</kbd> + <kbd>↑</kbd> / <kbd>↓</kbd>', '把选中的画布向上 / 向下调整顺序（「最近」自动排序）。'], ['<kbd>Enter</kbd>', '打开选中的画布。'], ['<kbd>1</kbd>–<kbd>9</kbd>', '移到第 1–9 个自定义分组。'], ['<kbd>0</kbd> 或 <kbd>Backspace</kbd>', '移到「未分组」。'], ['<kbd>→</kbd> 再按一次 <kbd>→</kbd>', '二次确认后移到回收站。'], ['<kbd>←</kbd> 或 <kbd>Esc</kbd>', '取消待删除状态。']]],
       ['客户端设置', '起始页右下角齿轮用于设置桌面客户端从最大化恢复后的窗口尺寸。可以选择紧凑、均衡、宽敞，也可以填写自定义宽高。设置会按当前显示器可用区域自动约束。'],
     ]},
     { id: 'study', eyebrow: '02 · STUDY', title: '学习页', sections: [
@@ -1128,7 +1137,8 @@
     study: ['#8b74ad', 'rgba(139, 116, 173, 0.3)'],
     focus: ['#87915b', 'rgba(135, 145, 91, 0.3)'],
     recent: ['#847a71', 'rgba(132, 122, 113, 0.3)'],
-    favorite: ['#d28b55', 'rgba(210, 139, 85, 0.3)']
+    favorite: ['#d28b55', 'rgba(210, 139, 85, 0.3)'],
+    inbox: ['#76858a', 'rgba(118, 133, 138, 0.3)']
   };
   const SPINE_GROUP_COLORS = [
     ['#9f7188', 'rgba(159, 113, 136, 0.3)'],
@@ -1146,6 +1156,7 @@
     if (target.classList.contains('focus-spine-tab')) return 'focus';
     if (target.classList.contains('study-spine-tab')) return 'study';
     if (target.dataset.groupId === FAVORITES_PAGE) return 'favorite';
+    if (target.dataset.groupId === INBOX_PAGE) return 'inbox';
     if (target.dataset.groupId === '') return 'recent';
     return 'group';
   }
@@ -1161,7 +1172,14 @@
   }
 
   function placeSpineHover(target) {
-    if (!spineHoverOrb || !spineHoverRail || !target || target.classList.contains('dot-add')) return;
+    if (!target) return;
+    const bubble = target.querySelector('.dot-bubble');
+    if (bubble) {
+      const targetRect = target.getBoundingClientRect();
+      bubble.style.left = Math.round(targetRect.right + 8) + 'px';
+      bubble.style.top = Math.round(targetRect.top + targetRect.height / 2) + 'px';
+    }
+    if (!spineHoverOrb || !spineHoverRail || target.classList.contains('dot-add')) return;
     const spine = target.closest('.left-spine');
     if (!spine) return;
     const spineRect = spine.getBoundingClientRect();
@@ -1522,24 +1540,144 @@
     return parts.join(' · ');
   }
 
-  // ── 数据分桶 ──────────────────────────────────
-  function validIds() { return new Set(lastGroups.map((g) => g.id)); }
+  function updateFileItemStats(li, f) {
+    if (!li || !f) return;
+    const missing = f.exists === false;
+    li.classList.toggle('recent-item-missing', missing);
+    li.draggable = !missing;
 
-  // 某书页的文件：''=最近(group 空/指向已删组)；收藏页跨分组筛选；其余=用户组。
-  function filesOf(gid) {
-    const ids = validIds();
-    return lastFiles.filter((f) => {
-      if (!f || !f.path) return false;
-      if (gid === FAVORITES_PAGE) return !!f.favorite;
-      const g = f.group || '';
-      const inValid = g && ids.has(g);
-      return gid === '' ? !inValid : g === gid;
+    const title = li.querySelector('.recent-item-title');
+    let tag = title && title.querySelector('.recent-item-tag');
+    if (missing && title && !tag) {
+      tag = document.createElement('span');
+      tag.className = 'recent-item-tag';
+      tag.textContent = '文件已不在';
+      title.appendChild(tag);
+    } else if (!missing && tag) {
+      tag.remove();
+    }
+
+    const meta = li.querySelector('.recent-item-meta');
+    let stats = meta && meta.querySelector('.recent-item-stats');
+    const statsText = formatFileStats(f);
+    if (statsText && meta) {
+      if (!stats) {
+        stats = document.createElement('span');
+        stats.className = 'recent-item-stats';
+        meta.appendChild(stats);
+      }
+      stats.textContent = statsText;
+    } else if (stats) {
+      stats.remove();
+    }
+  }
+
+  async function requestFileStats(paths, requestId) {
+    const unique = [...new Set((paths || []).filter(Boolean))]
+      .filter((path) => !fileStatsCache.has(path))
+      .slice(0, 200);
+    if (!unique.length) return;
+    try {
+      const response = await fetch('/api/file-stats', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paths: unique }),
+      });
+      const json = await response.json();
+      if (!response.ok || requestId !== fileStatsRequestSeq) return;
+      const visibleItems = new Map(Array.from(fileList.querySelectorAll('.recent-item'))
+        .map((item) => [item.dataset.path, item]));
+      (json.files || []).forEach((stats) => {
+        if (!stats || !stats.path) return;
+        fileStatsCache.set(stats.path, stats);
+        const file = lastFiles.find((item) => item.path === stats.path);
+        if (file) Object.assign(file, stats);
+        const li = visibleItems.get(stats.path);
+        if (li && file) updateFileItemStats(li, file);
+      });
+    } catch (err) {
+      console.warn('[画布] 文件统计读取失败', err);
+    }
+  }
+
+  function observeVisibleFileStats() {
+    if (fileStatsObserver) fileStatsObserver.disconnect();
+    const items = Array.from(fileList.querySelectorAll('.recent-item'));
+    const requestId = fileStatsRequestSeq;
+    if (!('IntersectionObserver' in window)) {
+      requestFileStats(items.slice(0, 200).map((item) => item.dataset.path), requestId);
+      return;
+    }
+    fileStatsObserver = new IntersectionObserver((entries) => {
+      const paths = [];
+      entries.forEach((entry) => {
+        if (!entry.isIntersecting) return;
+        fileStatsObserver.unobserve(entry.target);
+        paths.push(entry.target.dataset.path);
+      });
+      requestFileStats(paths, requestId);
+    }, { root: bookStage || null, rootMargin: '240px 0px' });
+    items.forEach((item) => {
+      if (!fileStatsCache.has(item.dataset.path)) fileStatsObserver.observe(item);
     });
+  }
+
+  // ── 数据分桶 ──────────────────────────────────
+  function validIds() { return validGroupIds; }
+
+  function rankOf(file, field) {
+    const value = Number(file && file[field]);
+    return Number.isFinite(value) ? value : 0;
+  }
+
+  function openedAtValue(file) {
+    const value = Date.parse(file && file.lastOpenedAt || '');
+    return Number.isFinite(value) ? value : 0;
+  }
+
+  function byRank(field) {
+    return (a, b) => rankOf(a, field) - rankOf(b, field)
+      || openedAtValue(b) - openedAtValue(a)
+      || String(a.id || a.path).localeCompare(String(b.id || b.path));
+  }
+
+  function rebuildFileIndex() {
+    validGroupIds = new Set(lastGroups.map((group) => group.id));
+    const buckets = new Map();
+    lastGroups.forEach((group) => buckets.set(group.id, []));
+    const favorites = [];
+    const inbox = [];
+    lastFiles.forEach((file) => {
+      if (!file || !file.path) return;
+      const cached = fileStatsCache.get(file.path);
+      if (cached) Object.assign(file, cached);
+      if (file.favorite) favorites.push(file);
+      const groupId = file.groupId || '';
+      if (groupId && validGroupIds.has(groupId)) buckets.get(groupId).push(file);
+      else inbox.push(file);
+    });
+    buckets.forEach((files) => files.sort(byRank('groupRank')));
+    inbox.sort(byRank('groupRank'));
+    favorites.sort(byRank('favoriteRank'));
+    const recent = lastFiles.slice().filter((file) => file && file.path)
+      .sort((a, b) => openedAtValue(b) - openedAtValue(a)
+        || String(a.id || a.path).localeCompare(String(b.id || b.path)))
+      .slice(0, recentLimit);
+    buckets.set('', recent);
+    buckets.set(FAVORITES_PAGE, favorites);
+    buckets.set(INBOX_PAGE, inbox);
+    fileBuckets = buckets;
+  }
+
+  // “最近”按打开时间自动计算；收藏、未分组与自定义分组各自保持独立顺序。
+  function filesOf(gid) {
+    return fileBuckets.get(gid) || [];
   }
 
   function nameOf(gid) {
     if (gid === '') return '最近';
     if (gid === FAVORITES_PAGE) return '收藏';
+    if (gid === INBOX_PAGE) return '未分组';
     const g = lastGroups.find((x) => x.id === gid);
     return g ? g.name : '最近';
   }
@@ -1547,9 +1685,11 @@
   // ── 渲染：左栏 + 右栏 ─────────────────────────
   function render(options) {
     // 选中的用户组若已被删 → 回到最近。
-    if (activeGroup && activeGroup !== FAVORITES_PAGE && !validIds().has(activeGroup)) {
+    if (activeGroup && activeGroup !== FAVORITES_PAGE && activeGroup !== INBOX_PAGE
+      && !validIds().has(activeGroup)) {
       activeGroup = '';
     }
+    rebuildFileIndex();
     renderDots();
     renderPanel(options);
   }
@@ -1557,7 +1697,11 @@
   // 页圆点（最近 + 收藏 + 各自定义分组）+ 末尾「+」新建分组。
   function renderDots() {
     dots.innerHTML = '';
-    const pages = [{ id: '', name: '最近' }, { id: FAVORITES_PAGE, name: '收藏' }]
+    const pages = [
+      { id: '', name: '最近' },
+      { id: FAVORITES_PAGE, name: '收藏' },
+      { id: INBOX_PAGE, name: '未分组' },
+    ]
       .concat(lastGroups.map((g) => ({ id: g.id, name: g.name })));
     pages.forEach((g) => {
       const dot = document.createElement('button');
@@ -1566,7 +1710,9 @@
       if (!studyActive && !cadenceActive && !notesActive && !calendarActive
         && !reviewActive && !focusActive && g.id === activeGroup) dot.classList.add('active');
       dot.dataset.groupId = g.id;
-      if (g.id !== '' && g.id !== FAVORITES_PAGE) dot.setAttribute('data-user-content', '');
+      if (g.id !== '' && g.id !== FAVORITES_PAGE && g.id !== INBOX_PAGE) {
+        dot.setAttribute('data-user-content', '');
+      }
       dot.setAttribute('aria-label', g.name);
 
       const bubble = document.createElement('span');
@@ -1576,7 +1722,7 @@
 
       dot.addEventListener('click', () => navigateTo(g.id));
       // 自定义组：右键 改名/删除
-      if (g.id !== '' && g.id !== FAVORITES_PAGE) {
+      if (g.id !== '' && g.id !== FAVORITES_PAGE && g.id !== INBOX_PAGE) {
         dot.addEventListener('contextmenu', (e) => {
           e.preventDefault();
           e.stopPropagation();
@@ -1586,7 +1732,7 @@
       }
       // 3c：拖拽归类——把文件拖到圆点 = 移到该组
       dot.addEventListener('dragover', (e) => {
-        if (g.id === FAVORITES_PAGE) return;
+        if (g.id === FAVORITES_PAGE || g.id === '') return;
         const files = !draggingPath && dtHasFiles(e.dataTransfer);
         if (!draggingPath && !files) return;
         e.preventDefault();
@@ -1595,7 +1741,7 @@
       });
       dot.addEventListener('dragleave', () => dot.classList.remove('drag-over'));
       dot.addEventListener('drop', (e) => {
-        if (g.id === FAVORITES_PAGE) return;
+        if (g.id === FAVORITES_PAGE || g.id === '') return;
         dot.classList.remove('drag-over');
         if (!draggingPath && dtHasFiles(e.dataTransfer)) {   // 外部拖入 .canvas → 复制导入到该组
           e.preventDefault();
@@ -1606,7 +1752,7 @@
         e.preventDefault();
         const path = (e.dataTransfer && e.dataTransfer.getData('text/plain')) || draggingPath;
         draggingPath = null;
-        if (path) moveFileToGroup(path, g.id);
+        if (path) moveFileToGroup(path, g.id === INBOX_PAGE ? '' : g.id);
       });
       dots.appendChild(dot);
       bindSpineHoverTarget(dot);
@@ -1626,6 +1772,7 @@
       floatingInput({ placeholder: '分组名称', anchor: add, onCommit: (name) => createGroup(name) });
     });
     dots.appendChild(add);
+    bindSpineHoverTarget(add);
     requestAnimationFrame(syncActiveSpineOrb);
   }
 
@@ -1678,20 +1825,25 @@
     const prevRects = (options && options.animateMoves) ? captureRecentRects() : null;
     const staggerEnter = !!(options && options.staggerEnter);
     if (panelTitle) {
-      panelTitle.toggleAttribute('data-user-content', activeGroup !== '' && activeGroup !== FAVORITES_PAGE);
+      panelTitle.toggleAttribute('data-user-content', activeGroup !== ''
+        && activeGroup !== FAVORITES_PAGE && activeGroup !== INBOX_PAGE);
       panelTitle.textContent = nameOf(activeGroup);
     }
+    if (fileStatsObserver) fileStatsObserver.disconnect();
     fileList.innerHTML = '';
     panelFiles = filesOf(activeGroup);
+    fileList.classList.toggle('is-large-list', panelFiles.length > LARGE_LIST_THRESHOLD);
     if (panelFiles.length === 0) {
       selectedIndex = -1;
       const empty = document.createElement('li');
       empty.className = 'group-empty soft-enter';
       empty.textContent = activeGroup === ''
-        ? '（这里没有未分组的画布）'
+        ? '（还没有最近打开的画布）'
         : activeGroup === FAVORITES_PAGE
           ? '（还没有收藏的画布）'
-          : '（空 — 拖文件进来，或右键画布选「移动到」）';
+          : activeGroup === INBOX_PAGE
+            ? '（还没有未分组的画布）'
+            : '（空 — 拖文件进来，或右键画布选「移动到」）';
       fileList.appendChild(empty);
       return;
     }
@@ -1699,7 +1851,7 @@
     panelFiles.forEach((f, i) => {
       const li = buildFileItem(f);
       if (i === selectedIndex) li.classList.add('file-selected');
-      if (staggerEnter) {
+      if (staggerEnter && panelFiles.length <= STAGGER_LIST_LIMIT) {
         li.classList.add('recent-enter');
         li.style.setProperty('--enter-delay', Math.min(i * 46, 368) + 'ms');
         li.addEventListener('animationend', () => {
@@ -1709,6 +1861,7 @@
       }
       fileList.appendChild(li);
     });
+    observeVisibleFileStats();
     if (flashImportPath) {
       let flashLi = null;
       fileList.querySelectorAll('.recent-item').forEach((li) => {
@@ -1839,16 +1992,35 @@
       .catch(showRuntimeWarning);
   }
 
-  // 把某下标的文件移到分组 gid（''=最近）：乐观更新 + 飞出动画 + 静默接口
+  function nextLocalGroupRank(gid) {
+    const ranks = lastFiles
+      .filter((file) => (file.groupId || '') === gid)
+      .map((file) => rankOf(file, 'groupRank'));
+    return (ranks.length ? Math.max(...ranks) : 0) + 1024;
+  }
+
+  function staysInActiveView(file, gid) {
+    if (activeGroup === '') return true;
+    if (activeGroup === FAVORITES_PAGE) return !!file.favorite;
+    if (activeGroup === INBOX_PAGE) return !gid;
+    return activeGroup === gid;
+  }
+
+  // 把某下标的文件移到分组 gid（''=未分组）：智能页保留卡片，普通分组离开时沿用原飞出动画
   function doMoveAnimated(idx, gid, toastMsg) {
     const f = panelFiles[idx];
     if (!f) return;
     const li = activeItems()[idx];
     const lf = lastFiles.find((x) => x.path === f.path);
-    if (lf) { if (gid) lf.group = gid; else delete lf.group; }
-    panelFiles.splice(idx, 1);
+    if (lf) {
+      lf.groupId = gid || '';
+      lf.groupRank = nextLocalGroupRank(gid || '');
+    }
+    const remainsVisible = staysInActiveView(f, gid || '');
     pendingDeleteIndex = -1;
-    animateOut(li);
+    if (!remainsVisible) animateOut(li);
+    rebuildFileIndex();
+    panelFiles = filesOf(activeGroup);
     renderDots();
     if (toastMsg) showToast(toastMsg);
     fetch('/api/file-set-group', {
@@ -1857,8 +2029,9 @@
       body: JSON.stringify({ path: f.path, group: gid }),
     }).then((r) => { if (!r.ok) refresh(); }).catch(() => refresh());
     selectedIndex = Math.min(idx, panelFiles.length - 1);
-    refreshSelectionHighlight();
-    if (panelFiles.length === 0) {
+    if (remainsVisible) renderPanel({ animateMoves: true });
+    else refreshSelectionHighlight();
+    if (!remainsVisible && panelFiles.length === 0) {
       setTimeout(() => { if (panelFiles.length === 0) renderPanel(); }, 280);
     }
   }
@@ -1869,31 +2042,33 @@
     if (!f) { showToast('先用 ↑↓ 选中一个画布'); return; }
     if (n > lastGroups.length) { showToast('没有第 ' + n + ' 个分组'); return; }
     const g = lastGroups[n - 1];
-    if ((f.group || '') === g.id) { showToast('已经在「' + g.name + '」'); return; }
+    if ((f.groupId || '') === g.id) { showToast('已经在「' + g.name + '」'); return; }
     doMoveAnimated(selectedIndex, g.id, '已移到「' + g.name + '」');
   }
 
   // 3c-2：组内手动排序——把选中文件上移(-1)/下移(+1)一位
   function reorderSelected(dir) {
     if (selectedIndex < 0) return;
+    if (activeGroup === '') { showToast('「最近」按打开时间自动排序'); return; }
     const j = selectedIndex + dir;
     if (j < 0 || j >= panelFiles.length) return;
     const tmp = panelFiles[selectedIndex];
     panelFiles[selectedIndex] = panelFiles[j];
     panelFiles[j] = tmp;
     selectedIndex = j;
-    syncLastFilesOrder();      // 同步 lastFiles，切组回来顺序也对
+    syncPanelRanks();
     renderPanel({ animateMoves: true }); // 重建后用 FLIP 让卡片滑到新顺序
     refreshSelectionHighlight();
     fetch('/api/reorder-files', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ paths: panelFiles.map((f) => f.path) }),
-    }).catch(() => refresh());
+      body: JSON.stringify({ paths: panelFiles.map((f) => f.path), view: activeGroup }),
+    }).then((response) => { if (!response.ok) refresh(); }).catch(() => refresh());
   }
 
   // 3c-2 拖拽版：把 srcPath 拖到 targetPath 的前(before=true)/后，组内调序
   function reorderByDrag(srcPath, targetPath, before) {
+    if (activeGroup === '') { showToast('「最近」按打开时间自动排序'); return; }
     const srcIdx = panelFiles.findIndex((x) => x.path === srcPath);
     if (srcIdx < 0 || srcPath === targetPath) return;
     const src = panelFiles.splice(srcIdx, 1)[0];
@@ -1902,14 +2077,14 @@
     const insertAt = before ? tIdx : tIdx + 1;
     panelFiles.splice(insertAt, 0, src);
     selectedIndex = insertAt;
-    syncLastFilesOrder();      // 同步 lastFiles，切组回来顺序也对
+    syncPanelRanks();
     renderPanel({ animateMoves: true }); // 重建后用 FLIP 让卡片滑到新顺序
     refreshSelectionHighlight();
     fetch('/api/reorder-files', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ paths: panelFiles.map((f) => f.path) }),
-    }).catch(() => refresh());
+      body: JSON.stringify({ paths: panelFiles.map((f) => f.path), view: activeGroup }),
+    }).then((response) => { if (!response.ok) refresh(); }).catch(() => refresh());
   }
 
   // 清掉右栏所有拖拽插入指示线
@@ -1918,34 +2093,37 @@
       .forEach((el) => el.classList.remove('drop-before', 'drop-after'));
   }
 
-  // 把 lastFiles 中"当前组"那些文件按 panelFiles 的新顺序重排（占原槽位）
-  function syncLastFilesOrder() {
-    const orderIdx = new Map(panelFiles.map((f, i) => [f.path, i]));
-    const slots = [];
-    const items = [];
-    lastFiles.forEach((f, i) => {
-      if (orderIdx.has(f.path)) { slots.push(i); items.push(f); }
-    });
-    items.sort((a, b) => orderIdx.get(a.path) - orderIdx.get(b.path));
-    slots.forEach((slot, k) => { lastFiles[slot] = items[k]; });
+  // 收藏页与分组页各自维护 rank，不再通过重排全局数组相互干扰。
+  function syncPanelRanks() {
+    const field = activeGroup === FAVORITES_PAGE ? 'favoriteRank' : 'groupRank';
+    panelFiles.forEach((file, index) => { file[field] = index * 1024; });
   }
 
-  // 3d：把选中文件移回"最近"
-  function moveSelectedToRecent() {
+  // 3d：把选中文件移回“未分组”
+  function moveSelectedToInbox() {
     const f = panelFiles[selectedIndex];
     if (!f) { showToast('先用 ↑↓ 选中一个画布'); return; }
-    const inRecent = !f.group || !validIds().has(f.group);
-    if (inRecent) { showToast('已经在「最近」'); return; }
-    doMoveAnimated(selectedIndex, '', '已移回「最近」');
+    const inInbox = !f.groupId || !validIds().has(f.groupId);
+    if (inInbox) { showToast('已经在「未分组」'); return; }
+    doMoveAnimated(selectedIndex, '', '已移到「未分组」');
+  }
+
+  async function activateFileItem(f, li) {
+    if (!f) return;
+    if (f.exists !== false && !fileStatsCache.has(f.path)) {
+      await requestFileStats([f.path], fileStatsRequestSeq);
+    }
+    if (f.exists !== false) { gotoEditor(f.path, li); return; }
+    const ok = window.confirm(englishUI()
+      ? 'This file was moved or deleted:\n' + f.path + '\n\nRemove it from the list?'
+      : '这个文件已被移动或删除：\n' + f.path + '\n\n要从列表移除吗？');
+    if (ok) removeRecent(f.path);
   }
 
   // ── 单个文件项 ────────────────────────────────
   function buildFileItem(f) {
-    const missing = f.exists === false;
-
     const li = document.createElement('li');
     li.className = 'recent-item';
-    if (missing) li.classList.add('recent-item-missing');
     li.dataset.path = f.path;
     li.tabIndex = 0;
 
@@ -1956,12 +2134,6 @@
     titleText.textContent = f.title || '(未命名)';
     if (f.title) titleText.setAttribute('data-user-content', '');
     title.appendChild(titleText);
-    if (missing) {
-      const tag = document.createElement('span');
-      tag.className = 'recent-item-tag';
-      tag.textContent = '文件已不在';
-      title.appendChild(tag);
-    }
 
     const meta = document.createElement('div');
     meta.className = 'recent-item-meta';
@@ -2002,13 +2174,7 @@
     favorite.addEventListener('keydown', (e) => e.stopPropagation());
     li.append(title, meta, favorite);
 
-    const activate = () => {
-      if (!missing) { gotoEditor(f.path, li); return; }
-      const ok = window.confirm(englishUI()
-        ? 'This file was moved or deleted:\n' + f.path + '\n\nRemove it from the list?'
-        : '这个文件已被移动或删除：\n' + f.path + '\n\n要从列表移除吗？');
-      if (ok) removeRecent(f.path);
-    };
+    const activate = () => activateFileItem(f, li);
 
     li.addEventListener('click', activate);
     li.addEventListener('keydown', (e) => {
@@ -2026,54 +2192,60 @@
       openFileMenu(e.clientX, e.clientY, f, li);
     });
 
-    // 3c：拖拽到左栏某个分组 → 移动（失效文件不让拖）
-    if (!missing) {
-      li.draggable = true;
-      li.addEventListener('dragstart', (e) => {
-        draggingPath = f.path;
-        e.dataTransfer.effectAllowed = 'move';
-        try { e.dataTransfer.setData('text/plain', f.path); } catch (err) {}
-        li.classList.add('dragging');
-        closeContextMenu();
-      });
-      li.addEventListener('dragend', () => {
-        draggingPath = null;
-        li.classList.remove('dragging');
-        dots.querySelectorAll('.drag-over').forEach((el) => el.classList.remove('drag-over'));
-        clearDropIndicators();
-      });
-      // 3c-2 拖拽排序：拖到另一文件的上半/下半 → 插到它前/后（同组内）
-      li.addEventListener('dragover', (e) => {
-        if (!draggingPath || draggingPath === f.path) return;
-        if (panelFiles.findIndex((x) => x.path === draggingPath) < 0) return; // 不是组内拖拽
-        e.preventDefault();
-        e.dataTransfer.dropEffect = 'move';
-        const rect = li.getBoundingClientRect();
-        const before = e.clientY < rect.top + rect.height / 2;
-        li.classList.toggle('drop-before', before);
-        li.classList.toggle('drop-after', !before);
-      });
-      li.addEventListener('dragleave', () => {
-        li.classList.remove('drop-before', 'drop-after');
-      });
-      li.addEventListener('drop', (e) => {
-        if (!draggingPath || draggingPath === f.path) return;
-        e.preventDefault();
-        e.stopPropagation();
-        const before = li.classList.contains('drop-before');
-        li.classList.remove('drop-before', 'drop-after');
-        const src = draggingPath;
-        draggingPath = null;
-        reorderByDrag(src, f.path, before);
-      });
-    }
+    // 3c：拖拽到左栏某个分组 → 移动；文件状态由懒加载统计动态更新。
+    li.addEventListener('dragstart', (e) => {
+      if (f.exists === false) { e.preventDefault(); return; }
+      draggingPath = f.path;
+      e.dataTransfer.effectAllowed = 'move';
+      try { e.dataTransfer.setData('text/plain', f.path); } catch (err) {}
+      li.classList.add('dragging');
+      closeContextMenu();
+    });
+    li.addEventListener('dragend', () => {
+      draggingPath = null;
+      li.classList.remove('dragging');
+      dots.querySelectorAll('.drag-over').forEach((el) => el.classList.remove('drag-over'));
+      clearDropIndicators();
+    });
+    // 3c-2 拖拽排序：拖到另一文件的上半/下半 → 插到它前/后（“最近”除外）。
+    li.addEventListener('dragover', (e) => {
+      if (activeGroup === '' || !draggingPath || draggingPath === f.path) return;
+      if (panelFiles.findIndex((x) => x.path === draggingPath) < 0) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      const rect = li.getBoundingClientRect();
+      const before = e.clientY < rect.top + rect.height / 2;
+      li.classList.toggle('drop-before', before);
+      li.classList.toggle('drop-after', !before);
+    });
+    li.addEventListener('dragleave', () => {
+      li.classList.remove('drop-before', 'drop-after');
+    });
+    li.addEventListener('drop', (e) => {
+      if (activeGroup === '' || !draggingPath || draggingPath === f.path) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const before = li.classList.contains('drop-before');
+      li.classList.remove('drop-before', 'drop-after');
+      const src = draggingPath;
+      draggingPath = null;
+      reorderByDrag(src, f.path, before);
+    });
+    updateFileItemStats(li, f);
     return li;
   }
 
   function toggleFavorite(f, li) {
     const next = !f.favorite;
     f.favorite = next;
-    if (!next) delete f.favorite;
+    if (next) {
+      const ranks = lastFiles.filter((item) => item.favorite && item !== f)
+        .map((item) => rankOf(item, 'favoriteRank'));
+      f.favoriteRank = (ranks.length ? Math.min(...ranks) : 0) - 1024;
+    } else {
+      delete f.favorite;
+      delete f.favoriteRank;
+    }
     const button = li && li.querySelector('.recent-favorite');
     if (button) {
       const icon = button.querySelector('.recent-favorite-icon');
@@ -2094,6 +2266,8 @@
       const idx = panelFiles.findIndex((x) => x.path === f.path);
       if (idx >= 0) panelFiles.splice(idx, 1);
       animateOut(li);
+      rebuildFileIndex();
+      panelFiles = filesOf(activeGroup);
       renderDots();
       selectedIndex = Math.min(selectedIndex, panelFiles.length - 1);
       refreshSelectionHighlight();
@@ -2101,12 +2275,13 @@
         setTimeout(() => { if (panelFiles.length === 0) renderPanel(); }, 280);
       }
     } else {
+      rebuildFileIndex();
       renderDots();
     }
     fetch('/api/favorite-toggle', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: f.path }),
+      body: JSON.stringify({ path: f.path, favorite: next }),
     }).then((r) => { if (!r.ok) refresh(); }).catch(() => refresh());
   }
 
@@ -2212,10 +2387,23 @@
     }
   }
 
+  function groupDestinationName(gid) {
+    return gid ? nameOf(gid) : nameOf(INBOX_PAGE);
+  }
+
+  function targetGroupForActivePage() {
+    return validIds().has(activeGroup) ? activeGroup : '';
+  }
+
   function moveFileToGroup(path, gid) {
     const idx = panelFiles.findIndex((x) => x.path === path);
-    if (idx >= 0 && gid !== activeGroup) {
-      doMoveAnimated(idx, gid, '已移到「' + nameOf(gid) + '」');
+    const file = idx >= 0 ? panelFiles[idx] : lastFiles.find((item) => item.path === path);
+    if (file && (file.groupId || '') === (gid || '')) {
+      showToast('已经在「' + groupDestinationName(gid) + '」');
+      return;
+    }
+    if (idx >= 0) {
+      doMoveAnimated(idx, gid, '已移到「' + groupDestinationName(gid) + '」');
       return;
     }
     fetch('/api/file-set-group', {
@@ -2227,8 +2415,8 @@
 
   async function deleteGroup(group) {
     const ok = window.confirm(englishUI()
-      ? 'Delete the group “' + group.name + '”?\nIts canvases will return to Recent; the canvas files themselves will not be deleted.'
-      : '删除分组「' + group.name + '」？\n组里的画布会回到「最近」（画布文件本身不会删）。');
+      ? 'Delete the group “' + group.name + '”?\nIts canvases will become ungrouped; the canvas files themselves will not be deleted.'
+      : '删除分组「' + group.name + '」？\n组里的画布会移到「未分组」（画布文件本身不会删）。');
     if (!ok) return;
     try {
       await fetch('/api/group-delete', {
@@ -2236,7 +2424,7 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: group.id }),
       });
-      if (activeGroup === group.id) { activeGroup = ''; saveActive(); }
+      if (activeGroup === group.id) { activeGroup = INBOX_PAGE; saveActive(); }
       await refresh();
     } catch (err) { console.warn('[画布] 删除分组失败', err); }
   }
@@ -2367,8 +2555,8 @@
     addMenuItem('从列表移除', () => removeRecent(f.path));
     addMenuSep();
     addMenuLabel('移动到');
-    const cur = f.group || '';
-    if (cur !== '') addMenuItem('最近', () => moveFileToGroup(f.path, ''));
+    const cur = f.groupId || '';
+    if (cur !== '') addMenuItem('未分组', () => moveFileToGroup(f.path, ''));
     lastGroups.forEach((g) => {
       if (g.id !== cur) {
         const groupItem = addMenuItem(g.name, () => moveFileToGroup(f.path, g.id));
@@ -2394,8 +2582,32 @@
       anchor: anchorEl,
       onCommit: (name) => commitGroupRename(group, name),
     }));
+    const index = lastGroups.findIndex((item) => item.id === group.id);
+    if (index > 0) addMenuItem('向上移动', () => moveGroupBy(group.id, -1));
+    if (index >= 0 && index < lastGroups.length - 1) {
+      addMenuItem('向下移动', () => moveGroupBy(group.id, 1));
+    }
     addMenuItem('删除分组', () => deleteGroup(group), true);
     showMenuAt(x, y);
+  }
+
+  async function moveGroupBy(groupId, delta) {
+    const index = lastGroups.findIndex((group) => group.id === groupId);
+    const next = index + delta;
+    if (index < 0 || next < 0 || next >= lastGroups.length) return;
+    const moved = lastGroups.splice(index, 1)[0];
+    lastGroups.splice(next, 0, moved);
+    renderDots();
+    try {
+      const response = await fetch('/api/groups-reorder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ order: lastGroups.map((group) => group.id) }),
+      });
+      if (!response.ok) await refresh();
+    } catch (err) {
+      await refresh();
+    }
   }
 
   document.addEventListener('click', closeContextMenu);
@@ -2436,7 +2648,10 @@
     } else if (e.key === 'Enter') {
       cancelPendingDelete();
       const f = panelFiles[selectedIndex];
-      if (f && f.exists !== false) { e.preventDefault(); gotoEditor(f.path); }
+      if (f) {
+        e.preventDefault();
+        activateFileItem(f, activeItems()[selectedIndex]);
+      }
     } else if (/^[1-9]$/.test(e.key)) {
       e.preventDefault();
       cancelPendingDelete();
@@ -2444,7 +2659,7 @@
     } else if (e.key === '0' || e.key === 'Backspace') {
       e.preventDefault();
       cancelPendingDelete();
-      moveSelectedToRecent();
+      moveSelectedToInbox();
     }
   });
 
@@ -2458,7 +2673,7 @@
         if (resp.ok && json.path) {
           // 在某个自定义分组页新建 → 把新画布直接归入当前分组；收藏页/最近页仍留在「最近」
           // （与拖入导入同一约定，见 drop 处理处）。归类失败不阻断进入画布，大不了留在「最近」。
-          const gid = activeGroup === FAVORITES_PAGE ? '' : activeGroup;
+          const gid = targetGroupForActivePage();
           if (gid) {
             try {
               await fetch('/api/file-set-group', {
@@ -2675,7 +2890,9 @@
     try { return window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { return false; }
   })();
 
-  function pageOrder() { return ['', FAVORITES_PAGE].concat(lastGroups.map((g) => g.id)); }
+  function pageOrder() {
+    return ['', FAVORITES_PAGE, INBOX_PAGE].concat(lastGroups.map((g) => g.id));
+  }
   function pageIndexOf(gid) {
     const i = pageOrder().indexOf(gid);
     return i < 0 ? 0 : i;
@@ -2848,6 +3065,10 @@
       if (requestId !== recentRefreshSeq) return false;
       lastFiles = (json && json.files) || [];
       lastGroups = (json && json.groups) || [];
+      recentLimit = Number.isFinite(Number(json && json.recentLimit))
+        ? Math.max(1, Number(json.recentLimit)) : 30;
+      fileStatsRequestSeq += 1;
+      fileStatsCache.clear();
       render();
       const shouldShowStudy = (initialStudy || studyActive) && !specialPagesHidden;
       const shouldShowCalendar = (initialCalendar || calendarActive) && !specialPagesHidden;
@@ -2912,7 +3133,7 @@
     e.preventDefault();
     setCanvasDropHint(false);
     if (!startPageAcceptsCanvasDrop()) return;
-    const gid = activeGroup === FAVORITES_PAGE ? '' : activeGroup;
+    const gid = targetGroupForActivePage();
     importCanvasFiles(e.dataTransfer.files, gid);
   });
 

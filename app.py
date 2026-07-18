@@ -28,6 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import unicodedata
 import webbrowser
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
@@ -43,6 +44,7 @@ CANVASES = ROOT / "canvases"
 TRASH = CANVASES / "回收站"   # 右键删除 = 移到这里（用户自己管理，可恢复）
 DATA = ROOT / "data"
 RECENT_FILE = DATA / "recent.json"
+RECENT_BACKUP_FILE = DATA / "recent.backup.json"
 BACKGROUND_PREF_FILE = DATA / "background.json"
 BACKGROUND_UPLOAD_DIR = DATA / "backgrounds"
 VIEWPORT_STATE_FILE = DATA / "viewport.json"
@@ -62,7 +64,10 @@ REVIEW_DB_FILE = DATA / "review.db"   # 独立复习卡片、调度状态与复�
 DEFAULT_PORT = 8765
 PORT_ATTEMPTS = 20
 RECENT_LIMIT = 30
-RUNTIME_SCHEMA = 2
+RECENT_SCHEMA = 3
+RECENT_RANK_STEP = 1024
+RECENT_STATS_BATCH_LIMIT = 200
+RUNTIME_SCHEMA = 3
 
 # 额外授权目录（--allow-dir）：这些目录下的 .canvas 视为可 load/save，
 # 无需先登记 recent。供可信外部调用方按协议 A 整目录授权用。
@@ -379,31 +384,165 @@ def _prune_node_annotations(canvas_path: Path, node_ids: set[str]) -> int:
     return removed
 
 
+def _recent_file_id() -> str:
+    return "cf_" + uuid.uuid4().hex
+
+
+def _recent_group_id() -> str:
+    return "g_" + uuid.uuid4().hex
+
+
+def _clean_recent_rank(value, fallback: int) -> int | float:
+    if isinstance(value, bool):
+        return fallback
+    try:
+        rank = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    if not math.isfinite(rank):
+        return fallback
+    return int(rank) if rank.is_integer() else rank
+
+
+def _clean_group_name(value) -> str:
+    name = unicodedata.normalize("NFC", str(value or "")).strip()
+    return "".join(
+        ch for ch in name if not unicodedata.category(ch).startswith("C")
+    )[:40]
+
+
+def _normalize_recent(raw) -> tuple[dict, bool]:
+    """把历史 recent.json 收敛到 v3 图书馆结构。
+
+    v3 不再用 files[] 的全局位置同时表达多个视图的顺序：自定义分组使用
+    groupRank，收藏使用 favoriteRank；最近页由 lastOpenedAt 动态计算。
+    """
+    source = raw if isinstance(raw, dict) else {}
+    groups: list[dict] = []
+    group_ids: set[str] = set()
+    group_id_aliases: dict[str, str] = {}
+    reserved_group_ids = {"", "__favorites__", "__inbox__"}
+    raw_groups = source.get("groups") if isinstance(source.get("groups"), list) else []
+    for item in raw_groups:
+        if not isinstance(item, dict):
+            continue
+        original_gid = str(item.get("id") or "").strip()
+        gid = original_gid
+        name = _clean_group_name(item.get("name"))
+        if not original_gid or original_gid in group_id_aliases or not name:
+            continue
+        if gid in reserved_group_ids:
+            gid = _recent_group_id()
+        group_id_aliases[original_gid] = gid
+        group_ids.add(gid)
+        groups.append({"id": gid, "name": name})
+
+    files: list[dict] = []
+    file_ids: set[str] = set()
+    group_rank_counts: dict[str, int] = {}
+    favorite_rank_count = 0
+    raw_files = source.get("files") if isinstance(source.get("files"), list) else []
+    for item in raw_files:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip()
+        if not path:
+            continue
+        file_id = str(item.get("id") or "").strip()
+        if not file_id or file_id in file_ids:
+            file_id = _recent_file_id()
+        file_ids.add(file_id)
+        legacy_group = item.get("groupId", item.get("group", ""))
+        raw_group_id = str(legacy_group or "").strip()
+        group_id = group_id_aliases.get(raw_group_id, raw_group_id)
+        if group_id not in group_ids:
+            group_id = ""
+        group_index = group_rank_counts.get(group_id, 0)
+        group_rank_counts[group_id] = group_index + 1
+        entry = {
+            "id": file_id,
+            "path": path,
+            "title": str(item.get("title") or Path(path).stem or "Untitled"),
+            "lastOpenedAt": str(item.get("lastOpenedAt") or ""),
+            "groupId": group_id,
+            "groupRank": _clean_recent_rank(
+                item.get("groupRank"), group_index * RECENT_RANK_STEP,
+            ),
+        }
+        if bool(item.get("favorite")):
+            entry["favorite"] = True
+            entry["favoriteRank"] = _clean_recent_rank(
+                item.get("favoriteRank"), favorite_rank_count * RECENT_RANK_STEP,
+            )
+            favorite_rank_count += 1
+        files.append(entry)
+
+    normalized = {"version": RECENT_SCHEMA, "groups": groups, "files": files}
+    return normalized, normalized != source
+
+
+def _recent_corrupt_path() -> Path:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    target = DATA / f"recent.corrupt-{stamp}.json"
+    if target.exists():
+        target = DATA / f"recent.corrupt-{stamp}-{uuid.uuid4().hex[:6]}.json"
+    return target
+
+
+def _preserve_corrupt_recent(content: bytes) -> None:
+    """隔离损坏的元数据，避免下一次正常操作直接覆盖唯一原件。"""
+    target = _recent_corrupt_path()
+    try:
+        os.replace(RECENT_FILE, target)
+        return
+    except OSError:
+        pass
+    try:
+        _atomic_write_bytes(target, content)
+        RECENT_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _save_recent_unlocked(data: dict, *, backup: bool = True) -> None:
+    normalized, _ = _normalize_recent(data)
+    if backup and RECENT_FILE.is_file():
+        try:
+            current = RECENT_FILE.read_bytes()
+            json.loads(current.decode("utf-8-sig"))
+            _atomic_write_bytes(RECENT_BACKUP_FILE, current)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            pass
+    _atomic_write_json(RECENT_FILE, normalized)
+    data.clear()
+    data.update(normalized)
+
+
 @_serialized_data
 def load_recent() -> dict:
-    """读 recent.json，并规范化成 v2 结构：{version, groups[], files[]}。
-
-    向后兼容旧格式（只有 files、无 groups）：补上空 groups，旧文件因无 group
-    字段自然都归入"最近"。"最近"是隐式特殊组，不出现在 groups 里。
-    """
-    data: dict
-    if not RECENT_FILE.exists():
-        data = {}
-    else:
+    """读取 v3 图书馆元数据；兼容旧版并自动保留损坏原件。"""
+    source = {}
+    changed = False
+    if RECENT_FILE.is_file():
+        content = b""
         try:
-            data = json.loads(RECENT_FILE.read_text(encoding="utf-8-sig"))
-        except (OSError, json.JSONDecodeError):
-            data = {}
-    if not isinstance(data, dict):
-        data = {}
-    if not isinstance(data.get("files"), list):
-        data["files"] = []
-    if not isinstance(data.get("groups"), list):
-        data["groups"] = []
-    data["version"] = 2
+            content = RECENT_FILE.read_bytes()
+            source = json.loads(content.decode("utf-8-sig"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            _preserve_corrupt_recent(content)
+            if RECENT_BACKUP_FILE.is_file():
+                try:
+                    source = json.loads(RECENT_BACKUP_FILE.read_text(encoding="utf-8-sig"))
+                    changed = True
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    source = {}
+    data, normalized = _normalize_recent(source)
+    changed = changed or normalized
     if _repair_portable_recent_paths(data):
+        changed = True
+    if changed:
         try:
-            _atomic_write_json(RECENT_FILE, data)
+            _save_recent_unlocked(data, backup=RECENT_FILE.is_file())
         except OSError:
             pass
     return data
@@ -411,7 +550,7 @@ def load_recent() -> dict:
 
 @_serialized_data
 def save_recent(data: dict) -> None:
-    _atomic_write_json(RECENT_FILE, data)
+    _save_recent_unlocked(data)
 
 
 def load_background_preference() -> dict:
@@ -634,43 +773,33 @@ def _repair_portable_recent_paths(data: dict) -> bool:
 
 @_serialized_data
 def register_recent(path: Path, title: str | None = None) -> dict:
-    """把一个文件登记/提前到队首，返回更新后的 recent。
-
-    保留该文件已有的分组归属（重新打开已归类的文件，不会被踢回"最近"）。
-    淘汰逻辑：只对"最近"（无 group、未收藏）保留最新 RECENT_LIMIT 条；
-    **已归类或已收藏的文件永不淘汰**（用户特意整理的内容不能丢）。
-    """
+    """登记画布并刷新打开时间；分组与手动顺序保持不变。"""
     canon = _norm(path)
     if title is None:
         title = Path(canon).stem
-    now = datetime.now().replace(microsecond=0).isoformat()
+    # 批量导入可能在同一秒完成；保留微秒，确保“最近”顺序不会退化为随机 id 排序。
+    now = datetime.now().isoformat(timespec="microseconds")
     data = load_recent()
     old = next(
         (f for f in data["files"] if _norm(f.get("path", "")) == canon),
         None,
     )
-    # 已归类的文件：原地更新 lastOpenedAt，**不移动位置**——否则会打乱用户在组内
-    # 手动排好的顺序（3c-2）。只有"最近"（无 group）的文件才顶到队首按时间排。
-    if old and old.get("group"):
+    if old:
         old["lastOpenedAt"] = now
+        old["title"] = title
         save_recent(data)
         return data
-    files = [f for f in data["files"] if _norm(f.get("path", "")) != canon]
-    entry = {"path": canon, "lastOpenedAt": now, "title": title}
-    if old and old.get("favorite"):
-        entry["favorite"] = True
-    files.insert(0, entry)
-    # 只淘汰"最近"（无 group、未收藏）里超出的；已归类或已收藏的全部保留
-    kept = []
-    seen_ungrouped = 0
-    for f in files:
-        if f.get("group") or f.get("favorite"):
-            kept.append(f)
-        else:
-            seen_ungrouped += 1
-            if seen_ungrouped <= RECENT_LIMIT:
-                kept.append(f)
-    data["files"] = kept
+    inbox_ranks = [
+        f.get("groupRank", 0) for f in data["files"] if not f.get("groupId")
+    ]
+    data["files"].append({
+        "id": _recent_file_id(),
+        "path": canon,
+        "lastOpenedAt": now,
+        "title": title,
+        "groupId": "",
+        "groupRank": (min(inbox_ranks) if inbox_ranks else 0) - RECENT_RANK_STEP,
+    })
     save_recent(data)
     return data
 
@@ -750,8 +879,34 @@ def canvas_file_stats(path: Path | str) -> dict:
     return stats
 
 
+def recent_file_stats(paths: list) -> list[dict]:
+    """只统计当前视口附近的已登记画布，避免首页扫描全部历史条目。"""
+    data = load_recent()
+    indexed = {
+        _norm(item.get("path", "")): item.get("path", "")
+        for item in data.get("files", [])
+        if item.get("path")
+    }
+    results: list[dict] = []
+    seen: set[str] = set()
+    for raw in paths[:RECENT_STATS_BATCH_LIMIT]:
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        key = _norm(raw)
+        if key in seen or key not in indexed:
+            continue
+        seen.add(key)
+        path = indexed[key]
+        exists = Path(path).is_file()
+        item = {"path": path, "exists": exists}
+        if exists:
+            item.update(canvas_file_stats(path))
+        results.append(item)
+    return results
+
+
 def group_name_of_path(path: Path | str) -> str:
-    """返回该路径的画布所在分组名；在"最近"/未登记 → 返回空串。
+    """返回该路径的画布所在分组名；在“未分组”/未登记 → 返回空串。
     用于重命名同名冲突时提示用户那个重名画布在哪——因为分组只是标签，
     所有 .canvas 物理上都在同一个 canvases/ 目录，跨分组也会重名。"""
     target = _norm(path)
@@ -759,36 +914,61 @@ def group_name_of_path(path: Path | str) -> str:
     groups = {g.get("id"): g.get("name") for g in data.get("groups", [])}
     for f in data.get("files", []):
         if _norm(f.get("path", "")) == target:
-            return groups.get(f.get("group") or "", "")
+            return groups.get(f.get("groupId") or "", "")
     return ""
 
 
 # ─── 分组（阶段 3a）─────────────────────────────────────────
 
 def new_group_id() -> str:
-    import random
-    import string
-    rnd = "".join(random.choices(string.ascii_lowercase + string.digits, k=3))
-    return "g_" + format(int(datetime.now().timestamp() * 1000), "x") + "_" + rnd
+    return _recent_group_id()
+
+
+def _group_name_taken(data: dict, name: str, *, except_id: str = "") -> bool:
+    key = _clean_group_name(name).casefold()
+    return any(
+        g.get("id") != except_id
+        and _clean_group_name(g.get("name")).casefold() == key
+        for g in data.get("groups", [])
+    )
+
+
+def _next_group_rank(data: dict, gid: str) -> int | float:
+    ranks = [
+        f.get("groupRank", 0)
+        for f in data.get("files", [])
+        if (f.get("groupId") or "") == gid
+    ]
+    return (max(ranks) if ranks else 0) + RECENT_RANK_STEP
 
 
 @_serialized_data
 def group_create(name: str) -> dict:
-    """新建分组，返回 {id, name}。同名允许（用 id 区分）。"""
-    gid = new_group_id()
+    """新建唯一名称分组，返回 {id, name}。"""
     data = load_recent()
-    data["groups"].append({"id": gid, "name": name})
+    clean_name = _clean_group_name(name)
+    if not clean_name:
+        raise ValueError("分组名不能为空")
+    if _group_name_taken(data, clean_name):
+        raise ValueError("已经有同名分组")
+    gid = new_group_id()
+    data["groups"].append({"id": gid, "name": clean_name})
     save_recent(data)
-    return {"id": gid, "name": name}
+    return {"id": gid, "name": clean_name}
 
 
 @_serialized_data
 def group_rename(gid: str, name: str) -> bool:
     data = load_recent()
+    clean_name = _clean_group_name(name)
+    if not clean_name:
+        raise ValueError("分组名不能为空")
+    if _group_name_taken(data, clean_name, except_id=gid):
+        raise ValueError("已经有同名分组")
     hit = False
     for g in data["groups"]:
         if g.get("id") == gid:
-            g["name"] = name
+            g["name"] = clean_name
             hit = True
     if hit:
         save_recent(data)
@@ -797,20 +977,28 @@ def group_rename(gid: str, name: str) -> bool:
 
 @_serialized_data
 def group_delete(gid: str) -> bool:
-    """删分组：从 groups 移除；组内文件 group 清空（回"最近"）。文件本身不动。"""
+    """删分组：组内文件按原顺序进入“未分组”，文件本身不动。"""
     data = load_recent()
     before = len(data["groups"])
     data["groups"] = [g for g in data["groups"] if g.get("id") != gid]
-    for f in data["files"]:
-        if f.get("group") == gid:
-            f.pop("group", None)
+    if len(data["groups"]) == before:
+        return False
+    moved = sorted(
+        (f for f in data["files"] if f.get("groupId") == gid),
+        key=lambda f: (f.get("groupRank", 0), f.get("id", "")),
+    )
+    rank = _next_group_rank(data, "")
+    for f in moved:
+        f["groupId"] = ""
+        f["groupRank"] = rank
+        rank += RECENT_RANK_STEP
     save_recent(data)
-    return len(data["groups"]) != before
+    return True
 
 
 @_serialized_data
 def file_set_group(path: str, gid: str) -> bool:
-    """把某文件移到分组 gid（gid 为空 = 回"最近"）。返回是否命中该文件。"""
+    """把画布移到分组 gid（gid 为空 = 未分组），并放到目标组末尾。"""
     canon = _norm(path)
     data = load_recent()
     valid = gid == "" or any(g.get("id") == gid for g in data["groups"])
@@ -819,10 +1007,9 @@ def file_set_group(path: str, gid: str) -> bool:
     hit = False
     for f in data["files"]:
         if _norm(f.get("path", "")) == canon:
-            if gid:
-                f["group"] = gid
-            else:
-                f.pop("group", None)
+            if (f.get("groupId") or "") != gid:
+                f["groupId"] = gid
+                f["groupRank"] = _next_group_rank(data, gid)
             hit = True
     if hit:
         save_recent(data)
@@ -830,42 +1017,58 @@ def file_set_group(path: str, gid: str) -> bool:
 
 
 @_serialized_data
-def file_toggle_favorite(path: str) -> bool | None:
-    """切换画布收藏状态。未收藏时省略字段，保持 recent.json 简洁。"""
+def file_set_favorite(path: str, favorite: bool) -> bool | None:
+    """幂等设置收藏状态；新收藏排在收藏页最前。"""
     canon = _norm(path)
     data = load_recent()
     for f in data["files"]:
         if _norm(f.get("path", "")) == canon:
-            favorite = not bool(f.get("favorite"))
             if favorite:
                 f["favorite"] = True
+                if "favoriteRank" not in f:
+                    ranks = [
+                        x.get("favoriteRank", 0)
+                        for x in data["files"] if x.get("favorite") and x is not f
+                    ]
+                    f["favoriteRank"] = (
+                        (min(ranks) if ranks else 0) - RECENT_RANK_STEP
+                    )
             else:
                 f.pop("favorite", None)
+                f.pop("favoriteRank", None)
             save_recent(data)
             return favorite
     return None
 
 
 @_serialized_data
-def reorder_files(paths: list) -> None:
-    """按 paths（同组文件的新顺序）重排 recent.files 中这些文件占据的槽位，
-    其他文件位置不变。用于组内手动排序（3c-2）。"""
-    canon_list = [_norm(p) for p in paths]
-    target = set(canon_list)
+def reorder_files(paths: list[str], view: str) -> None:
+    """只重排指定视图的独立 rank，不再扰动收藏与分组之间的顺序。"""
+    canon_list = list(dict.fromkeys(_norm(p) for p in paths))
     data = load_recent()
-    files = data["files"]
-    by = {_norm(f.get("path", "")): f for f in files if _norm(f.get("path", "")) in target}
-    ordered = [by[c] for c in canon_list if c in by]
-    result = []
-    i = 0
-    for f in files:
-        if _norm(f.get("path", "")) in target:
-            if i < len(ordered):
-                result.append(ordered[i])
-                i += 1
-        else:
-            result.append(f)
-    data["files"] = result
+    valid_groups = {g.get("id") for g in data["groups"]}
+    if view == "__favorites__":
+        rank_field = "favoriteRank"
+        members = [f for f in data["files"] if f.get("favorite")]
+    elif view == "__inbox__":
+        rank_field = "groupRank"
+        members = [
+            f for f in data["files"] if (f.get("groupId") or "") not in valid_groups
+        ]
+    elif view in valid_groups:
+        rank_field = "groupRank"
+        members = [f for f in data["files"] if f.get("groupId") == view]
+    else:
+        raise ValueError("最近页按打开时间自动排序")
+    by_path = {_norm(f.get("path", "")): f for f in members}
+    ordered = [by_path[path] for path in canon_list if path in by_path]
+    used = {id(f) for f in ordered}
+    ordered.extend(sorted(
+        (f for f in members if id(f) not in used),
+        key=lambda f: (f.get(rank_field, 0), f.get("id", "")),
+    ))
+    for index, item in enumerate(ordered):
+        item[rank_field] = index * RECENT_RANK_STEP
     save_recent(data)
 
 
@@ -874,7 +1077,7 @@ def groups_reorder(order: list) -> None:
     """按 order（id 列表）重排 groups；未列出的保持在后面，未知 id 忽略。"""
     data = load_recent()
     by_id = {g.get("id"): g for g in data["groups"]}
-    new_list = [by_id[i] for i in order if i in by_id]
+    new_list = [by_id[i] for i in order if isinstance(i, str) and i in by_id]
     # 补上 order 里没提到的（容错）
     for g in data["groups"]:
         if g not in new_list:
@@ -5023,6 +5226,7 @@ class RequestBodyError(ValueError):
 # appropriate lock only after the dialog returns, so an open dialog never stalls
 # autosave in another request thread.
 POST_WITHOUT_DATA_LOCK = {
+    "/api/file-stats",
     "/api/ai-chat",
     "/api/ai-compose",
     "/api/ai-test",
@@ -5458,6 +5662,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._api_remove(body)
         if path == "/api/rename":
             return self._api_rename(body)
+        if path == "/api/file-stats":
+            return self._api_file_stats(body)
         if path == "/api/group-create":
             return self._api_group_create(body)
         if path == "/api/group-rename":
@@ -5516,17 +5722,20 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     # ── API 实现 ──
     def _api_recent(self):
-        # 给每条附带 exists 标记：文件被删/移走后前端可标记失效（不主动剪掉，
-        # 可能只是临时挪走）。只读内存里的 dict，不写回 recent.json。
         data = load_recent()
-        files = data.get("files", [])
-        for f in files:
-            p = f.get("path", "")
-            f["exists"] = bool(p) and Path(p).is_file()
-            if f.get("exists"):
-                # 节点数 + 文件大小：起步页卡片展示用（取代原来的路径行）
-                f.update(canvas_file_stats(f.get("path", "")))
+        data["recentLimit"] = RECENT_LIMIT
         self._send_json(200, data)
+
+    def _api_file_stats(self, body: dict):
+        paths = body.get("paths") if isinstance(body, dict) else None
+        if not isinstance(paths, list):
+            return self._send_json(400, {"error": "缺少 paths 数组"})
+        if len(paths) > RECENT_STATS_BATCH_LIMIT:
+            return self._send_json(
+                400,
+                {"error": f"单次最多统计 {RECENT_STATS_BATCH_LIMIT} 个画布"},
+            )
+        self._send_json(200, {"files": recent_file_stats(paths)})
 
     def _api_new(self):
         target = make_new_canvas_path()
@@ -6592,7 +6801,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._send_json(400, {"error": "分组名不能为空"})
         if len(name) > 40:
             return self._send_json(400, {"error": "分组名过长（≤40 字）"})
-        self._send_json(200, group_create(name))
+        try:
+            group = group_create(name)
+        except ValueError as err:
+            return self._send_json(409, {"error": str(err)})
+        self._send_json(200, group)
 
     def _api_group_rename(self, body: dict):
         gid = (body.get("id") or "").strip()
@@ -6601,7 +6814,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._send_json(400, {"error": "缺少 id 或 name"})
         if len(name) > 40:
             return self._send_json(400, {"error": "分组名过长（≤40 字）"})
-        if not group_rename(gid, name):
+        try:
+            renamed = group_rename(gid, name)
+        except ValueError as err:
+            return self._send_json(409, {"error": str(err)})
+        if not renamed:
             return self._send_json(404, {"error": "分组不存在"})
         self._send_json(200, {"ok": True, "id": gid, "name": name})
 
@@ -6624,9 +6841,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def _api_favorite_toggle(self, body: dict):
         raw = (body.get("path") or "").strip()
-        if not raw:
-            return self._send_json(400, {"error": "缺少 path"})
-        favorite = file_toggle_favorite(raw)
+        favorite_value = body.get("favorite")
+        if not raw or not isinstance(favorite_value, bool):
+            return self._send_json(400, {"error": "缺少 path 或 favorite"})
+        favorite = file_set_favorite(raw, favorite_value)
         if favorite is None:
             return self._send_json(404, {"error": "文件不在列表中"})
         self._send_json(200, {"ok": True, "favorite": favorite})
@@ -6640,9 +6858,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def _api_reorder_files(self, body: dict):
         paths = body.get("paths")
-        if not isinstance(paths, list):
-            return self._send_json(400, {"error": "缺少 paths 数组"})
-        reorder_files(paths)
+        view = body.get("view")
+        if (
+            not isinstance(paths, list)
+            or not all(isinstance(path, str) for path in paths)
+            or not isinstance(view, str)
+        ):
+            return self._send_json(400, {"error": "缺少 paths 数组或 view"})
+        try:
+            reorder_files(paths, view)
+        except ValueError as err:
+            return self._send_json(409, {"error": str(err)})
         self._send_json(200, {"ok": True})
 
     # ── 回收站（右键删除 = 移到 canvases/回收站/）──
@@ -6784,7 +7010,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         move_viewport_state(src, dst)
         register_recent(dst)
         if gid:
-            file_set_group(_norm(dst), gid)   # 目标组不存在则忽略（留在最近）
+            file_set_group(_norm(dst), gid)   # 目标组不存在则忽略（留在未分组）
         self._send_json(200, {"path": _norm(dst), "title": dst.stem})
 
     def _api_reveal(self, body: dict):

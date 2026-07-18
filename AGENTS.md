@@ -108,7 +108,7 @@ Relatum 是一个离线优先的本地学习与知识组织工具：
 | 画布 | `canvases/*.canvas` |
 | 回收站 | `canvases/回收站/` |
 | 画布附件 | 与画布同名的 `<stem>.assets/` |
-| 最近、分组、收藏 | `data/recent.json` |
+| 最近、分组、收藏 | `data/recent.json`（v3）；上一次有效快照为 `data/recent.backup.json`，损坏原件隔离成 `data/recent.corrupt-<时间>.json` |
 | 背景偏好、辅助底纹与上传背景 | `data/background.json`（v2：`background` + 可选 `guide`）、`data/backgrounds/` |
 | 画布视口 | `data/viewport.json` |
 | 学习任务 | `data/study.json` |
@@ -165,7 +165,7 @@ Relatum 是一个离线优先的本地学习与知识组织工具：
 ### POST
 
 - 画布文件：`/api/new`、`/api/open`、`/api/pick`、`/api/save`、`/api/remove`、`/api/rename`、`/api/clean-assets`
-- 分组/收藏/排序：`/api/group-create`、`/api/group-rename`、`/api/group-delete`、`/api/file-set-group`、`/api/favorite-toggle`、`/api/groups-reorder`、`/api/reorder-files`
+- 分组/收藏/排序与可见文件统计：`/api/group-create`、`/api/group-rename`、`/api/group-delete`、`/api/file-set-group`、`/api/favorite-toggle`、`/api/groups-reorder`、`/api/reorder-files`、`/api/file-stats`
 - 回收站：`/api/trash`、`/api/trash-list`、`/api/trash-empty`、`/api/restore`
 - 文件系统交互：`/api/reveal`、`/api/open-external`、`/api/open-attachment`
 - 导入导出：`/api/export-markdown`、`/api/export-png`、`/api/import-markdown`、`/api/import-canvas`
@@ -306,9 +306,13 @@ Relatum 是一个离线优先的本地学习与知识组织工具：
 ### 起步页 `start.js`
 
 - 首页是书本式工作台，不是营销页。
-- 主要页面顺序包括复习、日历、速记、节奏/活跃、学习、专注、最近/分组；另有回收站、帮助、主题/背景设置。
+- 主要页面顺序包括复习、日历、速记、节奏/活跃、学习、专注、最近、收藏、未分组和自定义分组；另有回收站、帮助、主题/背景设置。
+- `recent.json` v3 的文件项有稳定 `id`、`groupId`、`groupRank`，收藏项另有 `favoriteRank`；最近页只按 `lastOpenedAt` 计算（最多展示 30 项），收藏与分组顺序互不覆盖。旧版 `group` 字段自动迁移，内置页保留 id 不得用作自定义分组 id。
+- `groupId: ""` 表示“未分组”，不是“最近”。删除自定义分组只把成员移到“未分组”，不删除画布，也不改变收藏状态。
+- `/api/favorite-toggle` 是幂等设置接口，请求必须带布尔 `favorite`；`/api/reorder-files` 必须带 `view`，最近页不可手动排序。
 - 最近文件会展示存在状态、节点数、大小等；失效文件不主动删除，需要用户处理。画布卡片的右键菜单与键盘右方向键共用“移到回收站”操作；若文件已不存在，该操作只清理最近记录和残留视野状态，不生成不可恢复的空回收站条目。
-- 最近画布的节点数统计按文件身份、大小和时间戳缓存，缓存上限 512 项；文件变化必须自动失效。
+- `/api/recent` 只返回元数据，不扫描全部画布；存在状态、节点数和大小由 `IntersectionObserver` 对视口附近卡片分批请求 `/api/file-stats`。后端统计按文件身份、大小和时间戳缓存，缓存上限 512 项；文件变化必须自动失效。
+- 正常规模保留玻璃卡片与现有翻页/收藏/FLIP 动画；仅列表超过 40 项时取消逐项错峰入场，超过 80 项时关闭卡片 `backdrop-filter` 并启用 `content-visibility`。
 - 分组、收藏、排序都存 `data/recent.json`。
 - 当前页通过 `aria-hidden` / `inert` 与 `start:viewchange` 统一管理；退场动画结束后，隐藏页用 `visibility:hidden` + `content-visibility:hidden` 跳过后代绘制。学习、活跃、速记、日历、复习和专注模块应在离页/pagehide 时暂停自己的计时器、RAF、observer 或音频，不能让隐藏页继续耗帧。
 - 复习页进入时根层保持静止，不得把整页当成完成的矩形贴图横移；日历先短促淡出并轻移，复习页标题、操作区、统计、纸面和纸面内容依次渐入。分层时长跟随起步页翻页速度，`start.js` 的清理延迟必须覆盖最长一层；自由复习和计划复习切到下一张卡片时直接完整展示，不再叠加卡片内部入场动画。
