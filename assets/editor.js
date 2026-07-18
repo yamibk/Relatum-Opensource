@@ -75,6 +75,8 @@
   const templateBtn = document.querySelector('[data-action="templates"]');
   const templateMenu = document.querySelector('[data-role="template-menu"]');
   const viewportEl = document.querySelector('[data-role="canvas-viewport"]');
+  const guideLayerEl = document.querySelector('[data-role="canvas-guide-layer"]');
+  const topbarGuideLayerEl = document.querySelector('[data-role="editor-topbar-guide"]');
   const topBarEl = document.querySelector('.editor-top-bar');
   const pageEl = document.body;
   const openingCoverEl = document.querySelector('[data-role="editor-opening-cover"]');
@@ -3287,6 +3289,7 @@
   let backgroundReady = false;
   let backgroundProbeVersion = 0;
   let backgroundPreference = null;
+  let guidePreference = { type: 'none' };
   let backgroundSaveTimer = null;
   let backgroundSaveQueue = Promise.resolve();
   let viewportSaveTimer = null;
@@ -3492,6 +3495,7 @@
   const IMAGE_LAYOUTS = ['immersive', 'soft-toolbar'];
   const TOOLBAR_READABILITY = ['off', 'light', 'medium'];
   const BACKGROUND_TONES = ['light', 'dark'];
+  const GUIDE_TYPES = ['none', 'ruled', 'dots', 'grid', 'major-grid'];
 
   // 没设过全局背景时的出厂默认：云霞渐变、全屏沉浸、浅色语义，不加标题栏保护层。
   const DEFAULT_BACKGROUND = {
@@ -3643,6 +3647,11 @@
     return null;
   }
 
+  function normalizeGuide(raw) {
+    const type = raw && GUIDE_TYPES.includes(raw.type) ? raw.type : 'none';
+    return { type };
+  }
+
   function withCurrentBackgroundLayout(next) {
     const old = normalizeBackground(backgroundPreference);
     if (!next || typeof next !== 'object') return next;
@@ -3660,13 +3669,17 @@
     clearTimeout(backgroundSaveTimer);
     const save = () => {
       const snapshot = backgroundPreference ? { ...backgroundPreference } : null;
+      const guideSnapshot = normalizeGuide(guidePreference);
       backgroundSaveQueue = backgroundSaveQueue
         .catch(() => {})
         .then(async () => {
           const resp = await fetch('/api/background-preference', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ background: snapshot }),
+            body: JSON.stringify({
+              background: snapshot,
+              guide: guideSnapshot.type === 'none' ? null : guideSnapshot,
+            }),
           });
           const json = await resp.json();
           if (!resp.ok) throw new Error(json.error || '保存失败');
@@ -3685,6 +3698,7 @@
       const json = await resp.json();
       if (resp.ok && json.configured) {
         backgroundPreference = normalizeBackground(json.background);
+        guidePreference = normalizeGuide(json.guide);
         return;
       }
     } catch (err) {
@@ -3694,11 +3708,22 @@
     // 仍没有则落到出厂默认「云霞」。
     backgroundPreference = normalizeBackground(canvasData && canvasData.background)
       || normalizeBackground(DEFAULT_BACKGROUND);
+    guidePreference = normalizeGuide(null);
     if (backgroundPreference) queueBackgroundPreferenceSave(false);
   }
 
   function backgroundFileName(path) {
     return String(path || '').split(/[\\/]/).pop() || '已选择图片';
+  }
+
+  function syncGuidePanel() {
+    if (!backgroundPanel) return;
+    const guide = normalizeGuide(guidePreference);
+    backgroundPanel.querySelectorAll('[data-guide-type]').forEach((button) => {
+      const active = button.dataset.guideType === guide.type;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    });
   }
 
   function syncBackgroundPanel(bg, imageError) {
@@ -3714,6 +3739,7 @@
       button.classList.toggle('active', !!bg && bg.type === 'gradient'
         && button.dataset.backgroundGradient === bg.preset);
     });
+    syncGuidePanel();
     const colorInput = backgroundPanel.querySelector('[data-role="background-custom-color"]');
     if (colorInput && bg && bg.type === 'solid') colorInput.value = bg.color;
     const imageMode = !!bg && bg.type === 'image';
@@ -4029,11 +4055,41 @@
     });
   }
 
+  function renderGuide() {
+    if (!viewportEl || !guideLayerEl) return;
+    const guide = normalizeGuide(guidePreference);
+    guidePreference = guide;
+    viewportEl.dataset.guideType = guide.type;
+    guideLayerEl.hidden = guide.type === 'none';
+    if (topbarGuideLayerEl) {
+      topbarGuideLayerEl.dataset.guideType = guide.type;
+      topbarGuideLayerEl.hidden = guide.type === 'none';
+    }
+    syncGuidePanel();
+    document.dispatchEvent(new CustomEvent('canvas:guide-visual-refresh'));
+  }
+
   function setBackground(next, deferred) {
     if (canvasData === null) return;
     backgroundPreference = normalizeBackground(next);
     renderBackground();
     queueBackgroundPreferenceSave(!!deferred);
+  }
+
+  function setGuide(next) {
+    if (canvasData === null) return;
+    guidePreference = normalizeGuide(next);
+    renderGuide();
+    queueBackgroundPreferenceSave(false);
+  }
+
+  function resetBackgroundAndGuide() {
+    if (canvasData === null) return;
+    backgroundPreference = null;
+    guidePreference = normalizeGuide(null);
+    renderBackground();
+    renderGuide();
+    queueBackgroundPreferenceSave(false);
   }
 
   function updateImageAppearance(updates, deferred) {
@@ -4123,7 +4179,7 @@
     const closeBtn = backgroundPanel.querySelector('[data-action="background-close"]');
     if (closeBtn) closeBtn.addEventListener('click', close);
     const reset = backgroundPanel.querySelector('[data-background-reset]');
-    if (reset) reset.addEventListener('click', () => setBackground(null));
+    if (reset) reset.addEventListener('click', resetBackgroundAndGuide);
     backgroundPanel.querySelectorAll('[data-background-color]').forEach((button) => {
       button.addEventListener('click', () => {
         setBackground(withCurrentBackgroundLayout({ type: 'solid', color: button.dataset.backgroundColor }));
@@ -4155,6 +4211,9 @@
         }
         setBackground(next);
       });
+    });
+    backgroundPanel.querySelectorAll('[data-guide-type]').forEach((button) => {
+      button.addEventListener('click', () => setGuide({ type: button.dataset.guideType }));
     });
     const chooseImage = backgroundPanel.querySelector('[data-action="background-image-pick"]');
     if (chooseImage) {
@@ -4357,20 +4416,25 @@
       // 利用已并行拿到的背景偏好，跳过 loadBackgroundPreference 里的重复 fetch
       if (bgJson && bgJson.configured) {
         backgroundPreference = normalizeBackground(bgJson.background);
+        guidePreference = normalizeGuide(bgJson.guide);
       } else {
         // 旧版背景曾跟随单张画布保存；尚无全局配置时迁移首次遇到的旧设置，
         // 仍没有则落到出厂默认「云霞」。
         backgroundPreference = normalizeBackground(canvasData && canvasData.background)
           || normalizeBackground(DEFAULT_BACKGROUND);
+        guidePreference = normalizeGuide(null);
         if (backgroundPreference) queueBackgroundPreferenceSave(false);
       }
       setupBackgroundPanel();
       const backgroundReady = renderBackground({ initial: true });
+      renderGuide();
 
       // 启动画布交互（canvas.js 直接 mutate canvasData.nodes）
       if (window.CanvasModule) {
         window.CanvasModule.init({
           viewport: viewportEl,
+          guideLayer: guideLayerEl,
+          topbarGuideLayer: topbarGuideLayerEl,
           surface: document.querySelector('[data-role="canvas-surface"]'),
           emptyHint: document.querySelector('[data-role="empty-hint"]'),
           edgesLayer: document.querySelector('[data-role="canvas-edges"]'),

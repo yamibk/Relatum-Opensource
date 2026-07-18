@@ -11965,6 +11965,7 @@ body.editor-page.topbar-pending .editor-top-bar {
 
 .editor-top-bar::before {
   inset: -16px;
+  z-index: -3;
   background-image: var(--editor-toolbar-image);
   background-position: var(--editor-toolbar-image-position);
   background-repeat: no-repeat;
@@ -11976,7 +11977,28 @@ body.editor-page.topbar-pending .editor-top-bar {
 
 .editor-top-bar::after {
   inset: 0;
+  z-index: -1;
   background: var(--editor-toolbar-wash);
+}
+
+/* 全屏沉浸时，把画布坐标底纹柔和延伸进标题栏。独立窄层避免放开 viewport
+   的裁剪；伪元素层级保持为：背景图(-3) → 底纹(-2) → 可读性保护(-1)。 */
+.editor-topbar-guide {
+  --topbar-guide-phase-y: -320px;
+  position: absolute;
+  inset: 0 -320px;
+  z-index: -2;
+  opacity: 0.75;
+  pointer-events: none;
+  transform: translate3d(0, 0, 0);
+  contain: paint;
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, rgba(0, 0, 0, 0.58) 38%, #000 100%);
+  mask-image: linear-gradient(to bottom, transparent 0%, rgba(0, 0, 0, 0.58) 38%, #000 100%);
+}
+
+.editor-topbar-guide[hidden],
+.editor-page:not(.immersive-background) .editor-topbar-guide {
+  display: none;
 }
 
 .editor-page.immersive-background .editor-top-bar {
@@ -14294,7 +14316,8 @@ html.dark-semantic-ui {
 }
 
 .background-swatches,
-.background-gradients {
+.background-gradients,
+.background-guides {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 7px;
@@ -14330,6 +14353,77 @@ html.dark-semantic-ui {
 .background-gradients button.active {
   border-color: var(--text-secondary);
   box-shadow: 0 0 0 2px var(--focus-ring);
+}
+
+.background-guide-choice {
+  appearance: none;
+  position: relative;
+  height: 48px;
+  overflow: hidden;
+  padding: 0 0 5px 7px;
+  display: flex;
+  align-items: flex-end;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background-color: #faf9f5;
+  color: rgba(42, 42, 42, 0.68);
+  font: 11px var(--font-ui);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color var(--duration) var(--easing-soft),
+              box-shadow var(--duration) var(--easing-soft),
+              transform var(--duration) var(--easing-soft);
+}
+
+.background-guide-choice:hover {
+  transform: translateY(-1px);
+}
+
+.background-guide-choice.active {
+  border-color: var(--text-secondary);
+  box-shadow: 0 0 0 2px var(--focus-ring);
+}
+
+.background-guide-choice span {
+  position: relative;
+  z-index: 1;
+  padding-right: 4px;
+  text-shadow: 0 1px 5px rgba(255, 255, 255, 0.92);
+}
+
+.background-guide-choice[data-guide-type="ruled"] {
+  background-image: repeating-linear-gradient(
+    to bottom,
+    transparent 0 10px,
+    rgba(68, 88, 82, 0.15) 10px 11px
+  );
+}
+
+.background-guide-choice[data-guide-type="dots"] {
+  background-image: radial-gradient(circle, rgba(55, 76, 70, 0.32) 0 1.5px, transparent 1.85px);
+  background-size: 11px 11px;
+}
+
+.background-guide-choice[data-guide-type="grid"] {
+  background-image:
+    linear-gradient(to right, rgba(68, 88, 82, 0.13) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(68, 88, 82, 0.13) 1px, transparent 1px);
+  background-size: 11px 11px;
+}
+
+.background-guide-choice[data-guide-type="major-grid"] {
+  background-image:
+    linear-gradient(to right, rgba(55, 76, 70, 0.21) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(55, 76, 70, 0.21) 1px, transparent 1px),
+    linear-gradient(to right, rgba(68, 88, 82, 0.09) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(68, 88, 82, 0.09) 1px, transparent 1px);
+  background-size: 33px 33px, 33px 33px, 11px 11px, 11px 11px;
+}
+
+.background-guide-hint {
+  color: var(--text-tertiary);
+  font-size: 10px;
+  line-height: 1.45;
 }
 
 .background-custom-color {
@@ -15242,6 +15336,94 @@ body.archiving-exit {
   position: relative;
   cursor: default;
   transition: background var(--duration) var(--easing);
+}
+
+/* 辅助底纹只覆盖当前视口。平移时由 canvas.js 更新合成位移，图案不会扩展成
+   与 16000×12000 surface 同尺寸的巨大栅格，也不创建逐格 DOM。 */
+.canvas-guide-layer,
+.editor-topbar-guide {
+  --guide-step: 32px;
+  --guide-major-step: 128px;
+  --guide-offset-x: 0px;
+  --guide-offset-y: 0px;
+  --canvas-guide-line: rgba(45, 60, 55, 0.105);
+  --canvas-guide-major-line: rgba(39, 55, 50, 0.18);
+  --canvas-guide-dot: rgba(39, 57, 51, 0.3);
+  pointer-events: none;
+  contain: paint;
+}
+
+.canvas-guide-layer {
+  position: absolute;
+  inset: -320px;
+  z-index: 0;
+  transform: translate3d(var(--guide-offset-x), var(--guide-offset-y), 0);
+}
+
+.canvas-guide-layer[hidden] {
+  display: none;
+}
+
+.editor-page[data-background-tone="dark"] .canvas-guide-layer,
+.editor-page[data-background-tone="dark"] .editor-topbar-guide {
+  --canvas-guide-line: rgba(247, 246, 242, 0.13);
+  --canvas-guide-major-line: rgba(247, 246, 242, 0.22);
+  --canvas-guide-dot: rgba(247, 246, 242, 0.36);
+}
+
+.canvas-viewport[data-guide-type="ruled"] .canvas-guide-layer,
+.editor-topbar-guide[data-guide-type="ruled"] {
+  background-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    transparent calc(100% - 1px),
+    var(--canvas-guide-line) calc(100% - 1px),
+    var(--canvas-guide-line) 100%
+  );
+  background-size: 100% var(--guide-step);
+}
+
+.canvas-viewport[data-guide-type="dots"] .canvas-guide-layer,
+.editor-topbar-guide[data-guide-type="dots"] {
+  background-image: radial-gradient(
+    circle at 2px 2px,
+    var(--canvas-guide-dot) 0 1.55px,
+    transparent 1.9px
+  );
+  background-size: var(--guide-step) var(--guide-step);
+  background-position: -2px -2px;
+}
+
+.canvas-viewport[data-guide-type="grid"] .canvas-guide-layer,
+.editor-topbar-guide[data-guide-type="grid"] {
+  background-image:
+    linear-gradient(to right, var(--canvas-guide-line) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--canvas-guide-line) 1px, transparent 1px);
+  background-size: var(--guide-step) var(--guide-step);
+}
+
+.canvas-viewport[data-guide-type="major-grid"] .canvas-guide-layer,
+.editor-topbar-guide[data-guide-type="major-grid"] {
+  background-image:
+    linear-gradient(to right, var(--canvas-guide-major-line) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--canvas-guide-major-line) 1px, transparent 1px),
+    linear-gradient(to right, var(--canvas-guide-line) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--canvas-guide-line) 1px, transparent 1px);
+  background-size:
+    var(--guide-major-step) var(--guide-major-step),
+    var(--guide-major-step) var(--guide-major-step),
+    var(--guide-step) var(--guide-step),
+    var(--guide-step) var(--guide-step);
+}
+
+.editor-topbar-guide[data-guide-type="ruled"],
+.editor-topbar-guide[data-guide-type="grid"],
+.editor-topbar-guide[data-guide-type="major-grid"] {
+  background-position: 0 var(--topbar-guide-phase-y);
+}
+
+.editor-topbar-guide[data-guide-type="dots"] {
+  background-position: -2px calc(var(--topbar-guide-phase-y) - 2px);
 }
 
 /* 首次渲染时 viewport 尚无行内背景变量，深色等待底必须覆盖默认纸白。 */

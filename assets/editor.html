@@ -116,6 +116,7 @@
             data-role="task-export-notice-close" aria-label="关闭提示">×</button>
   </aside>
   <header class="editor-top-bar">
+    <div class="editor-topbar-guide" data-role="editor-topbar-guide" aria-hidden="true" hidden></div>
     <div class="editor-nav">
       <button type="button" class="btn-text editor-back" data-action="back"
               data-toolbar-i18n-title="backTitle" title="返回起步页">
@@ -248,6 +249,7 @@
 
   <main class="editor-main">
     <div class="canvas-viewport" data-role="canvas-viewport">
+      <div class="canvas-guide-layer" data-role="canvas-guide-layer" aria-hidden="true" hidden></div>
       <canvas class="canvas-edges-canvas" data-role="canvas-edges-canvas" aria-hidden="true"></canvas>
       <div class="canvas-toolbox auto-hide" data-role="canvas-toolbox" aria-label="画布工具">
         <button type="button" class="canvas-tool-btn active" data-canvas-tool="select" title="选择 / 移动">
@@ -1568,6 +1570,28 @@
           <button type="button" data-background-gradient="dusk-sand" title="暮砂"><span>暮砂</span></button>
           <button type="button" data-background-gradient="moon-white" title="月白"><span>月白</span></button>
         </div>
+      </section>
+
+      <section class="background-section background-guide-section">
+        <div class="sp-subhead">辅助底纹（可叠加）</div>
+        <div class="background-guides" role="group" aria-label="辅助底纹">
+          <button type="button" class="background-guide-choice" data-guide-type="none" title="无底纹">
+            <span>无底纹</span>
+          </button>
+          <button type="button" class="background-guide-choice" data-guide-type="ruled" title="横线纸">
+            <span>横线纸</span>
+          </button>
+          <button type="button" class="background-guide-choice" data-guide-type="dots" title="点格纸">
+            <span>点格纸</span>
+          </button>
+          <button type="button" class="background-guide-choice" data-guide-type="grid" title="方格纸">
+            <span>方格纸</span>
+          </button>
+          <button type="button" class="background-guide-choice" data-guide-type="major-grid" title="主次方格">
+            <span>主次方格</span>
+          </button>
+        </div>
+        <div class="background-guide-hint">随画布移动和缩放，可与任意背景同时使用。</div>
       </section>
 
       <section class="background-section">

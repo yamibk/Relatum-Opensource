@@ -797,6 +797,8 @@
     const emptyHint = opts.emptyHint || null;
     const edgesLayer = opts.edgesLayer || null;
     const edgesCanvas = opts.edgesCanvas || null;
+    const guideLayer = opts.guideLayer || null;
+    const topbarGuideLayer = opts.topbarGuideLayer || null;
     const inkLayer = opts.inkLayer || null;
     const drawToolbar = opts.drawToolbar || null;
     const zoomIndicator = opts.zoomIndicator || null;
@@ -1130,6 +1132,12 @@
     let viewportTickTs = 0;             // 上一帧时间戳（视口缓动 dt 归一化用；0=新一段缓动）
     let spaceHeld = false;              // 空格被按住（等待平移）
     let viewportHasUserPosition = false; // 已恢复或用户调整过时，后台排版不再强制重定位
+    const GUIDE_BASE_STEP = 32;
+    const GUIDE_OVERSCAN = 320;
+    let guideStepCache = '';
+    let guideOffsetCache = '';
+    let topbarGuideHeight = topbarGuideLayer && topbarGuideLayer.parentElement
+      ? topbarGuideLayer.parentElement.getBoundingClientRect().height : 0;
     let rememberedViewportCenter = null; // 保持关注点稳定，窗口改尺寸也不漂走
 
     // ── W 轮：方向键平移 + 偏好 ──────────────
@@ -3146,9 +3154,59 @@
       };
     }
 
+    function positiveModulo(value, divisor) {
+      return ((value % divisor) + divisor) % divisor;
+    }
+
+    function updateGuideViewport() {
+      if (!guideLayer || guideLayer.hidden || viewport.dataset.guideType === 'none') return;
+      let step = GUIDE_BASE_STEP * curScale;
+      while (step < 12) step *= 2;
+      const majorStep = step * 4;
+      const offsetX = positiveModulo(curPanX + GUIDE_OVERSCAN + majorStep / 2, majorStep)
+        - majorStep / 2;
+      const offsetY = positiveModulo(curPanY + GUIDE_OVERSCAN + majorStep / 2, majorStep)
+        - majorStep / 2;
+      const stepKey = step.toFixed(3);
+      if (stepKey !== guideStepCache) {
+        guideStepCache = stepKey;
+        guideLayer.style.setProperty('--guide-step', stepKey + 'px');
+        guideLayer.style.setProperty('--guide-major-step', majorStep.toFixed(3) + 'px');
+        if (topbarGuideLayer) {
+          topbarGuideLayer.style.setProperty('--guide-step', stepKey + 'px');
+          topbarGuideLayer.style.setProperty('--guide-major-step', majorStep.toFixed(3) + 'px');
+        }
+      }
+      const offsetKey = offsetX.toFixed(2) + '|' + offsetY.toFixed(2);
+      if (offsetKey !== guideOffsetCache) {
+        guideOffsetCache = offsetKey;
+        guideLayer.style.transform = 'translate3d(' + offsetX.toFixed(2) + 'px, '
+          + offsetY.toFixed(2) + 'px, 0)';
+        if (topbarGuideLayer) {
+          topbarGuideLayer.style.transform = 'translate3d(' + offsetX.toFixed(2) + 'px, 0, 0)';
+          topbarGuideLayer.style.setProperty(
+            '--topbar-guide-phase-y',
+            (topbarGuideHeight - GUIDE_OVERSCAN + offsetY).toFixed(2) + 'px',
+          );
+        }
+      }
+    }
+
+    if (topbarGuideLayer && topbarGuideLayer.parentElement && window.ResizeObserver) {
+      const topbarGuideResizeObserver = new ResizeObserver(function (entries) {
+        const nextHeight = topbarGuideLayer.parentElement.getBoundingClientRect().height;
+        if (Math.abs(nextHeight - topbarGuideHeight) < 0.1) return;
+        topbarGuideHeight = nextHeight;
+        guideOffsetCache = '';
+        updateGuideViewport();
+      });
+      topbarGuideResizeObserver.observe(topbarGuideLayer.parentElement);
+    }
+
     function applyViewport() {
       surface.style.transform =
         'translate(' + curPanX + 'px, ' + curPanY + 'px) scale(' + curScale + ')';
+      updateGuideViewport();
       // 连线透明命中条宽度按缩放反向缩放，使其在屏幕上恒定（~22px）→ 缩小画布也好点中
       if (edgesLayer) {
         edgesLayer.style.setProperty('--edge-hit-w', Math.max(14, 22 / curScale).toFixed(2));
@@ -3161,6 +3219,12 @@
       renderEdgesCanvas();       // 阶段①：连线 canvas 层按新相机重描（开关关时是空操作）
       if (selToolbar && !selToolbar.hidden) scheduleSelToolbar();  // 缩放/平移时工具栏跟随选区
     }
+
+    document.addEventListener('canvas:guide-visual-refresh', function () {
+      guideStepCache = '';
+      guideOffsetCache = '';
+      updateGuideViewport();
+    });
 
     function setViewportImmediate(s, px, py) {
       cancelPanInertia();   // 程序化跳转视口前停掉惯性
