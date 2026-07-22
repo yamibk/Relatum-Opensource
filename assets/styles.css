@@ -13360,6 +13360,7 @@ body.panels-dimmed .panel-dim-btn {
 }
 
 .decor-text-style-swatch {
+  position: relative;
   display: block;
   width: 40px;
   height: 28px;
@@ -13368,6 +13369,46 @@ body.panels-dimmed .panel-dim-btn {
   border-radius: 4px;
   background: var(--decor-preset-color);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.32);
+}
+
+.decor-text-style-presets[data-mode="text:emphasis-card"] .decor-text-style-swatch {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  overflow: visible;
+}
+
+.decor-text-style-presets[data-mode="text:emphasis-card"] .decor-text-style-swatch::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  box-sizing: border-box;
+  border: var(--decor-preset-border-width, 1px) var(--decor-preset-border-style, solid) var(--decor-preset-border);
+  border-radius: 7px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.16), transparent 42%),
+    var(--decor-preset-color);
+  clip-path: polygon(0 0, 100% 0, 100% calc(100% - 9px), calc(100% - 11px) 100%, 0 100%);
+  filter: drop-shadow(0 2px 2px color-mix(in srgb, var(--decor-preset-border) 14%, transparent));
+}
+
+.decor-text-style-presets[data-mode="text:emphasis-card"] .decor-text-style-swatch::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 11px;
+  height: 11px;
+  box-sizing: border-box;
+  background: linear-gradient(
+    150deg,
+    color-mix(in srgb, var(--decor-preset-color) 82%, var(--decor-preset-border)) 0%,
+    color-mix(in srgb, var(--decor-preset-color) 95%, #ffffff) 50%,
+    color-mix(in srgb, var(--decor-preset-color) 86%, var(--decor-preset-border)) 100%
+  );
+  clip-path: polygon(20% 2%, 100% 18%, 0 100%);
+  filter: drop-shadow(0 0 1px color-mix(in srgb, var(--decor-preset-border) 48%, transparent));
 }
 
 .decor-text-style-name {
@@ -15534,12 +15575,17 @@ body.archiving-exit {
   }
 }
 
-/* Z 轮：空格按住等待平移 → 抓手光标 */
-.canvas-viewport.space-held {
-  cursor: grab;
+/* Z 轮：空格按住等待平移 → 抓手光标。
+   这是全局瞬时交互态，必须压过当前绘图工具及节点自身的 cursor。 */
+.canvas-viewport.space-held,
+.canvas-viewport.space-held .canvas-surface,
+.canvas-viewport.space-held .canvas-surface * {
+  cursor: grab !important;
 }
-.canvas-viewport.panning {
-  cursor: grabbing;
+.canvas-viewport.panning,
+.canvas-viewport.panning .canvas-surface,
+.canvas-viewport.panning .canvas-surface * {
+  cursor: grabbing !important;
 }
 
 .canvas-viewport.decor-draw-ready {
@@ -15549,13 +15595,6 @@ body.archiving-exit {
 .canvas-viewport.decor-draw-ready .canvas-surface {
   cursor: crosshair;
 }
-/* 空格按下时即使光标悬停在节点上也应该是 grab（提示"现在能拖背景"） */
-.canvas-viewport.space-held .node,
-.canvas-viewport.space-held .canvas-edge,
-.canvas-viewport.space-held .canvas-edge-label {
-  cursor: inherit;
-}
-
 .canvas-surface {
   position: relative;
   z-index: 1;
@@ -15710,26 +15749,107 @@ body.canvas-ready .canvas-empty-hint:not([hidden]) {
 }
 
 .decor-object[data-kind="textBox"][data-box-style="emphasis-card"] .decor-content {
-  --decor-note-pad-x: 24px;
-  --decor-note-pad-y: 22px;
-  padding: var(--decor-note-pad-y) var(--decor-note-pad-x) var(--decor-note-pad-y) 40px;
-  border-radius: 4px 6px 10px 4px;
-  box-shadow: 0 11px 24px rgba(66, 58, 35, 0.08), 0 1px 3px rgba(66, 58, 35, 0.04);
+  --decor-note-fold-bottom: 46px;
+  --decor-note-fold-right: 38px;
+  --decor-note-fold-box: 46px;
+  --decor-note-pad-x: 26px;
+  --decor-note-pad-y: 24px;
+  isolation: isolate;
+  padding: var(--decor-note-pad-y) calc(var(--decor-note-pad-x) + 6px) calc(var(--decor-note-pad-y) + 8px) var(--decor-note-pad-x);
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  overflow: visible;
 }
 
-.decor-object[data-kind="textBox"][data-box-style="emphasis-card"] .decor-content::before {
-  background:
-    linear-gradient(var(--decor-border, #b99a48), var(--decor-border, #b99a48)) 16px 22px / 2px calc(100% - 44px) no-repeat,
-    linear-gradient(135deg, transparent 0 49%, color-mix(in srgb, var(--decor-fill, #f6eab8) 72%, #ffffff) 50% 100%) right bottom / 22px 22px no-repeat,
-    radial-gradient(100% 72% at 100% 100%, color-mix(in srgb, var(--decor-border, #b99a48) 8%, transparent), transparent 66%),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.20), rgba(255, 255, 255, 0) 34%),
-    var(--decor-fill, #fff3b0);
-  border-color: color-mix(in srgb, var(--decor-border, #b99a48) 70%, #ffffff);
-  border-radius: 4px 6px 10px 4px;
-}
-
+.decor-object[data-kind="textBox"][data-box-style="emphasis-card"] .decor-content::before,
 .decor-object[data-kind="textBox"][data-box-style="emphasis-card"] .decor-content::after {
   content: none;
+}
+
+.emphasis-note-visual {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  filter:
+    drop-shadow(0 8px 12px rgba(43, 39, 29, 0.075))
+    drop-shadow(0 2px 3px color-mix(in srgb, var(--decor-border, #b99a48) 14%, transparent));
+  pointer-events: none;
+}
+
+.emphasis-note-sheet {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  box-sizing: border-box;
+  border: var(--decor-border-width, 1px) var(--decor-border-style, solid) color-mix(in srgb, var(--decor-border, #b99a48) 58%, #ffffff);
+  border-radius: 18px;
+  background:
+    radial-gradient(120% 92% at 0 0, rgba(255, 255, 255, 0.26), transparent 48%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.12), transparent 38%),
+    var(--decor-fill, #f6eab8);
+  clip-path: polygon(
+    0 0,
+    100% 0,
+    100% calc(100% - var(--decor-note-fold-right)),
+    calc(100% - var(--decor-note-fold-bottom)) 100%,
+    0 100%
+  );
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.50),
+    inset 0 -1px 0 color-mix(in srgb, var(--decor-border, #b99a48) 8%, transparent);
+}
+
+.emphasis-note-fold {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  z-index: 1;
+  width: var(--decor-note-fold-box);
+  height: var(--decor-note-fold-box);
+  box-sizing: border-box;
+  background: color-mix(in srgb, var(--decor-border, #b99a48) 44%, var(--decor-fill, #f6eab8));
+  clip-path: polygon(20% 2%, 100% 17%, 0 100%);
+  filter: drop-shadow(0 1px 1.5px color-mix(in srgb, var(--decor-border, #b99a48) 18%, transparent));
+}
+
+.emphasis-note-fold::before {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  z-index: 1;
+  background: linear-gradient(
+    150deg,
+    color-mix(in srgb, var(--decor-fill, #f6eab8) 82%, var(--decor-border, #b99a48)) 0%,
+    color-mix(in srgb, var(--decor-fill, #f6eab8) 94%, #ffffff) 46%,
+    color-mix(in srgb, var(--decor-fill, #f6eab8) 96%, #ffffff) 56%,
+    color-mix(in srgb, var(--decor-fill, #f6eab8) 86%, var(--decor-border, #b99a48)) 100%
+  );
+  clip-path: polygon(20% 2%, 100% 17%, 0 100%);
+}
+
+.emphasis-note-fold::after {
+  content: "";
+  position: absolute;
+  top: 5px;
+  right: 0;
+  z-index: 2;
+  width: 60px;
+  height: 7px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--decor-border, #b99a48) 52%, var(--decor-fill, #f6eab8)) 0 2px,
+    color-mix(in srgb, var(--decor-border, #b99a48) 16%, transparent) 2px,
+    color-mix(in srgb, var(--decor-border, #b99a48) 7%, transparent) 48%,
+    transparent 100%
+  );
+  transform: rotate(-39.5deg);
+  transform-origin: right center;
+}
+
+.decor-object[data-kind="textBox"][data-box-style="emphasis-card"] .text-box-content {
+  z-index: 2;
 }
 
 .decor-object[data-kind="textBox"][data-box-style="note-bubble"] .decor-content {
@@ -20168,6 +20288,119 @@ body:not([data-mode="decor"]) .canvas-free-arrow-poly {
 .canvas-edge.edge-style-glow.selected {
   opacity: 0.98;
   filter: drop-shadow(0 0 6px var(--edge-color, #4f8df7));
+}
+
+/* 连接锚点是画布连线的隐形结构端点：工具激活、锚点自身选中或相邻连线选中时才显形。 */
+.node.decor-object[data-shape-type="edge-anchor"] {
+  color: var(--text);
+  visibility: hidden;
+  opacity: 0;
+  overflow: visible;
+  pointer-events: none !important;
+  cursor: move;
+  box-shadow: none;
+  transition: opacity 120ms var(--easing), visibility 0s linear 120ms;
+}
+
+.node.decor-object[data-shape-type="edge-anchor"].edge-anchor-visible {
+  visibility: visible;
+  opacity: 1;
+  pointer-events: auto !important;
+  transition-delay: 0s;
+}
+
+.node.decor-object[data-shape-type="edge-anchor"].selected,
+.node.decor-object[data-shape-type="edge-anchor"]:hover {
+  box-shadow: none;
+}
+
+.node.decor-object[data-shape-type="edge-anchor"] .decor-content {
+  position: relative;
+  overflow: visible;
+  transform: scale(1);
+  transform-origin: center;
+  transition: transform 140ms var(--easing), filter 140ms var(--easing);
+}
+
+.node.decor-object[data-shape-type="edge-anchor"] .decor-content::before {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+  opacity: 0;
+  pointer-events: none;
+  transform: scale(0.78);
+  transition: opacity 140ms var(--easing), transform 160ms var(--easing);
+}
+
+.node.decor-object[data-shape-type="edge-anchor"]:hover .decor-content {
+  transform: scale(1.08);
+  filter: drop-shadow(0 0 4px color-mix(in srgb, currentColor 24%, transparent));
+}
+
+.node.decor-object[data-shape-type="edge-anchor"]:hover .decor-content::before {
+  opacity: 0.42;
+  transform: scale(0.92);
+}
+
+.node.decor-object[data-shape-type="edge-anchor"].selected .decor-content {
+  transform: scale(1.1);
+  filter: drop-shadow(0 0 6px color-mix(in srgb, currentColor 38%, transparent));
+  animation: edge-anchor-select-pop 180ms cubic-bezier(0.2, 0.9, 0.35, 1.2) both;
+}
+
+.node.decor-object[data-shape-type="edge-anchor"].selected .decor-content::before {
+  opacity: 1;
+  transform: scale(1);
+  box-shadow:
+    0 0 0 2px var(--surface),
+    0 0 0 3px color-mix(in srgb, currentColor 64%, transparent),
+    0 0 10px color-mix(in srgb, currentColor 22%, transparent);
+}
+
+.node.decor-object[data-shape-type="edge-anchor"].selected .edge-anchor-dot {
+  transform: scale(1.45);
+}
+
+@keyframes edge-anchor-select-pop {
+  0% { transform: scale(0.84); }
+  68% { transform: scale(1.16); }
+  100% { transform: scale(1.1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .node.decor-object[data-shape-type="edge-anchor"] .decor-content,
+  .node.decor-object[data-shape-type="edge-anchor"] .decor-content::before {
+    transition: none;
+  }
+
+  .node.decor-object[data-shape-type="edge-anchor"].selected .decor-content {
+    animation: none;
+  }
+}
+
+.decor-svg .edge-anchor-ring {
+  fill: var(--surface);
+  fill-opacity: 0.94;
+  stroke: currentColor;
+  stroke-width: 2.2;
+  vector-effect: non-scaling-stroke;
+}
+
+.decor-svg .edge-anchor-cross {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.decor-svg .edge-anchor-dot {
+  fill: currentColor;
+  transform-box: fill-box;
+  transform-origin: center;
+  transition: transform 140ms var(--easing);
 }
 
 .edge-waypoint {

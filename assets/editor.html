@@ -284,6 +284,13 @@
             <path d="M7 16 H13"/>
           </svg>
         </button>
+        <button type="button" class="canvas-tool-btn" data-canvas-tool="edge-anchor"
+                title="连接锚点：双击空白放置，拖动空白框选，拖动锚点移动，按住 Alt 拖出连线" aria-label="连接锚点">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <circle cx="10" cy="10" r="3.2"/>
+            <path d="M10 3.2 V6.3 M10 13.7 V16.8 M3.2 10 H6.3 M13.7 10 H16.8"/>
+          </svg>
+        </button>
         <button type="button" class="canvas-tool-btn" data-canvas-tool="arrow" title="添加逆时针箭头；再次点击设置，长按恢复默认">
           <svg viewBox="0 0 20 20" aria-hidden="true">
             <path d="M4 6 C8 15 12 15 16 13"/>
@@ -2105,6 +2112,7 @@
           <h3>连线</h3>
           <dl>
             <div><dt>按住 <kbd>Alt</kbd>，从一个节点拖到另一个</dt><dd>创建节点间连线</dd></div>
+            <div><dt>左侧工具栏 <kbd>连接锚点</kbd></dt><dd>双击空白放置；拖动空白框选；选中后按住 <kbd>Alt</kbd> 拖动连线，按 <kbd>Delete</kbd> 即可删除</dd></div>
             <div><dt><kbd>双击连线</kbd></dt><dd>给连线写文字</dd></div>
           </dl>
           <h3 data-i18n="shortcutsSelectionHeading" data-i18n-zh="选择">选择</h3>
