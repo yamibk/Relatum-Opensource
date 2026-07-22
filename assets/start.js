@@ -78,7 +78,7 @@
   const START_THEME_KEY = 'canvas:startTheme';
   const START_BACKGROUND_KEY = 'canvas:startBackgroundStyle';
   let startTheme = 'light';
-  let startBackgroundStyle = 'scenic';
+  let startBackgroundStyle = 'simple';
   let startThemeButtonTimer = 0;
   let startThemeApplyFrame = 0;
   const START_SPEED_KEY = 'canvas:startTurnMs';
@@ -359,7 +359,7 @@
 
   try { startTheme = localStorage.getItem(START_THEME_KEY) || 'light'; } catch (e) {}
   applyStartTheme(startTheme);
-  try { startBackgroundStyle = localStorage.getItem(START_BACKGROUND_KEY) || 'scenic'; } catch (e) {}
+  try { startBackgroundStyle = localStorage.getItem(START_BACKGROUND_KEY) || 'simple'; } catch (e) {}
   applyStartBackgroundStyle(startBackgroundStyle, false);
 
   document.querySelectorAll('[data-role="start-background-switch"] button').forEach((button) => {

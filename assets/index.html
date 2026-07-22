@@ -10,8 +10,8 @@
     (function () {
       try {
         var theme = localStorage.getItem('canvas:startTheme') === 'dark' ? 'dark' : 'light';
-        var backgroundStyle = localStorage.getItem('canvas:startBackgroundStyle') === 'simple'
-          ? 'simple' : 'scenic';
+        var backgroundStyle = localStorage.getItem('canvas:startBackgroundStyle') === 'scenic'
+          ? 'scenic' : 'simple';
         document.documentElement.dataset.startTheme = theme;
         document.documentElement.dataset.startBackground = backgroundStyle;
         var language = localStorage.getItem('canvas:toolbarLanguage') === 'en' ? 'en' : 'zh-CN';
@@ -19,7 +19,7 @@
         document.documentElement.lang = language;
       } catch (e) {
         document.documentElement.dataset.startTheme = 'light';
-        document.documentElement.dataset.startBackground = 'scenic';
+        document.documentElement.dataset.startBackground = 'simple';
         document.documentElement.dataset.uiLanguage = 'zh-CN';
       }
     })();
