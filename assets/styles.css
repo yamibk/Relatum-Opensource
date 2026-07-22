@@ -26416,6 +26416,12 @@ body.start-page[data-start-theme="dark"] .star-tooltip {
   font-weight: 610;
   letter-spacing: -0.045em;
 }
+.study-cadence-head h2,
+.cadence-starmap h3 {
+  font-size: clamp(29px, 3.4vw, 46px);
+  font-weight: 700;
+  letter-spacing: -0.045em;
+}
 .star-mode-switch {
   border-color: var(--border);
   background: color-mix(in srgb, var(--text) 3.5%, transparent);
