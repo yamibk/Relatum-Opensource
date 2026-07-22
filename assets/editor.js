@@ -3497,14 +3497,15 @@
   const BACKGROUND_TONES = ['light', 'dark'];
   const GUIDE_TYPES = ['none', 'ruled', 'dots', 'grid', 'major-grid'];
 
-  // 没设过全局背景时的出厂默认：云霞渐变、全屏沉浸、浅色语义，不加标题栏保护层。
+  // 没设过全局背景时的出厂默认：月灰、横线纸、全屏沉浸、浅色语义，不加标题栏保护层。
   const DEFAULT_BACKGROUND = {
-    type: 'gradient',
-    preset: 'rose-cloud',
+    type: 'solid',
+    color: '#f1f0ed',
     layout: 'immersive',
     tone: 'light',
     toolbarReadability: 'off',
   };
+  const DEFAULT_GUIDE = { type: 'ruled' };
 
   function backgroundGradientPreset(preset) {
     return BACKGROUND_GRADIENTS[preset] || null;
@@ -3705,10 +3706,10 @@
       console.warn('[画布] 读取全局背景失败，尝试兼容旧画布背景', err);
     }
     // 旧版背景曾跟随单张画布保存；尚无全局配置时迁移首次遇到的旧设置，
-    // 仍没有则落到出厂默认「云霞」。
-    backgroundPreference = normalizeBackground(canvasData && canvasData.background)
-      || normalizeBackground(DEFAULT_BACKGROUND);
-    guidePreference = normalizeGuide(null);
+    // 仍没有则落到出厂默认「月灰 + 横线纸」；迁移旧画布背景时保持旧版无底纹行为。
+    const legacyBackground = normalizeBackground(canvasData && canvasData.background);
+    backgroundPreference = legacyBackground || normalizeBackground(DEFAULT_BACKGROUND);
+    guidePreference = normalizeGuide(legacyBackground ? null : DEFAULT_GUIDE);
     if (backgroundPreference) queueBackgroundPreferenceSave(false);
   }
 
@@ -4419,10 +4420,10 @@
         guidePreference = normalizeGuide(bgJson.guide);
       } else {
         // 旧版背景曾跟随单张画布保存；尚无全局配置时迁移首次遇到的旧设置，
-        // 仍没有则落到出厂默认「云霞」。
-        backgroundPreference = normalizeBackground(canvasData && canvasData.background)
-          || normalizeBackground(DEFAULT_BACKGROUND);
-        guidePreference = normalizeGuide(null);
+        // 仍没有则落到出厂默认「月灰 + 横线纸」；迁移旧画布背景时保持旧版无底纹行为。
+        const legacyBackground = normalizeBackground(canvasData && canvasData.background);
+        backgroundPreference = legacyBackground || normalizeBackground(DEFAULT_BACKGROUND);
+        guidePreference = normalizeGuide(legacyBackground ? null : DEFAULT_GUIDE);
         if (backgroundPreference) queueBackgroundPreferenceSave(false);
       }
       setupBackgroundPanel();

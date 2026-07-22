@@ -127,7 +127,7 @@ Relatum 是一个离线优先的本地学习与知识组织工具：
 | AI 配置 | `data/ai.json`，含 Key、模型、baseUrl |
 | 桌面窗口状态 | `data/window-state.json` |
 
-全新用户尚无 `data/background.json` 且当前画布也没有旧版背景字段时，编辑器出厂默认使用“云霞”渐变、全屏沉浸、浅色背景语义，并关闭标题栏可读性保护；首次加载后会把这组全局背景偏好写入 `data/background.json`。辅助底纹是独立的全局可选偏好，缺省为无底纹；可选横线、点格、方格或主次方格，与原背景共存而不写入 `.canvas`。
+全新用户尚无 `data/background.json` 且当前画布也没有旧版背景字段时，编辑器出厂默认使用“月灰”纯色、横线纸底纹、全屏沉浸、浅色背景语义，并关闭标题栏可读性保护；首次加载后会把这组全局背景偏好写入 `data/background.json`。辅助底纹是独立的全局可选偏好；新用户缺省为横线纸，迁移只有旧版背景字段的画布时仍保持无底纹；可选无底纹、横线、点格、方格或主次方格，与原背景共存而不写入 `.canvas`。
 
 ### `.canvas` 和 `.assets`
 
@@ -141,7 +141,7 @@ Relatum 是一个离线优先的本地学习与知识组织工具：
 
 很多 UI 偏好存在 `localStorage` / `sessionStorage`，不进 `.canvas`：
 
-- 起步页：当前分组、主题、背景风格、翻页速度、速记惯性、日历倒数日开关、隐藏特殊页开关（`canvas:hideSpecialPages`，**默认关闭**：只有显式存为 `'1'` 才隐藏，unset 或其他值都正常显示全部页面；开启后书脊只留最近/收藏/分组，滚轮翻页与点击都不进 6 张前置页）、帮助看过状态。
+- 起步页：当前分组、主题、背景风格（`canvas:startBackgroundStyle`，unset 时默认“简洁”）、翻页速度、速记惯性、日历倒数日开关、隐藏特殊页开关（`canvas:hideSpecialPages`，**默认关闭**：只有显式存为 `'1'` 才隐藏，unset 或其他值都正常显示全部页面；开启后书脊只留最近/收藏/分组，滚轮翻页与点击都不进 6 张前置页）、帮助看过状态。
 - 编辑器：顶栏“画布 / 导图 / 图案”（内部 `canvas:mode` 仍只支持 `normal` / `mindmap` / `decor`；旧 `pro` / `edit` 读取时迁移为 `normal`）、全应用中英语言偏好 `canvas:toolbarLanguage`（由 `i18n.js` 在起始页、学习、活跃、日历、复习、专注与编辑器间共用；只翻译界面，不翻译文件名、任务名、便签、日记和画布内容）、首次语言确认 `canvas:initialLanguageChosen:v1`（只在全新用户第一次打开新画布且既无语言偏好也无引导状态时写入 `zh-CN` / `en`）、新手引导状态 `canvas:editorOnboarding:v2`（`in-progress` / `completed` / `skipped`）、三种模式各自的 `canvas:normalSubmode` / `canvas:mindmapSubmode` / `canvas:decorSubmode` 双模式偏好、右侧面板最后一次 Tab 收放选择 `canvas:sidePanelsCollapsed`（主编辑器全局共用，内嵌编辑器不读取也不改写）、底部文字属性带的全局收起偏好 `canvas:textToolbarCollapsed`（未设置时默认收起；显式 `'0'` 展开、`'1'` 收起）、普通画布属性检查器开关 `canvas:inspectorEnabled`、导图属性检查器开关 `canvas:mindmapInspectorEnabled`、图案属性检查器开关 `canvas:decorInspectorEnabled`（三个独立偏好；画布与图案默认开启，导图默认关闭）、文本框拖动自动对齐开关 `canvas:textSnapEnabled`（默认关闭，仅显式 `'1'` 开启）、完整画布模式的 `canvas:proNodeDefaults` / `canvas:proEdgeDefaults` 与简洁画布模式独立的 `canvas:cleanNodeDefaults` / `canvas:cleanEdgeDefaults` 新建默认、文本框新建默认 `canvas:textDefaults` 以及共享柔和色栏镜像保存的高光/字色 `canvas:textHighlightColor` / `canvas:textInlineColor`、自动保存、暗色连线优化、平移/缩放/读者透明度、索引/脑图悬停延迟等。
 - 空白框选创建盒子与框选节点创建分组分别由 `canvas:boxCreateEnabled` / `canvas:groupCreateEnabled` 控制，两个开关默认开启且彼此独立；`canvas:genIndexEnabled` 也必须独立判断，不能因关闭盒子或分组而隐藏框选生成索引入口。
 - 速记、学习、复习、专注各自有视图偏好和临时运行状态；复习方式使用 `canvas:reviewMode:v1` 记住 `scheduled` / `free`，只影响界面路径，不复制卡片数据或调度状态。
