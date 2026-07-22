@@ -1309,7 +1309,17 @@
     }
 
     function setDrawTool(tool) {
-      drawTool = tool || 'select';
+      const nextTool = tool || 'select';
+      if (drawTool === 'edge-anchor' && nextTool !== 'edge-anchor') {
+        let clearedAnchorSelection = false;
+        selectedNodeIds.forEach((id) => {
+          if (!isEdgeAnchorNode(findNode(id))) return;
+          selectedNodeIds.delete(id);
+          clearedAnchorSelection = true;
+        });
+        if (clearedAnchorSelection) applySelection();
+      }
+      drawTool = nextTool;
       closeToolConfig();
       if (drawToolbar) {
         drawToolbar.querySelectorAll('[data-canvas-tool]').forEach((button) => {
@@ -1317,8 +1327,19 @@
         });
       }
       viewport.classList.toggle('draw-tool-active', drawTool !== 'select');
+      refreshEdgeAnchorVisibility();
       updateEraserCursor();
       scheduleTextDock();
+    }
+
+    function syncEdgeAnchorToolAvailability(mode) {
+      if (!drawToolbar) return;
+      const button = drawToolbar.querySelector('[data-canvas-tool="edge-anchor"]');
+      if (!button) return;
+      const unavailable = (mode || currentMode()) === 'decor';
+      button.disabled = unavailable;
+      button.setAttribute('aria-disabled', unavailable ? 'true' : 'false');
+      if (unavailable && drawTool === 'edge-anchor') setDrawTool('select');
     }
 
     function isConfigurableTool(tool) {
@@ -1366,6 +1387,7 @@
         setDrawTool(tool);
       });
     }
+    syncEdgeAnchorToolAvailability();
 
     // ── 左侧工具配置浮层（再次点击图标弹出；只设“接下来新画的”默认样式）──────────
     const PEN_PRESETS = {
@@ -1809,7 +1831,9 @@
 
     function updateEmptyHint() {
       const ink = ensureInkData();
-      if (emptyHint) emptyHint.hidden = data.nodes.length > 0
+      const hasVisibleNode = data.nodes.some((node) => !isEdgeAnchorNode(node));
+      if (emptyHint) emptyHint.hidden = hasVisibleNode
+        || data.edges.length > 0
         || ink.strokes.length > 0
         || ink.arrows.length > 0;
     }
@@ -2097,13 +2121,52 @@
     function isColorBlockNode(node) {
       return isShapeNode(node) && node.shapeType === 'color-block';
     }
+    function isEdgeAnchorNode(node) {
+      return isShapeNode(node) && node.shapeType === 'edge-anchor';
+    }
+    function syncEdgeAnchorAriaLabel(el) {
+      if (!el) return;
+      const translate = (text) => (global.RelatumI18n ? global.RelatumI18n.t(text) : text);
+      el.setAttribute('aria-label', translate('连接锚点'));
+    }
+    function refreshEdgeAnchorAriaLabels() {
+      data.nodes.forEach((node) => {
+        if (isEdgeAnchorNode(node)) syncEdgeAnchorAriaLabel(nodeMap.get(node.id));
+      });
+    }
     function isDecorationNode(node) {
       return isShapeNode(node) || isImageNode(node) || isAttachmentNode(node) || isTextBoxNode(node);
     }
-    // 可连线节点：正文节点 + 附件（PDF/MD）。图案/图片仍不参与连线。
-    // 附件虽是装饰对象，但允许连线、进图谱（仍不进 Markdown 导出，导出在后端按 kind 过滤）。
+    // 可连线节点：正文节点 + 附件（PDF/MD）+ 专用连接锚点。其他图案/图片仍不参与连线。
+    // 锚点沿用 shape 存储以天然退出图谱、AI、Markdown 与模板等内容语义，只在画布连线层例外可连。
     function isLinkable(node) {
-      return !!node && !isShapeNode(node) && !isImageNode(node) && !isTextBoxNode(node);
+      return !!node && (isEdgeAnchorNode(node)
+        || (!isShapeNode(node) && !isImageNode(node) && !isTextBoxNode(node)));
+    }
+    function revealedEdgeAnchorIds() {
+      const ids = new Set();
+      selectedNodeIds.forEach((id) => {
+        if (isEdgeAnchorNode(findNode(id))) ids.add(id);
+      });
+      selectedEdgeIds.forEach((edgeId) => {
+        const edge = findEdge(edgeId);
+        if (!edge) return;
+        if (isEdgeAnchorNode(findNode(edge.from))) ids.add(edge.from);
+        if (isEdgeAnchorNode(findNode(edge.to))) ids.add(edge.to);
+      });
+      return ids;
+    }
+    function refreshEdgeAnchorVisibility() {
+      const revealAll = drawTool === 'edge-anchor' && currentMode() !== 'decor';
+      const revealed = revealAll ? null : revealedEdgeAnchorIds();
+      data.nodes.forEach((node) => {
+        if (!isEdgeAnchorNode(node)) return;
+        const el = nodeMap.get(node.id);
+        if (!el) return;
+        const visible = revealAll || revealed.has(node.id);
+        el.classList.toggle('edge-anchor-visible', visible);
+        el.setAttribute('aria-hidden', visible ? 'false' : 'true');
+      });
     }
     function findEdge(id) {
       for (let i = 0; i < data.edges.length; i++) {
@@ -3348,7 +3411,13 @@
     // Ctrl+1 / 初始打开：缩放并平移到刚好容纳所有节点
     function fitToContent(immediate) {
       const inkBox = inkBounds();
-      if (data.nodes.length === 0 && !inkBox) {
+      const connectedNodeIds = new Set();
+      data.edges.forEach((edge) => {
+        connectedNodeIds.add(edge.from);
+        connectedNodeIds.add(edge.to);
+      });
+      const fitNodes = data.nodes.filter((node) => !isEdgeAnchorNode(node) || connectedNodeIds.has(node.id));
+      if (fitNodes.length === 0 && !inkBox) {
         if (immediate) setViewportImmediate(1, 0, 0);
         else resetViewport();
         return;
@@ -3357,7 +3426,7 @@
       let minY = inkBox ? inkBox.minY : Infinity;
       let maxX = inkBox ? inkBox.maxX : -Infinity;
       let maxY = inkBox ? inkBox.maxY : -Infinity;
-      data.nodes.forEach(function (n) {
+      fitNodes.forEach(function (n) {
         const el = nodeMap.get(n.id);
         const w = el ? el.offsetWidth : 160;
         const h = el ? el.offsetHeight : 36;
@@ -4411,6 +4480,9 @@
         return Math.max(0, Math.min(18, (px / basis) * 100));
       };
       const svgNum = (value) => Number(value).toFixed(3).replace(/\.?0+$/, '');
+      if (type === 'edge-anchor') return '<circle class="edge-anchor-ring" cx="50" cy="50" r="27"/>'
+        + '<path class="edge-anchor-cross" d="M50 6 V24 M50 76 V94 M6 50 H24 M76 50 H94"/>'
+        + '<circle class="edge-anchor-dot" cx="50" cy="50" r="7"/>';
       if (type === 'rect') return '<rect class="decor-fill" x="2" y="2" width="96" height="96"/>';
       if (type === 'ellipse') return '<ellipse class="decor-fill" cx="50" cy="50" rx="47" ry="38"/>';
       if (type === 'circle') return '<circle class="decor-fill" cx="50" cy="50" r="47"/>';
@@ -4577,6 +4649,26 @@
         text.setAttribute('spellcheck', 'false');
         content.appendChild(text);
         content.dataset.textBoxReady = '1';
+      }
+      let noteVisual = content.querySelector('.emphasis-note-visual');
+      if (node.boxStyle === 'emphasis-card') {
+        if (!noteVisual) {
+          noteVisual = document.createElement('div');
+          noteVisual.className = 'emphasis-note-visual';
+          noteVisual.setAttribute('aria-hidden', 'true');
+
+          const sheet = document.createElement('div');
+          sheet.className = 'emphasis-note-sheet';
+          noteVisual.appendChild(sheet);
+
+          const fold = document.createElement('div');
+          fold.className = 'emphasis-note-fold';
+          noteVisual.appendChild(fold);
+
+          content.insertBefore(noteVisual, content.firstChild);
+        }
+      } else if (noteVisual) {
+        noteVisual.remove();
       }
       const text = content.querySelector('.text-box-content');
       if (!text || editingTextBoxId === node.id) return;
@@ -4950,8 +5042,11 @@
     // 与普通模式共用同一套创建逻辑/快捷键）。实时读 localStorage → 与
     // editor.js 的模式开关/默认样式面板解耦，无需互相通知。
     function ensureDecorResizeHandles(el, node) {
-      if (!isDecorationNode(node)) return;
       let wrap = el.querySelector('.decor-resize-handles');
+      if (!isDecorationNode(node) || isEdgeAnchorNode(node)) {
+        if (wrap) wrap.remove();
+        return;
+      }
       if (!wrap) {
         wrap = document.createElement('div');
         wrap.className = 'decor-resize-handles';
@@ -5652,6 +5747,7 @@
       const el = document.createElement('div');
       el.className = 'node';
       el.dataset.id = node.id;
+      if (isEdgeAnchorNode(node)) syncEdgeAnchorAriaLabel(el);
       if (node.color) el.dataset.color = node.color;   // C1：节点颜色
       applyNodeStyle(el, node);                         // 5-1：形状/颜色/透明度
       applyTransform(el, node.x, node.y);
@@ -5835,7 +5931,8 @@
       if (currentMode() === 'decor') return;
       selectedEdgeIds.forEach((id) => {
         const edge = data.edges.find((x) => x.id === id);
-        if (!edge || !Array.isArray(edge.waypoints)) return;
+        if (!edge) return;
+        if (!Array.isArray(edge.waypoints)) return;
         edge.waypoints.forEach((w, i) => {
           const c = document.createElementNS(SVG_NS, 'circle');
           c.setAttribute('class', 'edge-waypoint');
@@ -7259,14 +7356,14 @@
     const DECOR_TEXT_BORDER_STYLES = new Set(['solid', 'dashed', 'dotted', 'double']);
     const DECOR_TEXT_STYLE_PRESETS = {
       'emphasis-card': [
-        { id: 'sun', name: '暖金纸', fillColor: '#f6eab8', borderColor: '#b99a48', color: '#383225', borderWidth: 1, borderStyle: 'solid' },
-        { id: 'cream', name: '象牙纸', fillColor: '#f3eed9', borderColor: '#ad9d64', color: '#353329', borderWidth: 1, borderStyle: 'solid' },
-        { id: 'peach', name: '陶粉纸', fillColor: '#f2e0d5', borderColor: '#ae826b', color: '#3d312b', borderWidth: 1, borderStyle: 'solid' },
-        { id: 'rose', name: '藕荷纸', fillColor: '#f0dfe3', borderColor: '#aa7887', color: '#3e3035', borderWidth: 1, borderStyle: 'solid' },
-        { id: 'lavender', name: '灰紫纸', fillColor: '#e9e4f0', borderColor: '#88789e', color: '#332f3d', borderWidth: 1, borderStyle: 'solid' },
-        { id: 'sky', name: '雾蓝纸', fillColor: '#e1eaf0', borderColor: '#70889b', color: '#29343d', borderWidth: 1, borderStyle: 'solid' },
-        { id: 'mint', name: '鼠尾草', fillColor: '#e3ebe1', borderColor: '#73866f', color: '#2d372c', borderWidth: 1, borderStyle: 'solid' },
-        { id: 'paper', name: '原色纸', fillColor: '#eee6d8', borderColor: '#9e835e', color: '#373128', borderWidth: 1, borderStyle: 'solid' },
+        { id: 'sun', name: '暖金纸', fillColor: '#f6eab8', borderColor: '#b99a48', color: '#383225', borderWidth: 2.5, borderStyle: 'solid' },
+        { id: 'cream', name: '象牙纸', fillColor: '#f3eed9', borderColor: '#ad9d64', color: '#353329', borderWidth: 2.5, borderStyle: 'solid' },
+        { id: 'peach', name: '陶粉纸', fillColor: '#f2e0d5', borderColor: '#ae826b', color: '#3d312b', borderWidth: 2.5, borderStyle: 'solid' },
+        { id: 'rose', name: '藕荷纸', fillColor: '#f0dfe3', borderColor: '#aa7887', color: '#3e3035', borderWidth: 2.5, borderStyle: 'solid' },
+        { id: 'lavender', name: '灰紫纸', fillColor: '#e9e4f0', borderColor: '#88789e', color: '#332f3d', borderWidth: 2.5, borderStyle: 'solid' },
+        { id: 'sky', name: '雾蓝纸', fillColor: '#e1eaf0', borderColor: '#70889b', color: '#29343d', borderWidth: 2.5, borderStyle: 'solid' },
+        { id: 'mint', name: '鼠尾草', fillColor: '#e3ebe1', borderColor: '#73866f', color: '#2d372c', borderWidth: 2.5, borderStyle: 'solid' },
+        { id: 'paper', name: '原色纸', fillColor: '#eee6d8', borderColor: '#9e835e', color: '#373128', borderWidth: 2.5, borderStyle: 'solid' },
       ],
       'note-bubble': [
         { id: 'ink', name: '墨线留白', fillColor: '#fbfaf6', borderColor: '#4f5b55', color: '#26302b', borderWidth: 1.5, borderStyle: 'solid' },
@@ -7334,7 +7431,7 @@
         color: '#383225',
         fillColor: '#f6eab8',
         borderColor: '#b99a48',
-        borderWidth: 1,
+        borderWidth: 2.5,
         borderStyle: 'solid',
         layer: 'front',
       },
@@ -7756,7 +7853,7 @@
       for (const id of selectedNodeIds) {
         const node = findNode(id);
         // 图案检查器只接管纯装饰选区；混入正文节点时交回普通选择检查器。
-        if (!isDecorationNode(node)) return [];
+        if (!isDecorationNode(node) || isEdgeAnchorNode(node)) return [];
         targets.push(node);
       }
       return targets;
@@ -8047,6 +8144,7 @@
     document.addEventListener('editor:inspectorpreferencechange', refreshDecorPanel);
     document.addEventListener('editor:modechange', refreshDecorPanel);
     document.addEventListener('relatum:languagechange', refreshDecorPanel);
+    document.addEventListener('relatum:languagechange', refreshEdgeAnchorAriaLabels);
 
     function decorStackAvailability(targets) {
       const selected = new Set((targets || []).map((node) => node.id));
@@ -10009,16 +10107,22 @@
         refs.labelEl.classList.toggle('selected', sel);
       });
       requestEdgesCanvasRender();
+      refreshEdgeAnchorVisibility();
       renderEdgeHandles();   // 5-3：编辑模式下随选中变化刷新拐点手柄
       refreshEditPanel();    // 5-4：随选中变化刷新编辑抽屉
       refreshDecorPanel();   // 图案模式：随选中变化刷新装饰属性面板
       const contentNodeCount = [...selectedNodeIds].filter((id) => !isDecorationNode(findNode(id))).length;
-      const decorNodeCount = [...selectedNodeIds].filter((id) => isDecorationNode(findNode(id))).length;
+      const anchorNodeCount = [...selectedNodeIds].filter((id) => isEdgeAnchorNode(findNode(id))).length;
+      const decorNodeCount = [...selectedNodeIds].filter((id) => {
+        const node = findNode(id);
+        return isDecorationNode(node) && !isEdgeAnchorNode(node);
+      }).length;
       document.dispatchEvent(new CustomEvent('editor:selectionchange', {
         detail: {
-          nodes: selectedNodeIds.size,
+          nodes: contentNodeCount + decorNodeCount,
           contentNodes: contentNodeCount,
           decorNodes: decorNodeCount,
+          anchorNodes: anchorNodeCount,
           edges: selectedEdgeIds.size,
           arrow: !!selectedArrowId
         }
@@ -10179,7 +10283,7 @@
         // 与节点重合时点中谁交给 z-index：front 图片在节点之上→选图片，back 图片在节点之下→选节点。
         // 语义分组是内容组织工具，不是单纯装饰：普通 / 脑图模式也应可选中、拖动与折叠。
         if (isShapeNode(node) && currentMode() !== 'decor'
-            && !isTransientMovableDecor(node) && !isGroupBoxNode(node)) return;
+            && !isTransientMovableDecor(node) && !isGroupBoxNode(node) && !isEdgeAnchorNode(node)) return;
         if (editingNodeId === node.id) return;
         e.stopPropagation();
         if (isSelectionToggleEvent(e)) {
@@ -10189,7 +10293,7 @@
           return;
         }
         if (e.altKey) {
-          if (!isDecorationNode(node) && canCreate()) startEdgeCreate(node, e);   // 装饰对象不参与连线
+          if (isLinkable(node) && canCreate()) startEdgeCreate(node, e);
           return;
         }
         startNodeDrag(node, e);
@@ -12110,9 +12214,26 @@
       });
     }
 
+    function createEdgeAnchorAt(e) {
+      const p = clientToSurface(e.clientX, e.clientY);
+      addDecorationNode({
+        kind: 'shape',
+        shapeType: 'edge-anchor',
+        width: 20,
+        height: 20,
+        rotation: 0,
+        opacity: 1,
+        layer: 'front',
+        borderColor: '#1a1a1a',
+        fillColor: '#ffffff',
+        fillMode: 'none',
+      }, p, true);
+    }
+
     function handleDrawToolMouseDown(e) {
       if (drawTool === 'select') return false;
       if (drawTool === 'lasso') return false;   // 套索当成选择类工具：不起笔、不抢指针，交给框选链路
+      if (drawTool === 'edge-anchor') return false; // 锚点工具保留空白左键框选；创建统一由双击入口处理
       if (e.button !== 0) return false;
       if (drawToolbar && (e.target === drawToolbar || drawToolbar.contains(e.target))) return false;
       if (e.target.closest && e.target.closest('.tool-config-pop, .search-bar, .viewport-hud-bl, .help-fab, .settings-fab, .settings-pop')) {
@@ -12606,11 +12727,16 @@
       const nodeSizes = options && options.nodeSizes;
       const out = [];
       data.nodes.forEach((n) => {
+        // 锚点平时是隐藏结构，不参与框选；只有锚点工具激活、锚点全部显形时才纳入。
+        const selectableAnchor = isEdgeAnchorNode(n)
+          && drawTool === 'edge-anchor'
+          && currentMode() !== 'decor';
+        if (isEdgeAnchorNode(n) && !selectableAnchor) return;
         if (forTemplate) {
           if (!isTemplateEligibleNode(n)) return;
         } else {
           if (currentMode() === 'decor' && !isDecorationNode(n)) return;
-          if (currentMode() !== 'decor' && isShapeNode(n)) return;   // 图案仍限图案模式；图片可随框选选中
+          if (currentMode() !== 'decor' && isShapeNode(n) && !selectableAnchor) return;   // 图案仍限图案模式；图片可随框选选中
         }
         const el = nodeMap.get(n.id);
         const size = nodeSizes && nodeSizes.get(n.id);
@@ -18239,6 +18365,10 @@
     // 这样取景框（当前视口）始终落在小地图内、不会跑丢。空画布时整体隐藏。
     const MM_PAD = 60;   // 映射域四周留白（surface 单位）
 
+    function hasMinimapNodes() {
+      return data.nodes.some((node) => !isEdgeAnchorNode(node));
+    }
+
     // 当前视口在 surface 坐标中可见区域的 [x0,y0,x1,y1]
     function visibleSurfaceRect() {
       const vRect = viewport.getBoundingClientRect();
@@ -18305,7 +18435,7 @@
       const mmH = minimap.clientHeight || 120;
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
       data.nodes.forEach(function (n) {
-        if (hiddenMindmapNodeIds.has(n.id) || hiddenGroupNodeIds.has(n.id)) return;
+        if (isEdgeAnchorNode(n) || hiddenMindmapNodeIds.has(n.id) || hiddenGroupNodeIds.has(n.id)) return;
         const s = cachedNodeSize(nodeMap.get(n.id), n.id);
         if (n.x < minX) minX = n.x;
         if (n.y < minY) minY = n.y;
@@ -18354,7 +18484,7 @@
     // 完整重画：重算映射 + 同步所有节点小方块 + 取景框。节点增删改/拖动后调用。
     function redrawMinimap() {
       if (!minimap || !minimapNodes || !minimapViewbox) return;
-      if (data.nodes.length === 0) {
+      if (!hasMinimapNodes()) {
         if (!minimap.hidden) minimap.hidden = true;
         return;
       }
@@ -18366,7 +18496,7 @@
       // 节点小矩形：持久 div 池，增删改时同步（不每帧重建）
       const seen = new Set();
       data.nodes.forEach(function (n) {
-        if (hiddenMindmapNodeIds.has(n.id) || hiddenGroupNodeIds.has(n.id)) return;
+        if (isEdgeAnchorNode(n) || hiddenMindmapNodeIds.has(n.id) || hiddenGroupNodeIds.has(n.id)) return;
         seen.add(n.id);
         const sz = cachedNodeSize(nodeMap.get(n.id), n.id);
         let dot = mmNodeMap.get(n.id);
@@ -18395,14 +18525,14 @@
     // 映射变了（缩到内容外 / 缩放改变占比）→ 退回完整重画，保证结果与原行为一致。
     function updateMinimapDraggedNodes(liveCoords) {
       if (!minimap || !minimapNodes || !minimapViewbox || !liveCoords || !liveCoords.size) return;
-      if (data.nodes.length === 0) { redrawMinimap(); return; }
+      if (!hasMinimapNodes()) { redrawMinimap(); return; }
       if (!mmMap || minimap.hidden) redrawMinimap();
       if (!mmMap) return;
       const ox = mmMap.ox, oy = mmMap.oy, s = mmMap.s, minX = mmMap.minX, minY = mmMap.minY;
       let needsFullRedraw = false;
       liveCoords.forEach((pos, id) => {
-        if (hiddenMindmapNodeIds.has(id) || hiddenGroupNodeIds.has(id)) return;
         const node = findNode(id);
+        if (isEdgeAnchorNode(node) || hiddenMindmapNodeIds.has(id) || hiddenGroupNodeIds.has(id)) return;
         if (!node) return;
         const dot = mmNodeMap.get(id);
         if (!dot) { needsFullRedraw = true; return; }
@@ -18418,7 +18548,7 @@
 
     function updateMinimapViewport() {
       if (!minimap || !minimapNodes || !minimapViewbox) return;
-      if (data.nodes.length === 0) { redrawMinimap(); return; }
+      if (!hasMinimapNodes()) { redrawMinimap(); return; }
       const next = computeMinimapMapping();
       if (sameMinimapMapping(next, mmMap)) {
         mmMap = next;
@@ -19102,6 +19232,15 @@
       // 绑在 viewport 上：surface 框外（含负坐标区）的空白处也能建节点
       if (e.target !== surface && e.target !== viewport && e.target !== emptyHint) return;
       if (lastPointerType === 'pen') return;   // 手写笔双击不建节点（防批注时误触；鼠标/触摸照常）
+      if (drawTool === 'edge-anchor') {
+        if (currentMode() === 'decor') return;
+        e.preventDefault();
+        if (editingNodeId !== null) commitNodeEdit();
+        if (editingEdgeId !== null) commitEdgeEdit();
+        if (editingTextBoxId !== null) commitTextBoxEdit();
+        createEdgeAnchorAt(e);
+        return;
+      }
       if (!canCreate()) return;             // 图案模式不新建内容节点
       // Z 轮：用 clientToSurface 而不是直接减 surfRect——缩放下也得对
       const p = clientToSurface(e.clientX, e.clientY);
@@ -19922,6 +20061,9 @@
         spaceHeld = false;
         viewport.classList.remove('space-held');
       }
+      // 平移中切走窗口不会收到可靠的 mouseup；主动结束，避免返回后残留闭合抓手。
+      if (drag && drag.mode === 'pan') drag = null;
+      viewport.classList.remove('panning');
       Object.keys(arrowKeys).forEach(function (k) { arrowKeys[k] = false; });
     }
 
@@ -20424,6 +20566,8 @@
       finishMindmapGlide();
       if (mode !== 'mindmap') cancelMindmapColorBrush(false);
       clearTransientMovableDecor();
+      if (mode === 'decor' && drawTool === 'edge-anchor') setDrawTool('select');
+      syncEdgeAnchorToolAvailability(mode);
       if (mode === 'decor') {
         const hasContentSelection = selectedEdgeIds.size > 0
           || [...selectedNodeIds].some((id) => !isDecorationNode(findNode(id)));
@@ -20437,6 +20581,7 @@
       if (mode === 'decor') clearArrowSelection();
       renderEdgeHandles();
       renderArrowHandles();   // 进/出编辑模式时显示/隐藏折线箭头手柄
+      refreshEdgeAnchorVisibility();
       refreshEditPanel();
       refreshDecorPanel();
       refreshDecorToolButtons();
@@ -20720,7 +20865,7 @@
         if (by1 > maxY) maxY = by1;
       }
       data.nodes.forEach(function (n) {
-        if (n.kind === 'pdf') return;
+        if (n.kind === 'pdf' || isEdgeAnchorNode(n)) return;
         const el = nodeMap.get(n.id);
         const w = el ? el.offsetWidth : 160;
         const h = el ? el.offsetHeight : 36;
@@ -20772,6 +20917,7 @@
       clone.style.transition = 'none';
       clone.style.animation = 'none';
       clone.querySelectorAll('[data-attach-kind="pdf"]').forEach(function (e) { e.remove(); });
+      clone.querySelectorAll('.node[data-shape-type="edge-anchor"]').forEach(function (e) { e.remove(); });
       clone.querySelectorAll(
         '.canvas-empty-hint, .decor-resize-handle, .edge-handle, .canvas-edge-hit, .frame-rect, .node-mindmap-fold'
       ).forEach(function (e) { e.remove(); });
